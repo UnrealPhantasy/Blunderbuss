@@ -1,0 +1,26 @@
+# Artefacts de compilation Rust — plusieurs centaines de mégaoctets très vite.
+/target/
+
+# Python (étapes 2 et 3)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Poids de réseaux et parties de self-play (étape 3) : volumineux et regénérables.
+*.pt
+*.pth
+*.safetensors
+/donnees/
+/parties/
+
+# Divers
+.DS_Store
+*.log
+
+# Personnel — NE PAS publier. Le dépôt est public ; la KB, les skills et les
+# instructions de session peuvent contenir des notes personnelles. Ces éléments
+# restent en local uniquement.
+.claude/
+kb/
+CLAUDE.md

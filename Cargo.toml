@@ -1,0 +1,28 @@
+# Espace de travail (« workspace ») cargo.
+#
+# Pourquoi plusieurs crates plutôt qu'un seul : le binding Python de l'étape 2
+# exigera `crate-type = ["cdylib"]`, ce qui est incompatible avec une
+# bibliothèque Rust normale consommée par un binaire. La parade standard est de
+# garder la logique dans un crate pur (`moteur`) et de n'avoir que de fines
+# enveloppes autour : le binaire UCI, puis le module Python.
+#
+#   moteur/    la logique — recherche, évaluation, interface Position
+#   uci/       (à venir) le binaire qui parle le protocole UCI
+#   bindings/  (à venir, étape 2) l'enveloppe PyO3
+
+[workspace]
+resolver = "3"
+members = ["moteur"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+# Profil de compilation pour les mesures de performance : sans ça, un banc
+# d'essai en mode debug donne des chiffres 20 à 50 fois trop lents et donc
+# inexploitables.
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
