@@ -17,7 +17,7 @@
 //! only if it is declared with `pub mod <name>;` — an orphan `src/foo.rs` file
 //! would be silently ignored, a classic source of confusion.
 
-// pub mod position;
+pub mod position;
 // pub mod evaluation;
 // pub mod ordering;
 // pub mod search;
