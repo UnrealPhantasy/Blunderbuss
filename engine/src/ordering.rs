@@ -90,11 +90,43 @@ mod tests {
     }
 
     #[test]
-    fn order_moves_puts_captures_first() {
-        let p = Position::from_fen("4k3/8/8/3q4/8/8/8/3RK3 w - - 0 1").unwrap();
+    fn most_valuable_victim_is_preferred() {
+        // The core of MVV-LVA: a bigger victim outranks a smaller one. White can
+        // take a queen with a pawn (dxe5) or a pawn with the queen (Qxb5); the
+        // pawn-takes-queen must score far higher.
+        let p = Position::from_fen("7k/8/8/1p2q3/Q2P4/8/8/6K1 w - - 0 1").unwrap();
+        let moves = p.legal_moves();
+        let pawn_takes_queen = moves
+            .iter()
+            .copied()
+            .find(|&mv| p.piece_on(mv.from) == Some(Piece::Pawn) && p.piece_on(mv.to) == Some(Piece::Queen))
+            .unwrap();
+        let queen_takes_pawn = moves
+            .iter()
+            .copied()
+            .find(|&mv| p.piece_on(mv.from) == Some(Piece::Queen) && p.piece_on(mv.to) == Some(Piece::Pawn))
+            .unwrap();
+        assert!(mvv_lva(&p, pawn_takes_queen) > mvv_lva(&p, queen_takes_pawn));
+    }
+
+    #[test]
+    fn order_moves_sorts_all_captures_first_by_mvv_lva() {
+        // White has several captures of different victims (queen e5, knight c5,
+        // pawn a6) plus quiet moves.
+        let p = Position::from_fen("7k/8/p7/2n1q3/3P4/8/8/R5K1 w - - 0 1").unwrap();
         let mut moves = p.legal_moves();
         order_moves(&p, &mut moves);
-        // The first move after ordering must be a capture.
-        assert!(p.piece_on(moves[0].to).is_some(), "a capture should sort first");
+
+        let is_capture = |mv: Move| p.piece_on(mv.to).is_some();
+        let captures = moves.iter().copied().filter(|&mv| is_capture(mv)).count();
+        assert!(captures >= 3, "expected several captures, got {captures}");
+
+        // Every capture comes before every quiet move.
+        assert!(moves[..captures].iter().all(|&mv| is_capture(mv)), "captures must lead");
+        assert!(moves[captures..].iter().all(|&mv| !is_capture(mv)), "quiet moves must follow");
+
+        // Captures are sorted by non-increasing MVV-LVA score.
+        let scores: Vec<i32> = moves[..captures].iter().map(|&mv| mvv_lva(&p, mv)).collect();
+        assert!(scores.windows(2).all(|w| w[0] >= w[1]), "captures not sorted: {scores:?}");
     }
 }
