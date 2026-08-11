@@ -32,6 +32,9 @@ pub use cozy_chess::Color;
 /// A piece type (pawn … king), used to read material.
 pub use cozy_chess::Piece;
 
+/// A board square (a1 … h8), used to read what sits on a move's endpoints.
+pub use cozy_chess::Square;
+
 /// The status of a position, purely from the rules' point of view.
 ///
 /// Deliberately coarse for this first brick: it mirrors what `cozy-chess` can
@@ -114,6 +117,14 @@ impl Position {
     /// this module.
     pub fn count(&self, color: Color, piece: Piece) -> u32 {
         (self.0.colors(color) & self.0.pieces(piece)).len()
+    }
+
+    /// The piece sitting on `square`, if any (regardless of color).
+    ///
+    /// Used by move ordering to read a capture's victim and attacker while
+    /// keeping `cozy-chess` confined to this module.
+    pub fn piece_on(&self, square: Square) -> Option<Piece> {
+        self.0.piece_on(square)
     }
 
     /// All legal moves in the position.
