@@ -29,6 +29,9 @@ pub use cozy_chess::Move;
 /// The side to move. (cozy-chess's variants are `White` / `Black`.)
 pub use cozy_chess::Color;
 
+/// A piece type (pawn … king), used to read material.
+pub use cozy_chess::Piece;
+
 /// The status of a position, purely from the rules' point of view.
 ///
 /// Deliberately coarse for this first brick: it mirrors what `cozy-chess` can
@@ -102,6 +105,15 @@ impl Position {
     /// The Zobrist hash key of the position (for a future transposition table).
     pub fn hash(&self) -> u64 {
         self.0.hash()
+    }
+
+    /// How many pieces of the given `color` and `piece` type are on the board.
+    ///
+    /// Kept here so the rest of the engine (e.g. evaluation) can read material
+    /// without touching `cozy-chess` directly — the boundary stays confined to
+    /// this module.
+    pub fn count(&self, color: Color, piece: Piece) -> u32 {
+        (self.0.colors(color) & self.0.pieces(piece)).len()
     }
 
     /// All legal moves in the position.

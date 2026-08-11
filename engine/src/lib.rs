@@ -18,6 +18,6 @@
 //! would be silently ignored, a classic source of confusion.
 
 pub mod position;
-// pub mod evaluation;
+pub mod evaluation;
 // pub mod ordering;
-// pub mod search;
+pub mod search;
