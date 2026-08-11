@@ -19,5 +19,5 @@
 
 pub mod position;
 pub mod evaluation;
-// pub mod ordering;
+pub mod ordering;
 pub mod search;
