@@ -127,6 +127,14 @@ impl Position {
         self.0.piece_on(square)
     }
 
+    /// The colour of the piece on `square`, if any.
+    ///
+    /// Companion to [`Position::piece_on`], used by evaluation to read whose
+    /// piece sits where — again keeping `cozy-chess` confined to this module.
+    pub fn color_on(&self, square: Square) -> Option<Color> {
+        self.0.color_on(square)
+    }
+
     /// This move rendered as a UCI string (e.g. `"e2e4"`, `"e7e8q"`, `"e1g1"`).
     ///
     /// Goes through cozy-chess's UCI helper, which converts the crate's internal
