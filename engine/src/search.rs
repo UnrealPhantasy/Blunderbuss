@@ -1,14 +1,15 @@
 //! The search: pick a move for a position.
 //!
 //! Negamax with alpha-beta pruning, guided by [`evaluate`](crate::evaluation::evaluate)
-//! and sped up by move [`ordering`](crate::ordering). Two ways to bound it:
+//! and sped up by move [`ordering`](crate::ordering).
 //!
-//! - **fixed depth** — [`search`] / [`best_move`], used by tests and by `go depth N`;
-//! - **iterative deepening** — [`search_timed`] searches depth 1, 2, 3, … until a
-//!   depth cap or a wall-clock **deadline**, always returning the last *completed*
-//!   depth's move. Deepening is what lets the engine use a time budget: it can stop
-//!   at any moment with a legal move, and each iteration orders the previous best
-//!   move first, which prunes the next one better.
+//! [`search_timed`] is the **only** entry point: it searches depth 1, 2, 3, … until
+//! it hits the depth cap or the wall-clock deadline carried by [`Limits`], and always
+//! returns the last *completed* depth's move. This iterative deepening is what lets
+//! the engine use a time budget — it can stop at any moment with a legal move — and
+//! each iteration orders the previous best move first, which prunes the next one
+//! better, so deepening to depth N costs about as much as (often less than) a single
+//! direct depth-N pass. [`best_move`] is a thin convenience wrapper over it.
 
 use crate::evaluation::evaluate;
 use crate::ordering::order_moves;
@@ -47,6 +48,14 @@ impl Limits {
     pub fn until(deadline: Instant) -> Limits {
         Limits { max_depth: MAX_DEPTH, deadline: Some(deadline) }
     }
+
+    /// Both bounds at once: never deeper than `max_depth`, and — when a deadline is
+    /// given — never past it. The general form the two constructors above specialise;
+    /// it is what a UCI `go` maps onto, since the protocol may send a depth, a clock,
+    /// both, or neither.
+    pub fn bounded(max_depth: u32, deadline: Option<Instant>) -> Limits {
+        Limits { max_depth, deadline }
+    }
 }
 
 /// The outcome of a search: the chosen move and its score (side-to-move
@@ -57,16 +66,10 @@ pub struct SearchStats {
     pub nodes: u64,
 }
 
-/// Fixed-depth search: `depth` plies, with move ordering.
-pub fn search(pos: &Position, depth: u32) -> SearchStats {
-    let mut searcher = Searcher::new(true, None);
-    let best = searcher.root(pos, depth, None);
-    SearchStats { best, depth, nodes: searcher.nodes }
-}
-
 /// The best move for `pos` at a fixed `depth`, or `None` at a terminal root.
+/// A convenience wrapper over [`search_timed`], bounded by depth alone.
 pub fn best_move(pos: &Position, depth: u32) -> Option<(Move, i32)> {
-    search(pos, depth).best
+    search_timed(pos, Limits::depth(depth)).best
 }
 
 /// Iterative deepening: search depth 1, 2, 3, … up to `limits.max_depth` or the
@@ -213,10 +216,11 @@ mod tests {
     use crate::position::{Color, Piece, Status};
     use std::time::Duration;
 
-    // A search with ordering disabled — used only to prove that ordering keeps the
-    // score identical (correctness) while cutting the node count (the payoff).
-    fn search_unordered(pos: &Position, depth: u32) -> SearchStats {
-        let mut searcher = Searcher::new(false, None);
+    // A single fixed-depth pass — no deepening, no clock — driving `Searcher` directly.
+    // The oracle these tests compare against: it gives the verdict a plain depth-D
+    // search reaches, and, with `ordered` flipped, isolates what move ordering does.
+    fn search_fixed(pos: &Position, depth: u32, ordered: bool) -> SearchStats {
+        let mut searcher = Searcher::new(ordered, None);
         let best = searcher.root(pos, depth, None);
         SearchStats { best, depth, nodes: searcher.nodes }
     }
@@ -278,8 +282,8 @@ mod tests {
             "4k3/8/8/3q4/8/8/8/3RK3 w - - 0 1",
         ] {
             let p = Position::from_fen(fen).unwrap();
-            let ordered = search(&p, 3).best.map(|(_, s)| s);
-            let unordered = search_unordered(&p, 3).best.map(|(_, s)| s);
+            let ordered = search_fixed(&p, 3, true).best.map(|(_, s)| s);
+            let unordered = search_fixed(&p, 3, false).best.map(|(_, s)| s);
             assert_eq!(ordered, unordered, "score must not depend on ordering ({fen})");
         }
     }
@@ -291,8 +295,8 @@ mod tests {
             "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 0 3",
         )
         .unwrap();
-        let ordered = search(&p, 4);
-        let unordered = search_unordered(&p, 4);
+        let ordered = search_fixed(&p, 4, true);
+        let unordered = search_fixed(&p, 4, false);
         assert!(
             ordered.nodes < unordered.nodes,
             "ordering should prune: ordered {} vs unordered {}",
@@ -303,18 +307,57 @@ mod tests {
 
     #[test]
     fn iterative_deepening_matches_direct_search() {
-        // With no deadline, deepening to depth D returns the same score as a direct
-        // depth-D search, and reports having reached D.
+        // With no deadline, deepening to depth D returns the same score as a single
+        // direct depth-D pass, and reports having reached D.
         for fen in [
             "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
             "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 0 3",
         ] {
             let p = Position::from_fen(fen).unwrap();
             let deep = search_timed(&p, Limits::depth(4));
-            let direct = search(&p, 4);
+            let direct = search_fixed(&p, 4, true);
             assert_eq!(deep.best.map(|(_, s)| s), direct.best.map(|(_, s)| s));
             assert_eq!(deep.depth, 4);
         }
+    }
+
+    #[test]
+    fn best_move_goes_through_deepening() {
+        // `best_move` is only a wrapper: same score as the deepening search it calls,
+        // and as a direct fixed-depth pass.
+        let p = Position::from_fen("4k3/8/8/3q4/8/8/8/3RK3 w - - 0 1").unwrap();
+        let wrapped = best_move(&p, 4).map(|(_, s)| s);
+        assert_eq!(wrapped, search_timed(&p, Limits::depth(4)).best.map(|(_, s)| s));
+        assert_eq!(wrapped, search_fixed(&p, 4, true).best.map(|(_, s)| s));
+    }
+
+    #[test]
+    fn bounded_honours_both_limits() {
+        // `Limits::bounded` is what a UCI `go` maps onto. A depth cap with a generous
+        // deadline stops at the cap; a deadline with no useful depth cap stops on time.
+        let p = Position::initial();
+        let far = Instant::now() + Duration::from_secs(30);
+        assert_eq!(search_timed(&p, Limits::bounded(3, Some(far))).depth, 3);
+
+        let stats = search_timed(
+            &p,
+            Limits::bounded(MAX_DEPTH, Some(Instant::now() + Duration::from_millis(5))),
+        );
+        assert!(stats.depth >= 1 && stats.depth < MAX_DEPTH, "the clock must bite");
+        assert!(stats.best.is_some(), "a legal move is always returned");
+    }
+
+    #[test]
+    fn an_expired_deadline_still_returns_the_guaranteed_iteration() {
+        // A flag-fall can reach the engine as a deadline already in the past. Depth 1
+        // is owed anyway: `check_time` only reads the clock every 2048 nodes and depth
+        // 1 costs 21 from the start position, so the first iteration always completes;
+        // the deadline is then re-checked between iterations and stops the loop there.
+        // Structural, hence an equality — it holds at any speed.
+        let expired = Instant::now() - Duration::from_secs(1);
+        let stats = search_timed(&Position::initial(), Limits::bounded(MAX_DEPTH, Some(expired)));
+        assert_eq!(stats.depth, 1, "an expired deadline still owes one iteration");
+        assert!(stats.best.is_some(), "a legal move is always returned");
     }
 
     #[test]
