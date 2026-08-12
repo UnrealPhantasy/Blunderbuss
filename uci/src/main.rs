@@ -47,8 +47,11 @@ fn time_budget(remaining: Duration, increment: Duration) -> Duration {
     let remaining = remaining.as_millis() as u64;
     let increment = increment.as_millis() as u64;
     let alloc = remaining / 30 + increment / 2;
-    let cap = remaining.saturating_sub(SAFETY_MS).max(1);
-    Duration::from_millis(alloc.clamp(1, cap))
+    // Keep a safety margin, and never propose more time than we actually have:
+    // once the margin already eats the whole clock, spend nothing (play instantly).
+    let cap = remaining.saturating_sub(SAFETY_MS);
+    let budget = if cap > 0 { alloc.clamp(1, cap) } else { 0 };
+    Duration::from_millis(budget)
 }
 
 /// The protocol state: the current position and the default search depth. Kept
@@ -270,9 +273,13 @@ mod tests {
 
     #[test]
     fn time_budget_never_exceeds_remaining() {
+        // A realistic clock: a positive budget, safely under the time left.
         let remaining = Duration::from_millis(300);
-        assert!(time_budget(remaining, Duration::from_secs(10)) < remaining);
-        // Even with almost no time, it returns a positive, capped budget.
-        assert!(time_budget(Duration::from_millis(10), Duration::from_secs(0)) >= Duration::from_millis(1));
+        let b = time_budget(remaining, Duration::from_secs(10));
+        assert!(b >= Duration::from_millis(1) && b < remaining);
+        // Edge cases: the budget is never more than the remaining time, and it is
+        // exactly zero once the safety margin already eats the whole clock.
+        assert_eq!(time_budget(Duration::ZERO, Duration::ZERO), Duration::ZERO);
+        assert!(time_budget(Duration::from_millis(10), Duration::ZERO) <= Duration::from_millis(10));
     }
 }
