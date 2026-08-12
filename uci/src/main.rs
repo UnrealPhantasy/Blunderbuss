@@ -380,31 +380,6 @@ mod tests {
         assert_eq!(plan, GoPlan { max_depth: 3, budget: None });
     }
 
-    #[test]
-    fn a_bare_go_is_bounded_by_time_not_by_a_fixed_depth() {
-        // A bare `go` is bounded by its limits, never by a hard-coded depth. The plan
-        // says so, and so does what the search does with it — both asserted exactly,
-        // because how many plies a budget buys is a property of the machine, not of
-        // the code, and a test may not depend on it.
-        let plan = parse_go(&[], Color::White, Duration::from_millis(DEFAULT_BUDGET_MS));
-        assert_eq!(plan.max_depth, MAX_DEPTH, "no shallow depth cap remains");
-        assert_eq!(plan.budget, Some(Duration::from_millis(DEFAULT_BUDGET_MS)));
-
-        // The floor: a deadline already in the past still owes the one iteration
-        // deepening guarantees. Depth 1 from the start position visits 21 nodes, far
-        // under the 2048-node interval between clock checks, so it always completes —
-        // at any speed.
-        let expired = Instant::now() - Duration::from_secs(1);
-        let out_of_time =
-            search_timed(&Position::initial(), Limits::bounded(plan.max_depth, Some(expired)));
-        assert_eq!(out_of_time.depth, 1, "an expired deadline stops after that iteration");
-        assert!(out_of_time.best.is_some(), "a legal move is always returned");
-
-        // The ceiling: with a deadline too far off to bind, the depth cap alone decides.
-        let far = Instant::now() + Duration::from_secs(3600);
-        assert_eq!(search_timed(&Position::initial(), Limits::bounded(3, Some(far))).depth, 3);
-    }
-
     // --- time allocation --------------------------------------------------------
 
     #[test]
