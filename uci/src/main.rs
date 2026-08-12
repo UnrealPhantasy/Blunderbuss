@@ -186,6 +186,19 @@ mod tests {
     }
 
     #[test]
+    fn bare_go_uses_the_default_depth_and_returns_a_legal_move() {
+        // `go` with no depth must fall back to DEFAULT_DEPTH and still answer with
+        // a legal move (the fallback branch not covered by `go depth N`).
+        let mut uci = Uci::new();
+        uci.handle("position startpos");
+        let out = uci.handle("go");
+        let line = out.lines.first().expect("a bestmove line");
+        let mv_str = line.strip_prefix("bestmove ").expect("bestmove prefix");
+        let mv = uci.position.move_from_uci(mv_str).expect("a parseable move");
+        assert!(uci.position.try_play(mv).is_ok(), "the reported move must be legal");
+    }
+
+    #[test]
     fn quit_stops_the_loop() {
         assert!(Uci::new().handle("quit").quit);
     }
