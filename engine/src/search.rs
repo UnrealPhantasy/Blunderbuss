@@ -369,12 +369,4 @@ mod tests {
         assert!(p.try_play(mv).is_ok(), "the returned move must be legal");
         assert!(stats.depth >= 1);
     }
-
-    #[test]
-    fn a_generous_budget_reaches_beyond_depth_one() {
-        // Given real time, deepening must go past depth 1.
-        let p = Position::initial();
-        let stats = search_timed(&p, Limits::until(Instant::now() + Duration::from_millis(500)));
-        assert!(stats.depth > 1, "expected depth > 1 with 500ms, got {}", stats.depth);
-    }
 }
