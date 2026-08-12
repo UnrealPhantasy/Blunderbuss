@@ -3,19 +3,23 @@
 //! UCI (Universal Chess Interface) is the text protocol chess GUIs (Cute Chess,
 //! Arena, …) speak to engines: line-based commands on stdin, replies on stdout.
 //! This binary is a thin adapter — it keeps the current [`Position`] and answers
-//! `go` with a move from [`engine::search::best_move`]. All the chess logic lives
-//! in the `engine` crate; nothing here knows about `cozy-chess`.
+//! `go` with a move from the engine's search. All the chess logic lives in the
+//! `engine` crate; nothing here knows about `cozy-chess`.
 //!
-//! Supported: `uci`, `isready`, `ucinewgame`, `position`, `go` (fixed depth),
-//! `quit`. Time-control arguments to `go` are accepted but ignored for now.
+//! Supported: `uci`, `isready`, `ucinewgame`, `position`, `go` (fixed depth,
+//! `movetime`, or a real clock via `wtime`/`btime`/`winc`/`binc`), `quit`.
 
-use engine::position::Position;
-use engine::search::best_move;
+use engine::position::{Color, Position};
+use engine::search::{search, search_timed, Limits};
 use std::io::{self, BufRead, Write};
+use std::time::{Duration, Instant};
 
-/// Search depth used when `go` does not specify one. Fixed for now — real time
-/// management comes later, with iterative deepening.
+/// Depth used for a bare `go` (no limit given) and for `go infinite` (we do not
+/// implement `stop`, so "infinite" is a fixed-depth search rather than a hang).
 const DEFAULT_DEPTH: u32 = 4;
+
+/// Time kept in reserve so we answer before the flag falls, in milliseconds.
+const SAFETY_MS: u64 = 50;
 
 fn main() {
     let mut uci = Uci::new();
@@ -36,11 +40,21 @@ fn main() {
     }
 }
 
+/// How long to spend on this move, derived from the clock. A simple, tunable
+/// rule: a thirtieth of the remaining time plus half the increment — never more
+/// than the remaining time minus a safety margin, and at least 1 ms.
+fn time_budget(remaining: Duration, increment: Duration) -> Duration {
+    let remaining = remaining.as_millis() as u64;
+    let increment = increment.as_millis() as u64;
+    let alloc = remaining / 30 + increment / 2;
+    let cap = remaining.saturating_sub(SAFETY_MS).max(1);
+    Duration::from_millis(alloc.clamp(1, cap))
+}
+
 /// The protocol state: the current position and the default search depth. Kept
 /// separate from `main` so it can be unit-tested without spawning a process.
 struct Uci {
     position: Position,
-    depth: u32,
 }
 
 /// What [`Uci::handle`] produced: the lines to print, and whether to stop.
@@ -60,13 +74,12 @@ impl Response {
 
 impl Uci {
     fn new() -> Uci {
-        Uci { position: Position::initial(), depth: DEFAULT_DEPTH }
+        Uci { position: Position::initial() }
     }
 
     /// Handle one UCI command line and return what to print (and whether to quit).
     /// Unknown or empty commands are ignored, as the protocol requires.
     fn handle(&mut self, line: &str) -> Response {
-        // Idiom: `split_whitespace` also trims, so blank lines yield no tokens.
         let tokens: Vec<&str> = line.split_whitespace().collect();
         match tokens.first().copied() {
             Some("uci") => Response::lines(vec![
@@ -91,7 +104,6 @@ impl Uci {
 
     /// `position [startpos | fen <6 fields>] [moves <m1> <m2> …]`.
     fn set_position(&mut self, args: &[&str]) {
-        // `moves` (if present) separates the setup from the move list.
         let moves_at = args.iter().position(|&t| t == "moves");
         let setup_end = moves_at.unwrap_or(args.len());
 
@@ -118,17 +130,38 @@ impl Uci {
         self.position = pos;
     }
 
-    /// `go [depth N] …` → the `bestmove` line. Any other argument (`wtime`,
-    /// `movetime`, …) is ignored for now.
+    /// `go [depth N | movetime N | wtime N btime N winc N binc N | infinite]`
+    /// → the `bestmove` line. Unknown arguments are ignored.
     fn go(&self, args: &[&str]) -> String {
-        let depth = args
-            .iter()
-            .position(|&a| a == "depth")
-            .and_then(|i| args.get(i + 1))
-            .and_then(|n| n.parse::<u32>().ok())
-            .unwrap_or(self.depth);
+        // Parse the recognized `key value` tokens (and the flag `infinite`).
+        let value = |key: &str| -> Option<u64> {
+            args.iter()
+                .position(|&a| a == key)
+                .and_then(|i| args.get(i + 1))
+                .and_then(|v| v.parse::<u64>().ok())
+        };
+        let infinite = args.contains(&"infinite");
 
-        match best_move(&self.position, depth) {
+        let stats = if let Some(d) = value("depth") {
+            search(&self.position, d as u32)
+        } else if let Some(mt) = value("movetime") {
+            let budget = mt.saturating_sub(SAFETY_MS).max(1);
+            search_timed(&self.position, Limits::until(Instant::now() + Duration::from_millis(budget)))
+        } else if value("wtime").is_some() || value("btime").is_some() {
+            // Use the side-to-move's own clock.
+            let white = self.position.side_to_move() == Color::White;
+            let remaining = if white { value("wtime") } else { value("btime") }.unwrap_or(0);
+            let inc = if white { value("winc") } else { value("binc") }.unwrap_or(0);
+            let budget = time_budget(Duration::from_millis(remaining), Duration::from_millis(inc));
+            search_timed(&self.position, Limits::until(Instant::now() + budget))
+        } else if infinite {
+            // No `stop` support: bound it to a fixed depth so it always ends.
+            search(&self.position, DEFAULT_DEPTH)
+        } else {
+            search(&self.position, DEFAULT_DEPTH)
+        };
+
+        match stats.best {
             Some((mv, _score)) => format!("bestmove {}", self.position.move_to_uci(mv)),
             None => "bestmove 0000".to_string(), // no legal move (terminal position)
         }
@@ -138,6 +171,13 @@ impl Uci {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Helper: the move string a `go` reply advertises must be legal here.
+    fn bestmove_is_legal(uci: &Uci, line: &str) {
+        let mv_str = line.strip_prefix("bestmove ").expect("bestmove prefix");
+        let mv = uci.position.move_from_uci(mv_str).expect("a parseable move");
+        assert!(uci.position.try_play(mv).is_ok(), "the reported move must be legal");
+    }
 
     #[test]
     fn uci_command_announces_uciok() {
@@ -175,31 +215,64 @@ mod tests {
     }
 
     #[test]
-    fn go_returns_a_legal_bestmove() {
+    fn go_depth_returns_a_legal_bestmove() {
         let mut uci = Uci::new();
         uci.handle("position startpos");
         let out = uci.handle("go depth 2");
-        let line = out.lines.first().expect("a bestmove line");
-        let mv_str = line.strip_prefix("bestmove ").expect("bestmove prefix");
-        let mv = uci.position.move_from_uci(mv_str).expect("a parseable move");
-        assert!(uci.position.try_play(mv).is_ok(), "the reported move must be legal");
+        bestmove_is_legal(&uci, out.lines.first().expect("a bestmove line"));
     }
 
     #[test]
-    fn bare_go_uses_the_default_depth_and_returns_a_legal_move() {
-        // `go` with no depth must fall back to DEFAULT_DEPTH and still answer with
-        // a legal move (the fallback branch not covered by `go depth N`).
+    fn bare_go_returns_a_legal_move() {
         let mut uci = Uci::new();
         uci.handle("position startpos");
         let out = uci.handle("go");
-        let line = out.lines.first().expect("a bestmove line");
-        let mv_str = line.strip_prefix("bestmove ").expect("bestmove prefix");
-        let mv = uci.position.move_from_uci(mv_str).expect("a parseable move");
-        assert!(uci.position.try_play(mv).is_ok(), "the reported move must be legal");
+        bestmove_is_legal(&uci, out.lines.first().expect("a bestmove line"));
+    }
+
+    #[test]
+    fn go_movetime_returns_a_legal_move() {
+        let mut uci = Uci::new();
+        uci.handle("position startpos");
+        let out = uci.handle("go movetime 50");
+        bestmove_is_legal(&uci, out.lines.first().expect("a bestmove line"));
+    }
+
+    #[test]
+    fn go_with_a_clock_returns_a_legal_move() {
+        let mut uci = Uci::new();
+        uci.handle("position startpos");
+        let out = uci.handle("go wtime 1000 btime 1000 winc 0 binc 0");
+        bestmove_is_legal(&uci, out.lines.first().expect("a bestmove line"));
+    }
+
+    #[test]
+    fn go_infinite_returns_a_legal_move() {
+        let mut uci = Uci::new();
+        uci.handle("position startpos");
+        let out = uci.handle("go infinite");
+        bestmove_is_legal(&uci, out.lines.first().expect("a bestmove line"));
     }
 
     #[test]
     fn quit_stops_the_loop() {
         assert!(Uci::new().handle("quit").quit);
+    }
+
+    #[test]
+    fn time_budget_grows_with_time_and_increment() {
+        let more = time_budget(Duration::from_secs(60), Duration::from_secs(0));
+        let less = time_budget(Duration::from_secs(6), Duration::from_secs(0));
+        assert!(more > less, "more time should mean a larger budget");
+        let with_inc = time_budget(Duration::from_secs(60), Duration::from_secs(2));
+        assert!(with_inc > more, "an increment should raise the budget");
+    }
+
+    #[test]
+    fn time_budget_never_exceeds_remaining() {
+        let remaining = Duration::from_millis(300);
+        assert!(time_budget(remaining, Duration::from_secs(10)) < remaining);
+        // Even with almost no time, it returns a positive, capped budget.
+        assert!(time_budget(Duration::from_millis(10), Duration::from_secs(0)) >= Duration::from_millis(1));
     }
 }

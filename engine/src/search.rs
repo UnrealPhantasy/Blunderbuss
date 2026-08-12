@@ -1,58 +1,138 @@
 //! The search: pick a move for a position.
 //!
-//! Negamax with alpha-beta pruning, to a fixed depth, guided by the material
-//! [`evaluate`](crate::evaluation::evaluate) and sped up by move
-//! [`ordering`](crate::ordering). Move ordering does not change the result — only
-//! the number of nodes visited.
+//! Negamax with alpha-beta pruning, guided by [`evaluate`](crate::evaluation::evaluate)
+//! and sped up by move [`ordering`](crate::ordering). Two ways to bound it:
+//!
+//! - **fixed depth** — [`search`] / [`best_move`], used by tests and by `go depth N`;
+//! - **iterative deepening** — [`search_timed`] searches depth 1, 2, 3, … until a
+//!   depth cap or a wall-clock **deadline**, always returning the last *completed*
+//!   depth's move. Deepening is what lets the engine use a time budget: it can stop
+//!   at any moment with a legal move, and each iteration orders the previous best
+//!   move first, which prunes the next one better.
 
 use crate::evaluation::evaluate;
 use crate::ordering::order_moves;
 use crate::position::{Move, Position};
+use std::time::Instant;
 
 /// A mate score, large enough to dominate any material balance. The distance to
 /// mate (`ply`) is subtracted so the search prefers shorter mates, and so a mate
 /// is always distinguishable from a mere material advantage.
 pub const MATE: i32 = 30_000;
 
+/// A depth cap for time-bounded searches (deep enough to be effectively
+/// unbounded for this engine; it exists only so `go infinite`-style searches
+/// terminate).
+pub const MAX_DEPTH: u32 = 64;
+
 // A bound strictly above any reachable score (including `MATE`), used as the
 // initial alpha/beta window.
 const INF: i32 = 40_000;
 
-/// The outcome of a search: the chosen move and its score (from the side-to-move
-/// perspective), plus how many nodes were visited — the metric that move ordering
-/// is meant to shrink.
+/// How far / how long to search.
+pub struct Limits {
+    /// Never search deeper than this.
+    pub max_depth: u32,
+    /// Stop once this instant is reached (checked between and within iterations).
+    pub deadline: Option<Instant>,
+}
+
+impl Limits {
+    /// A fixed-depth limit (no clock).
+    pub fn depth(max_depth: u32) -> Limits {
+        Limits { max_depth, deadline: None }
+    }
+
+    /// Search until `deadline`, never deeper than [`MAX_DEPTH`].
+    pub fn until(deadline: Instant) -> Limits {
+        Limits { max_depth: MAX_DEPTH, deadline: Some(deadline) }
+    }
+}
+
+/// The outcome of a search: the chosen move and its score (side-to-move
+/// perspective), the deepest **completed** depth, and the node count.
 pub struct SearchStats {
     pub best: Option<(Move, i32)>,
+    pub depth: u32,
     pub nodes: u64,
 }
 
-/// Search `pos` to `depth` plies (with move ordering) and report the best move,
-/// its score, and the node count.
+/// Fixed-depth search: `depth` plies, with move ordering.
 pub fn search(pos: &Position, depth: u32) -> SearchStats {
-    let mut searcher = Searcher { nodes: 0, ordered: true };
-    let best = searcher.root(pos, depth);
-    SearchStats { best, nodes: searcher.nodes }
+    let mut searcher = Searcher::new(true, None);
+    let best = searcher.root(pos, depth, None);
+    SearchStats { best, depth, nodes: searcher.nodes }
 }
 
-/// The best move for `pos` at `depth`, or `None` at a terminal root. Thin wrapper
-/// over [`search`].
+/// The best move for `pos` at a fixed `depth`, or `None` at a terminal root.
 pub fn best_move(pos: &Position, depth: u32) -> Option<(Move, i32)> {
     search(pos, depth).best
 }
 
-/// Carries the state shared by the whole search: the node counter and whether to
-/// order moves. Making `root` and `negamax` methods on one struct keeps them in
-/// sync — they share the counter and the ordering switch instead of passing them
-/// around by hand.
+/// Iterative deepening: search depth 1, 2, 3, … up to `limits.max_depth` or the
+/// `limits.deadline`, and return the last **completed** depth's result. Depth 1
+/// always finishes, so there is always a legal move to return (unless the root is
+/// terminal).
+pub fn search_timed(pos: &Position, limits: Limits) -> SearchStats {
+    let mut searcher = Searcher::new(true, limits.deadline);
+    let max_depth = limits.max_depth.max(1);
+
+    let mut best: Option<(Move, i32)> = None;
+    let mut completed = 0;
+    for depth in 1..=max_depth {
+        // Order the previous iteration's best move first — the whole point of
+        // deepening, since a good first move causes early cutoffs below.
+        let pv = best.map(|(mv, _)| mv);
+        let result = searcher.root(pos, depth, pv);
+
+        if searcher.aborted {
+            break; // ran out of time mid-iteration: discard it, keep the last one
+        }
+        best = result;
+        completed = depth;
+        if best.is_none() {
+            break; // terminal root — nothing to deepen
+        }
+        // Don't open another iteration we have no time to finish.
+        if let Some(deadline) = limits.deadline {
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+    }
+    SearchStats { best, depth: completed, nodes: searcher.nodes }
+}
+
+/// Carries the state shared by the whole search: the node counter, the ordering
+/// switch, and the time deadline / abort flag. Keeping `root` and `negamax` as
+/// methods on one struct keeps them in sync.
 struct Searcher {
     nodes: u64,
     ordered: bool,
+    deadline: Option<Instant>,
+    aborted: bool,
 }
 
 impl Searcher {
-    /// The root: like [`Searcher::negamax`] but it tracks the chosen move and does
-    /// not cut off (there is no `beta` above the root).
-    fn root(&mut self, pos: &Position, depth: u32) -> Option<(Move, i32)> {
+    fn new(ordered: bool, deadline: Option<Instant>) -> Searcher {
+        Searcher { nodes: 0, ordered, deadline, aborted: false }
+    }
+
+    /// Set `aborted` if the deadline has passed. Checked only every so often
+    /// (reading the clock on every node would dominate the search cost).
+    fn check_time(&mut self) {
+        if self.nodes % 2048 == 0 {
+            if let Some(deadline) = self.deadline {
+                if Instant::now() >= deadline {
+                    self.aborted = true;
+                }
+            }
+        }
+    }
+
+    /// The root: like [`Searcher::negamax`] but it tracks the chosen move, does not
+    /// cut off (no `beta` above the root), and tries `pv_move` first if given.
+    fn root(&mut self, pos: &Position, depth: u32, pv_move: Option<Move>) -> Option<(Move, i32)> {
         self.nodes += 1;
         let mut moves = pos.legal_moves();
         if moves.is_empty() {
@@ -61,14 +141,20 @@ impl Searcher {
         if self.ordered {
             order_moves(pos, &mut moves);
         }
+        if let Some(pv) = pv_move {
+            if let Some(i) = moves.iter().position(|&mv| mv == pv) {
+                moves.swap(0, i);
+            }
+        }
 
         let mut best_move = moves[0];
         let mut best_score = -INF;
         let mut alpha = -INF;
         for &mv in &moves {
-            // Copy-make: `play` returns the child; `pos` stays untouched. The child
-            // is searched from the opponent's side, hence the negation and window.
             let score = -self.negamax(&pos.play(mv), depth.saturating_sub(1), -INF, -alpha, 1);
+            if self.aborted {
+                break; // time is up; this iteration will be discarded by the caller
+            }
             if score > best_score {
                 best_score = score;
                 best_move = mv;
@@ -84,6 +170,11 @@ impl Searcher {
     /// perspective. `ply` is the distance from the root, used only to score mates.
     fn negamax(&mut self, pos: &Position, depth: u32, mut alpha: i32, beta: i32, ply: i32) -> i32 {
         self.nodes += 1;
+        self.check_time();
+        if self.aborted {
+            return 0; // value ignored: the whole iteration is thrown away
+        }
+
         let mut moves = pos.legal_moves();
         if moves.is_empty() {
             // Terminal: checkmate (side to move loses) or stalemate (draw).
@@ -99,6 +190,9 @@ impl Searcher {
         let mut best = -INF;
         for &mv in &moves {
             let score = -self.negamax(&pos.play(mv), depth - 1, -beta, -alpha, ply + 1);
+            if self.aborted {
+                return 0;
+            }
             if score > best {
                 best = score;
             }
@@ -117,13 +211,14 @@ impl Searcher {
 mod tests {
     use super::*;
     use crate::position::{Color, Piece, Status};
+    use std::time::Duration;
 
     // A search with ordering disabled — used only to prove that ordering keeps the
     // score identical (correctness) while cutting the node count (the payoff).
     fn search_unordered(pos: &Position, depth: u32) -> SearchStats {
-        let mut searcher = Searcher { nodes: 0, ordered: false };
-        let best = searcher.root(pos, depth);
-        SearchStats { best, nodes: searcher.nodes }
+        let mut searcher = Searcher::new(false, None);
+        let best = searcher.root(pos, depth, None);
+        SearchStats { best, depth, nodes: searcher.nodes }
     }
 
     #[test]
@@ -198,17 +293,45 @@ mod tests {
         .unwrap();
         let ordered = search(&p, 4);
         let unordered = search_unordered(&p, 4);
-        println!(
-            "MVV-LVA @ depth 4: {} nodes vs {} unordered ({:.1}x fewer)",
-            ordered.nodes,
-            unordered.nodes,
-            unordered.nodes as f64 / ordered.nodes as f64
-        );
         assert!(
             ordered.nodes < unordered.nodes,
             "ordering should prune: ordered {} vs unordered {}",
             ordered.nodes,
             unordered.nodes
         );
+    }
+
+    #[test]
+    fn iterative_deepening_matches_direct_search() {
+        // With no deadline, deepening to depth D returns the same score as a direct
+        // depth-D search, and reports having reached D.
+        for fen in [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 0 3",
+        ] {
+            let p = Position::from_fen(fen).unwrap();
+            let deep = search_timed(&p, Limits::depth(4));
+            let direct = search(&p, 4);
+            assert_eq!(deep.best.map(|(_, s)| s), direct.best.map(|(_, s)| s));
+            assert_eq!(deep.depth, 4);
+        }
+    }
+
+    #[test]
+    fn a_tiny_budget_still_returns_a_legal_move() {
+        // Even a few milliseconds must yield at least the depth-1 result.
+        let p = Position::initial();
+        let stats = search_timed(&p, Limits::until(Instant::now() + Duration::from_millis(5)));
+        let (mv, _) = stats.best.expect("a move");
+        assert!(p.try_play(mv).is_ok(), "the returned move must be legal");
+        assert!(stats.depth >= 1);
+    }
+
+    #[test]
+    fn a_generous_budget_reaches_beyond_depth_one() {
+        // Given real time, deepening must go past depth 1.
+        let p = Position::initial();
+        let stats = search_timed(&p, Limits::until(Instant::now() + Duration::from_millis(500)));
+        assert!(stats.depth > 1, "expected depth > 1 with 500ms, got {}", stats.depth);
     }
 }
