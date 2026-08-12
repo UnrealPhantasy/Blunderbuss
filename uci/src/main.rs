@@ -385,10 +385,10 @@ mod tests {
 
     #[test]
     fn a_bare_go_is_bounded_by_time_not_by_a_fixed_depth() {
-        // A bare `go` used to mean a hard `DEFAULT_DEPTH = 4`, whatever the machine or
-        // the position. Two things must now hold, and neither depends on how fast this
-        // machine is — a fixed depth threshold would be flaky on slower hardware:
-        //   1. the plan carries no shallow cap;
+        // A bare `go` is bounded by the clock alone. Two things must hold, and neither
+        // may depend on how fast this machine is — asserting some absolute depth would
+        // go red on slower hardware:
+        //   1. the plan carries no shallow depth cap;
         //   2. the depth actually reached follows the budget.
         let plan = parse_go(&[], true, Duration::from_millis(DEFAULT_BUDGET_MS));
         assert_eq!(plan.max_depth, MAX_DEPTH, "no shallow depth cap remains");

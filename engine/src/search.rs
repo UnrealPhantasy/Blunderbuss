@@ -8,9 +8,8 @@
 //! returns the last *completed* depth's move. This iterative deepening is what lets
 //! the engine use a time budget — it can stop at any moment with a legal move — and
 //! each iteration orders the previous best move first, which prunes the next one
-//! better. Deepening to depth N therefore costs about as much as (often less than) a
-//! single direct depth-N pass, so there is no reason to keep a second, fixed-depth
-//! path: [`best_move`] is a thin convenience wrapper over the same function.
+//! better, so deepening to depth N costs about as much as (often less than) a single
+//! direct depth-N pass. [`best_move`] is a thin convenience wrapper over it.
 
 use crate::evaluation::evaluate;
 use crate::ordering::order_moves;
@@ -68,8 +67,7 @@ pub struct SearchStats {
 }
 
 /// The best move for `pos` at a fixed `depth`, or `None` at a terminal root.
-/// A convenience wrapper over [`search_timed`] — there is no separate fixed-depth
-/// implementation to keep in sync.
+/// A convenience wrapper over [`search_timed`], bounded by depth alone.
 pub fn best_move(pos: &Position, depth: u32) -> Option<(Move, i32)> {
     search_timed(pos, Limits::depth(depth)).best
 }
@@ -218,10 +216,9 @@ mod tests {
     use crate::position::{Color, Piece, Status};
     use std::time::Duration;
 
-    // A single fixed-depth pass — no deepening, no clock. It is not part of the
-    // engine's API (the engine only ever deepens); it survives here as a test oracle,
-    // to check that deepening reaches the same verdict as a direct search, and — with
-    // `ordered` flipped — that ordering keeps the score identical while cutting nodes.
+    // A single fixed-depth pass — no deepening, no clock — driving `Searcher` directly.
+    // The oracle these tests compare against: it gives the verdict a plain depth-D
+    // search reaches, and, with `ordered` flipped, isolates what move ordering does.
     fn search_fixed(pos: &Position, depth: u32, ordered: bool) -> SearchStats {
         let mut searcher = Searcher::new(ordered, None);
         let best = searcher.root(pos, depth, None);
@@ -311,8 +308,7 @@ mod tests {
     #[test]
     fn iterative_deepening_matches_direct_search() {
         // With no deadline, deepening to depth D returns the same score as a single
-        // direct depth-D pass, and reports having reached D. This is what makes the
-        // fixed-depth path removable: nothing is lost by always deepening.
+        // direct depth-D pass, and reports having reached D.
         for fen in [
             "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
             "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 0 3",
@@ -328,7 +324,7 @@ mod tests {
     #[test]
     fn best_move_goes_through_deepening() {
         // `best_move` is only a wrapper: same score as the deepening search it calls,
-        // and the same score a direct fixed-depth pass would have given.
+        // and as a direct fixed-depth pass.
         let p = Position::from_fen("4k3/8/8/3q4/8/8/8/3RK3 w - - 0 1").unwrap();
         let wrapped = best_move(&p, 4).map(|(_, s)| s);
         assert_eq!(wrapped, search_timed(&p, Limits::depth(4)).best.map(|(_, s)| s));
