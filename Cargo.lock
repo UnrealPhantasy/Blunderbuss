@@ -23,3 +23,10 @@ version = "0.1.0"
 dependencies = [
  "cozy-chess",
 ]
+
+[[package]]
+name = "uci"
+version = "0.1.0"
+dependencies = [
+ "engine",
+]

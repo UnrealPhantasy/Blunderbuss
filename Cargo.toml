@@ -12,7 +12,7 @@
 
 [workspace]
 resolver = "3"
-members = ["engine"]
+members = ["engine", "uci"]
 
 [workspace.package]
 edition = "2024"

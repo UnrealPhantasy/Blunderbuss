@@ -127,6 +127,21 @@ impl Position {
         self.0.piece_on(square)
     }
 
+    /// This move rendered as a UCI string (e.g. `"e2e4"`, `"e7e8q"`, `"e1g1"`).
+    ///
+    /// Goes through cozy-chess's UCI helper, which converts the crate's internal
+    /// king-captures-rook castling notation (`e1h1`) to the standard UCI form
+    /// (`e1g1`). Keeping this here confines that quirk to the boundary.
+    pub fn move_to_uci(&self, mv: Move) -> String {
+        cozy_chess::util::display_uci_move(&self.0, mv).to_string()
+    }
+
+    /// Parses a UCI move string for this position, or `None` if it does not
+    /// parse. Also converts UCI castling (`e1g1`) to the internal notation.
+    pub fn move_from_uci(&self, s: &str) -> Option<Move> {
+        cozy_chess::util::parse_uci_move(&self.0, s).ok()
+    }
+
     /// All legal moves in the position.
     ///
     /// First version: we fill a `Vec`. Move ordering and staged generation (not
@@ -260,5 +275,21 @@ mod tests {
         let size = std::mem::size_of::<Board>();
         println!("size_of::<cozy_chess::Board>() = {size} bytes");
         assert!(size > 0);
+    }
+
+    #[test]
+    fn uci_move_roundtrips_including_castling() {
+        // A normal move round-trips through UCI.
+        let start = Position::initial();
+        let e2e4 = start.move_from_uci("e2e4").expect("e2e4 parses");
+        assert_eq!(start.move_to_uci(e2e4), "e2e4");
+
+        // Castling: cozy-chess stores kingside castling as `e1h1` internally, but
+        // UCI is `e1g1`. Both directions must speak the standard UCI form.
+        let p = Position::from_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1").unwrap();
+        let castle = p.move_from_uci("e1g1").expect("e1g1 parses as a castle");
+        assert_eq!(p.move_to_uci(castle), "e1g1");
+        let after = p.try_play(castle).expect("kingside castling is legal here");
+        assert_eq!(after.piece_on(Square::G1), Some(Piece::King));
     }
 }
