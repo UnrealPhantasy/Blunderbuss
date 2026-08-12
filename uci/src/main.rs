@@ -54,14 +54,14 @@ struct GoPlan {
     budget: Option<Duration>,
 }
 
-/// Map the arguments of `go` to a [`GoPlan`]. `white_to_move` selects which side's
+/// Map the arguments of `go` to a [`GoPlan`]. `side_to_move` selects which side's
 /// clock to read; `default_budget` is used when the command names no limit at all.
 ///
 /// The rules, in order: an explicit `depth` sets the cap; `movetime` sets the budget,
 /// otherwise a clock (`wtime`/`btime`) does. A command with a depth but no time runs
 /// unbounded in time; one with neither — a bare `go`, or `go infinite`, which we
 /// cannot interrupt without `stop` — falls back to `default_budget`.
-fn parse_go(args: &[&str], white_to_move: bool, default_budget: Duration) -> GoPlan {
+fn parse_go(args: &[&str], side_to_move: Color, default_budget: Duration) -> GoPlan {
     // The protocol sends `key value` pairs; read the number following `key`.
     let value = |key: &str| -> Option<u64> {
         args.iter()
@@ -77,8 +77,9 @@ fn parse_go(args: &[&str], white_to_move: bool, default_budget: Duration) -> GoP
         Some(Duration::from_millis(mt.saturating_sub(SAFETY_MS).max(1)))
     } else if value("wtime").is_some() || value("btime").is_some() {
         // Use the side-to-move's own clock and increment.
-        let remaining = if white_to_move { value("wtime") } else { value("btime") }.unwrap_or(0);
-        let inc = if white_to_move { value("winc") } else { value("binc") }.unwrap_or(0);
+        let white = side_to_move == Color::White;
+        let remaining = if white { value("wtime") } else { value("btime") }.unwrap_or(0);
+        let inc = if white { value("winc") } else { value("binc") }.unwrap_or(0);
         Some(time_budget(
             Duration::from_millis(remaining),
             Duration::from_millis(inc),
@@ -201,11 +202,7 @@ impl Uci {
     /// Every form goes through the same two steps — plan, then search — so the engine
     /// has a single search path whatever the GUI sends.
     fn go(&self, args: &[&str]) -> String {
-        let plan = parse_go(
-            args,
-            self.position.side_to_move() == Color::White,
-            self.default_budget,
-        );
+        let plan = parse_go(args, self.position.side_to_move(), self.default_budget);
         let deadline = plan.budget.map(|b| Instant::now() + b);
         let stats = search_timed(&self.position, Limits::bounded(plan.max_depth, deadline));
 
@@ -322,27 +319,27 @@ mod tests {
     #[test]
     fn go_depth_plans_a_depth_cap_and_no_clock() {
         assert_eq!(
-            parse_go(&["depth", "5"], true, FALLBACK),
+            parse_go(&["depth", "5"], Color::White, FALLBACK),
             GoPlan { max_depth: 5, budget: None }
         );
     }
 
     #[test]
     fn go_movetime_plans_a_budget_minus_the_safety_margin() {
-        let plan = parse_go(&["movetime", "1000"], true, FALLBACK);
+        let plan = parse_go(&["movetime", "1000"], Color::White, FALLBACK);
         assert_eq!(plan.max_depth, MAX_DEPTH, "no depth cap was asked for");
         assert_eq!(plan.budget, Some(Duration::from_millis(1000 - SAFETY_MS)));
         // A movetime smaller than the margin must still leave something to search
         // with, rather than underflowing to a huge budget or to zero.
-        let tiny = parse_go(&["movetime", "10"], true, FALLBACK).budget.unwrap();
+        let tiny = parse_go(&["movetime", "10"], Color::White, FALLBACK).budget.unwrap();
         assert_eq!(tiny, Duration::from_millis(1));
     }
 
     #[test]
     fn go_with_a_clock_reads_the_side_to_moves_own_clock() {
         let args = ["wtime", "60000", "btime", "6000", "winc", "0", "binc", "0"];
-        let white = parse_go(&args, true, FALLBACK).budget.expect("a budget");
-        let black = parse_go(&args, false, FALLBACK).budget.expect("a budget");
+        let white = parse_go(&args, Color::White, FALLBACK).budget.expect("a budget");
+        let black = parse_go(&args, Color::Black, FALLBACK).budget.expect("a budget");
         // White has ten times Black's time, so White must plan to think longer —
         // proof that the side to move selects which clock is read.
         assert!(white > black, "white {white:?} should exceed black {black:?}");
@@ -351,14 +348,14 @@ mod tests {
 
         // The increment is read from the same side.
         let with_inc = ["wtime", "60000", "btime", "60000", "winc", "0", "binc", "4000"];
-        let black_inc = parse_go(&with_inc, false, FALLBACK).budget.expect("a budget");
-        assert!(black_inc > parse_go(&with_inc, true, FALLBACK).budget.unwrap());
+        let black_inc = parse_go(&with_inc, Color::Black, FALLBACK).budget.expect("a budget");
+        assert!(black_inc > parse_go(&with_inc, Color::White, FALLBACK).budget.unwrap());
     }
 
     #[test]
     fn go_depth_and_movetime_honours_both_bounds() {
         // The protocol allows both; `Limits` can carry both, so neither is dropped.
-        let plan = parse_go(&["depth", "6", "movetime", "2000"], true, FALLBACK);
+        let plan = parse_go(&["depth", "6", "movetime", "2000"], Color::White, FALLBACK);
         assert_eq!(plan.max_depth, 6);
         assert_eq!(plan.budget, Some(Duration::from_millis(2000 - SAFETY_MS)));
     }
@@ -369,7 +366,7 @@ mod tests {
         // cannot be interrupted (`stop` is unimplemented), so we time-box ourselves.
         for args in [vec![], vec!["infinite"]] {
             assert_eq!(
-                parse_go(&args, true, FALLBACK),
+                parse_go(&args, Color::White, FALLBACK),
                 GoPlan { max_depth: MAX_DEPTH, budget: Some(FALLBACK) },
                 "args {args:?} should fall back to the default budget"
             );
@@ -379,7 +376,7 @@ mod tests {
     #[test]
     fn unknown_go_arguments_are_ignored() {
         // Arguments we do not implement must not disturb the ones we do.
-        let plan = parse_go(&["ponder", "searchmoves", "e2e4", "depth", "3"], true, FALLBACK);
+        let plan = parse_go(&["ponder", "searchmoves", "e2e4", "depth", "3"], Color::White, FALLBACK);
         assert_eq!(plan, GoPlan { max_depth: 3, budget: None });
     }
 
@@ -390,7 +387,7 @@ mod tests {
         // go red on slower hardware:
         //   1. the plan carries no shallow depth cap;
         //   2. the depth actually reached follows the budget.
-        let plan = parse_go(&[], true, Duration::from_millis(DEFAULT_BUDGET_MS));
+        let plan = parse_go(&[], Color::White, Duration::from_millis(DEFAULT_BUDGET_MS));
         assert_eq!(plan.max_depth, MAX_DEPTH, "no shallow depth cap remains");
 
         let depth_for = |budget: Duration| {
@@ -400,7 +397,9 @@ mod tests {
             )
             .depth
         };
-        let brief = depth_for(Duration::from_millis(20));
+        // 2 ms buys depth 1-2 while the default budget reaches 5 in a debug build and 6
+        // in release — two plies of slack, so a slow or loaded machine still passes.
+        let brief = depth_for(Duration::from_millis(2));
         let full = depth_for(plan.budget.expect("a bare `go` plans a budget"));
         assert!(
             full > brief,
