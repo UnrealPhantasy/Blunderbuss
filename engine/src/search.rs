@@ -348,6 +348,19 @@ mod tests {
     }
 
     #[test]
+    fn an_expired_deadline_still_returns_the_guaranteed_iteration() {
+        // A flag-fall can reach the engine as a deadline already in the past. Depth 1
+        // is owed anyway: `check_time` only reads the clock every 2048 nodes and depth
+        // 1 costs 21 from the start position, so the first iteration always completes;
+        // the deadline is then re-checked between iterations and stops the loop there.
+        // Structural, hence an equality — it holds at any speed.
+        let expired = Instant::now() - Duration::from_secs(1);
+        let stats = search_timed(&Position::initial(), Limits::bounded(MAX_DEPTH, Some(expired)));
+        assert_eq!(stats.depth, 1, "an expired deadline still owes one iteration");
+        assert!(stats.best.is_some(), "a legal move is always returned");
+    }
+
+    #[test]
     fn a_tiny_budget_still_returns_a_legal_move() {
         // Even a few milliseconds must yield at least the depth-1 result.
         let p = Position::initial();
