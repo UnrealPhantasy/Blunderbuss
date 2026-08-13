@@ -777,15 +777,18 @@ mod tests {
         ] {
             let pos = Position::from_fen(fen).unwrap();
             let mut reported = Vec::new();
-            let mut record = |p: &Progress| reported.push(p.depth);
-            let stats = search(
-                &pos,
-                Request {
-                    limits: Limits::until(Instant::now() + Duration::from_millis(budget)),
-                    progress: Some(&mut record),
-                },
-            );
-            drop(record);
+            // The closure borrows `reported` mutably, so it has to go out of scope
+            // before the assertion can read it — hence the block rather than a `drop`.
+            let stats = {
+                let mut record = |p: &Progress| reported.push(p.depth);
+                search(
+                    &pos,
+                    Request {
+                        limits: Limits::until(Instant::now() + Duration::from_millis(budget)),
+                        progress: Some(&mut record),
+                    },
+                )
+            };
             assert_eq!(
                 reported,
                 (1..=stats.depth).collect::<Vec<u32>>(),
