@@ -10,7 +10,8 @@
 //! position    the Position interface + its cozy-chess-backed implementation
 //! evaluation  material, piece-square tables (PST), then the rest
 //! ordering    move ordering — MVV-LVA, killer moves, history
-//! search      alpha-beta, quiescence, iterative deepening, transposition
+//! transposition  the cache of already-searched positions, keyed by Zobrist
+//! search      alpha-beta, quiescence, iterative deepening
 //! ```
 //!
 //! Modules are declared here as they are written. In Rust, a module is compiled
@@ -20,4 +21,5 @@
 pub mod position;
 pub mod evaluation;
 pub mod ordering;
+pub mod transposition;
 pub mod search;

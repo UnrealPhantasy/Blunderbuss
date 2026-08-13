@@ -14,6 +14,7 @@
 use crate::evaluation::evaluate;
 use crate::ordering::{mvv_lva, order_moves};
 use crate::position::{Move, Piece, Position};
+use crate::transposition::{Bound, Table};
 use std::time::Instant;
 
 /// A mate score, large enough to dominate any material balance. The distance to
@@ -59,11 +60,20 @@ impl Limits {
 }
 
 /// The outcome of a search: the chosen move and its score (side-to-move
-/// perspective), the deepest **completed** depth, and the node count.
+/// perspective), the deepest **completed** depth, the node count, and what the
+/// transposition table contributed.
 pub struct SearchStats {
     pub best: Option<(Move, i32)>,
     pub depth: u32,
     pub nodes: u64,
+    /// Fraction of probes that found an entry for the position asked about.
+    /// Reported because node counts alone cannot distinguish a table that is never
+    /// read from one whose every match is rejected as a collision.
+    pub table_key_match_rate: f64,
+    /// Fraction of probes that returned a score, and so skipped a subtree. Always
+    /// the lower of the two: about half of the matches are too shallow to cut off
+    /// and contribute move ordering only.
+    pub table_cutoff_rate: f64,
 }
 
 /// Whether `mv` promotes a pawn to a queen.
@@ -131,7 +141,13 @@ pub fn search_timed(pos: &Position, limits: Limits) -> SearchStats {
             }
         }
     }
-    SearchStats { best, depth: completed, nodes: searcher.nodes }
+    SearchStats {
+        best,
+        depth: completed,
+        nodes: searcher.nodes,
+        table_key_match_rate: searcher.table.key_match_rate(),
+        table_cutoff_rate: searcher.table.cutoff_rate(),
+    }
 }
 
 /// Carries the state shared by the whole search: the node counter, the ordering
@@ -142,11 +158,14 @@ struct Searcher {
     ordered: bool,
     deadline: Option<Instant>,
     aborted: bool,
+    /// Lives for the whole `search_timed` call, so iteration N+1 reuses what
+    /// iteration N learned. That reuse is a large part of why the table pays.
+    table: Table,
 }
 
 impl Searcher {
     fn new(ordered: bool, deadline: Option<Instant>) -> Searcher {
-        Searcher { nodes: 0, ordered, deadline, aborted: false }
+        Searcher { nodes: 0, ordered, deadline, aborted: false, table: Table::new() }
     }
 
     /// Set `aborted` if the deadline has passed. Checked only every so often
@@ -214,6 +233,13 @@ impl Searcher {
             return self.quiescence(pos, alpha, beta, ply);
         }
 
+        // Have we been here before, by another move order or in an earlier iteration?
+        let key = pos.hash();
+        let hit = self.table.probe(key, depth, alpha, beta, ply);
+        if let Some(score) = hit.cutoff {
+            return score;
+        }
+
         let mut moves = pos.legal_moves();
         if moves.is_empty() {
             // Terminal: checkmate (side to move loses) or stalemate (draw).
@@ -222,15 +248,29 @@ impl Searcher {
         if self.ordered {
             order_moves(pos, &mut moves);
         }
+        // The cached move goes first, ahead even of the best capture. A previous
+        // search already found it good here, and a good first move is what makes the
+        // cutoffs below cheap — often a larger win than the cutoffs the table itself
+        // provides.
+        if let Some(cached) = hit.best {
+            if let Some(i) = moves.iter().position(|&mv| mv == cached) {
+                moves.swap(0, i);
+            }
+        }
 
+        // Kept to classify the result: a value that never beat the alpha we started
+        // with is only an upper bound on this node, not its value.
+        let alpha_before = alpha;
         let mut best = -INF;
+        let mut best_move = None;
         for &mv in &moves {
             let score = -self.negamax(&pos.play(mv), depth - 1, -beta, -alpha, ply + 1);
             if self.aborted {
-                return 0;
+                return 0; // nothing worth caching: the value is a placeholder
             }
             if score > best {
                 best = score;
+                best_move = Some(mv);
             }
             if best > alpha {
                 alpha = best;
@@ -239,6 +279,15 @@ impl Searcher {
                 break; // Beta cutoff: this branch cannot improve the result.
             }
         }
+
+        let bound = if best <= alpha_before {
+            Bound::Upper // no move beat alpha: the true value is at most `best`
+        } else if best >= beta {
+            Bound::Lower // we stopped early: the true value is at least `best`
+        } else {
+            Bound::Exact // the window contained the answer
+        };
+        self.table.store_at(key, depth, best, bound, best_move, ply);
         best
     }
 
@@ -321,7 +370,13 @@ mod tests {
     fn search_fixed(pos: &Position, depth: u32, ordered: bool) -> SearchStats {
         let mut searcher = Searcher::new(ordered, None);
         let best = searcher.root(pos, depth, None);
-        SearchStats { best, depth, nodes: searcher.nodes }
+        SearchStats {
+            best,
+            depth,
+            nodes: searcher.nodes,
+            table_key_match_rate: searcher.table.key_match_rate(),
+            table_cutoff_rate: searcher.table.cutoff_rate(),
+        }
     }
 
     #[test]
@@ -405,6 +460,64 @@ mod tests {
             ordered.nodes,
             unordered.nodes
         );
+    }
+
+    #[test]
+    fn a_repeated_search_reuses_the_table() {
+        // The same position, twice, on one `Searcher`. The second pass asks the very
+        // questions the first one answered, so almost all of it should come out of the
+        // table rather than the tree.
+        let p = Position::initial();
+        let mut searcher = Searcher::new(true, None);
+        searcher.root(&p, 5, None);
+        let first = searcher.nodes;
+        searcher.nodes = 0;
+        searcher.root(&p, 5, None);
+        let second = searcher.nodes;
+        assert!(
+            second * 10 < first,
+            "a cached re-search should cost a fraction of the first: {second} against {first}"
+        );
+    }
+
+    #[test]
+    fn the_table_is_actually_consulted() {
+        // Guards against a table that is written but never read, or one whose every
+        // hit is discarded as a collision — both look like a working table from the
+        // node count alone, which is why the hit rate is reported.
+        let p = Position::from_fen(
+            "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 0 3",
+        )
+        .unwrap();
+        let stats = search_timed(&p, Limits::depth(5));
+        assert!(
+            stats.table_key_match_rate > 0.05,
+            "expected the table to answer some probes, got {:.3}",
+            stats.table_key_match_rate
+        );
+        assert!(
+            stats.table_cutoff_rate > 0.0,
+            "and some of those matches must actually cut off, got {:.3}",
+            stats.table_cutoff_rate
+        );
+    }
+
+    #[test]
+    fn a_cached_mate_keeps_its_distance() {
+        // Mate scores are stored relative to the node, not to the root, so a mate
+        // cached at one depth must still read as the same mate at another. If the
+        // conversion were wrong, deepening would report a different mate distance at
+        // each iteration — an engine that announces mate and then does not deliver.
+        let p = Position::from_fen("6k1/5ppp/8/8/8/8/8/R6K w - - 0 1").unwrap();
+        let mut previous = None;
+        for depth in 3..=6 {
+            let (_, score) = best_move(&p, depth).expect("a move");
+            assert!(score >= MATE - 100, "depth {depth} lost the mate: {score}");
+            if let Some(before) = previous {
+                assert_eq!(score, before, "the mate distance moved between iterations");
+            }
+            previous = Some(score);
+        }
     }
 
     #[test]
