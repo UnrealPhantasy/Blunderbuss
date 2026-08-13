@@ -249,21 +249,18 @@ mod tests {
 
     #[test]
     fn a_key_mismatch_is_ignored() {
-        // Two keys one table-size apart share an index — the collision case.
+        // Two keys one table-size apart share an index — the collision case. This is
+        // the test that guards the failure nobody would notice: one position's score
+        // silently attributed to another.
         let mut t = Table::new();
         let key = 1234u64;
         let colliding = key + (ENTRIES as u64);
-        let mut probe = Table::new();
-        probe.store(key, 9, 999, Bound::Exact, Some(a_move()));
-        assert_eq!(
-            probe.index(key),
-            probe.index(colliding),
-            "the test needs two keys that actually collide"
-        );
-        let hit = probe.probe(colliding, 1, -100, 100, 0);
+        assert_eq!(t.index(key), t.index(colliding), "the keys must actually collide");
+
+        t.store(key, 9, 999, Bound::Exact, Some(a_move()));
+        let hit = t.probe(colliding, 1, -100, 100, 0);
         assert_eq!(hit.cutoff, None, "another position's score must never be returned");
         assert_eq!(hit.best, None, "nor its move");
-        t.store(key, 1, 1, Bound::Exact, None);
     }
 
     #[test]
