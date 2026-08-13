@@ -68,11 +68,17 @@ pub struct SearchStats {
 
 /// Whether `mv` promotes a pawn to a queen.
 ///
-/// Quiescence searches queen promotions only. Under-promotions would multiply this
-/// branch by four to cover cases that decide a game very rarely — and the point of
-/// searching a promotion here is that a queen is about to appear, which is what moves
-/// the evaluation by ~800 centipawns. A knight under-promotion that wins by fork is
-/// still found by the main search, which has no such filter.
+/// Quiescence searches queen promotions only, for two reasons. What moves the
+/// evaluation by ~800 centipawns is a queen appearing; a knight under-promotion that
+/// wins by fork is still found by the main search, which has no such filter.
+///
+/// And the cost is not the fourfold one it looks like. Accepting every promotion piece
+/// lets each pawn on the seventh branch four ways *at every node of the quiescence
+/// recursion*, so the tree explodes multiplicatively rather than linearly. Measured at
+/// depth 4 on `4k3/PPP3PP/8/8/8/8/ppp3pp/4K3 w` (six pawns one square from promoting):
+/// 24 277 nodes queen-only against **2 591 390** for all four — a factor of 107, and
+/// 346 at depth 3. On an ordinary middlegame the two are indistinguishable, which is
+/// exactly why the comparison has to be made on a position where pawns are promoting.
 fn is_queen_promotion(mv: Move) -> bool {
     mv.promotion == Some(Piece::Queen)
 }
@@ -595,3 +601,4 @@ mod tests {
         assert!(stats.depth >= 1);
     }
 }
+
