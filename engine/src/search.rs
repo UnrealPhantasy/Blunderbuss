@@ -356,13 +356,16 @@ mod tests {
 
     #[test]
     fn ordering_prunes_more_nodes() {
-        // On a middlegame position, ordering must visit strictly fewer nodes.
+        // On a middlegame position, ordering must visit strictly fewer nodes. Depth 3
+        // rather than 4: quiescence multiplies what the unordered search explores —
+        // 229k nodes here against 2.3M at depth 4 — and the gap is already a factor of
+        // 33, so the extra ply costs ten times the runtime to prove the same thing.
         let p = Position::from_fen(
             "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 0 3",
         )
         .unwrap();
-        let ordered = search_fixed(&p, 4, true);
-        let unordered = search_fixed(&p, 4, false);
+        let ordered = search_fixed(&p, 3, true);
+        let unordered = search_fixed(&p, 3, false);
         assert!(
             ordered.nodes < unordered.nodes,
             "ordering should prune: ordered {} vs unordered {}",
