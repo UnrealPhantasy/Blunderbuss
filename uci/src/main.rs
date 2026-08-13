@@ -550,16 +550,20 @@ mod tests {
     #[test]
     fn an_unfinished_iteration_is_not_reported() {
         // The search discards an aborted iteration, so announcing its depth would mean
-        // walking the claim back — worse than saying nothing. With an expired deadline
-        // only the guaranteed first iteration completes.
+        // walking the claim back — worse than saying nothing.
+        //
+        // Measured, not assumed: Kiwipete's first iteration costs ~25 900 nodes against
+        // a 2048-node clock check, so a 1 ms budget always cuts it short and **nothing**
+        // completes. The log is therefore empty, and asserting emptiness is what makes
+        // this discriminating — an upper bound of one would also accept the single line
+        // a defective implementation emits.
         let (mut uci, log) = uci_with_log();
         uci.handle("position fen r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
         uci.handle("go movetime 51");
-        let lines = log.borrow();
-        let depths: Vec<&str> = lines.iter().filter_map(|l| l.split_whitespace().nth(2)).collect();
         assert!(
-            depths.len() <= 1,
-            "at most the completed iteration should be reported, got {depths:?}"
+            log.borrow().is_empty(),
+            "an aborted iteration must not be announced, got {:?}",
+            log.borrow()
         );
     }
 
