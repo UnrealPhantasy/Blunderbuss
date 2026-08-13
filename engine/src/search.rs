@@ -12,7 +12,7 @@
 //! direct depth-N pass. [`best_move`] is a thin convenience wrapper over it.
 
 use crate::evaluation::evaluate;
-use crate::ordering::order_moves;
+use crate::ordering::{mvv_lva, order_moves};
 use crate::position::{Move, Position};
 use std::time::Instant;
 
@@ -89,7 +89,18 @@ pub fn search_timed(pos: &Position, limits: Limits) -> SearchStats {
         let result = searcher.root(pos, depth, pv);
 
         if searcher.aborted {
-            break; // ran out of time mid-iteration: discard it, keep the last one
+            // Ran out of time mid-iteration: discard it and keep the last complete one.
+            // Unless there is none — a capture-rich position can spend more than the
+            // 2048 nodes between clock checks inside iteration 1 alone, so even the
+            // first iteration can be cut short. The partial root result is then all we
+            // have, and it is still a legal move: `root` seeds `best_move` with
+            // `moves[0]` before searching anything. Returning it beats returning
+            // nothing, which the UCI layer would report as `bestmove 0000` — an
+            // illegal move, and an instant forfeit in any arena.
+            if best.is_none() {
+                best = result;
+            }
+            break;
         }
         best = result;
         completed = depth;
@@ -178,13 +189,18 @@ impl Searcher {
             return 0; // value ignored: the whole iteration is thrown away
         }
 
+        // Out of depth, but not necessarily out of danger: hand over to quiescence
+        // rather than evaluating a position that may be mid-exchange. Checked before
+        // generating moves, since quiescence generates them itself — and it is the one
+        // that detects mate and stalemate from here on.
+        if depth == 0 {
+            return self.quiescence(pos, alpha, beta, ply);
+        }
+
         let mut moves = pos.legal_moves();
         if moves.is_empty() {
             // Terminal: checkmate (side to move loses) or stalemate (draw).
             return if pos.in_check() { -(MATE - ply) } else { 0 };
-        }
-        if depth == 0 {
-            return evaluate(pos);
         }
         if self.ordered {
             order_moves(pos, &mut moves);
@@ -204,6 +220,67 @@ impl Searcher {
             }
             if alpha >= beta {
                 break; // Beta cutoff: this branch cannot improve the result.
+            }
+        }
+        best
+    }
+
+    /// Search on past the depth limit, over **captures only**, until the position is
+    /// quiet — then evaluate. Without this, a leaf landing in the middle of an
+    /// exchange is scored as if the exchange stopped there, and the engine comes to
+    /// prefer moves that push a loss just beyond its own horizon.
+    ///
+    /// No depth argument: the recursion ends on its own, because every capture takes
+    /// a piece off the board and there are finitely many.
+    fn quiescence(&mut self, pos: &Position, mut alpha: i32, beta: i32, ply: i32) -> i32 {
+        self.nodes += 1;
+        self.check_time();
+        if self.aborted {
+            return 0; // value ignored: the whole iteration is thrown away
+        }
+
+        // Generate every legal move, not just the captures: it is the only way to
+        // tell mate and stalemate from a merely quiet position, and scoring a mate
+        // as a material count is exactly the lie this function exists to remove.
+        let mut moves = pos.legal_moves();
+        if moves.is_empty() {
+            return if pos.in_check() { -(MATE - ply) } else { 0 };
+        }
+
+        // "Stand pat": the side to move is never *obliged* to capture, so the static
+        // score is a lower bound on what they can get here. That makes it usable both
+        // as a cutoff and as the starting `alpha` — and it is what stops the search
+        // from playing out a losing exchange just because it is the only capture.
+        let stand_pat = evaluate(pos);
+        if stand_pat >= beta {
+            return stand_pat;
+        }
+        if stand_pat > alpha {
+            alpha = stand_pat;
+        }
+
+        // Idiom: `retain` filters the vector in place, keeping the elements the
+        // closure accepts. `mvv_lva` scores quiet moves 0 and captures above it, so
+        // it doubles as the capture test.
+        moves.retain(|&mv| mvv_lva(pos, mv) > 0);
+        if self.ordered {
+            order_moves(pos, &mut moves);
+        }
+
+        let mut best = stand_pat;
+        for &mv in &moves {
+            let score = -self.quiescence(&pos.play(mv), -beta, -alpha, ply + 1);
+            if self.aborted {
+                return 0;
+            }
+            if score > best {
+                best = score;
+            }
+            if best > alpha {
+                alpha = best;
+            }
+            if alpha >= beta {
+                break;
             }
         }
         best
@@ -290,13 +367,16 @@ mod tests {
 
     #[test]
     fn ordering_prunes_more_nodes() {
-        // On a middlegame position, ordering must visit strictly fewer nodes.
+        // On a middlegame position, ordering must visit strictly fewer nodes. Depth 3
+        // rather than 4: quiescence multiplies what the unordered search explores —
+        // 229k nodes here against 2.3M at depth 4 — and the gap is already a factor of
+        // 33, so the extra ply costs ten times the runtime to prove the same thing.
         let p = Position::from_fen(
             "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 0 3",
         )
         .unwrap();
-        let ordered = search_fixed(&p, 4, true);
-        let unordered = search_fixed(&p, 4, false);
+        let ordered = search_fixed(&p, 3, true);
+        let unordered = search_fixed(&p, 3, false);
         assert!(
             ordered.nodes < unordered.nodes,
             "ordering should prune: ordered {} vs unordered {}",
@@ -353,17 +433,101 @@ mod tests {
         assert!(stats.best.is_some(), "a legal move is always returned");
     }
 
+    // The position behind the quiescence tests: White's queen can take the d6 pawn,
+    // and the e7 pawn takes it straight back. A search that stops counting after the
+    // capture sees a won pawn; one that plays the exchange out sees a lost queen.
+    const HORIZON: &str = "4k3/4p3/3p4/8/8/8/8/3QK3 w - - 0 1";
+
+    // Quiescence from `pos`, on a full window — what a leaf of the main search gets.
+    fn quiesce(pos: &Position) -> i32 {
+        Searcher::new(true, None).quiescence(pos, -INF, INF, 0)
+    }
+
+    #[test]
+    fn the_recapture_is_seen_past_the_depth_limit() {
+        let p = Position::from_fen(HORIZON).unwrap();
+        let static_eval = evaluate(&p);
+        // At depth 1 the capture is the very last ply, so its recapture falls exactly
+        // one ply beyond the limit — the horizon effect in its purest form. The score
+        // must not claim the pawn: taking it costs the queen.
+        let (_, score) = best_move(&p, 1).expect("a move");
+        assert!(
+            score < static_eval + 100,
+            "score {score} claims material over the static {static_eval}: the recapture was missed"
+        );
+    }
+
+    #[test]
+    fn a_losing_capture_is_not_forced() {
+        // Qxd6 is the only capture available and it loses the queen. Standing pat is
+        // always allowed, so the value of the position is the static score, never the
+        // best of a bad set of captures.
+        let p = Position::from_fen(HORIZON).unwrap();
+        assert_eq!(quiesce(&p), evaluate(&p));
+    }
+
+    #[test]
+    fn a_quiet_position_is_worth_its_static_score() {
+        // Nothing to capture: quiescence has no work to do and must agree exactly with
+        // the evaluation it extends.
+        let p = Position::from_fen("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1").unwrap();
+        assert_eq!(quiesce(&p), evaluate(&p));
+    }
+
+    #[test]
+    fn a_winning_capture_is_taken() {
+        // The mirror case: the rook on a7 is undefended, so quiescence must find the
+        // queen takes it and report roughly a rook more than the static score.
+        let p = Position::from_fen("4k3/r7/8/8/8/8/8/Q3K3 w - - 0 1").unwrap();
+        assert!(
+            quiesce(&p) >= evaluate(&p) + 400,
+            "expected a free rook, got {} over {}",
+            quiesce(&p),
+            evaluate(&p)
+        );
+    }
+
+    #[test]
+    fn terminal_positions_are_still_terminal_at_a_leaf() {
+        // Quiescence took over leaf duty from `negamax`, so it owns mate and stalemate
+        // detection there: a mate must score as a mate, not as a material count.
+        let mate = Position::from_fen(
+            "r1bqkb1r/pppp1Qpp/2n2n2/4p3/2B1P3/8/PPPP1PPP/RNB1K1NR b KQkq - 0 4",
+        )
+        .unwrap();
+        let stalemate = Position::from_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1").unwrap();
+        assert_eq!(quiesce(&mate), -MATE);
+        assert_eq!(quiesce(&stalemate), 0);
+    }
+
     #[test]
     fn an_expired_deadline_still_returns_the_guaranteed_iteration() {
-        // A flag-fall can reach the engine as a deadline already in the past. Depth 1
-        // is owed anyway: `check_time` only reads the clock every 2048 nodes and depth
-        // 1 costs 21 from the start position, so the first iteration always completes;
-        // the deadline is then re-checked between iterations and stops the loop there.
-        // Structural, hence an equality — it holds at any speed.
+        // A flag-fall can reach the engine as a deadline already in the past. From a
+        // quiet position depth 1 is owed anyway: `check_time` only reads the clock
+        // every 2048 nodes and iteration 1 costs 41 from the start position, so it
+        // completes; the deadline is then re-checked between iterations and stops the
+        // loop there. Structural for *this* position, hence an equality.
         let expired = Instant::now() - Duration::from_secs(1);
         let stats = search_timed(&Position::initial(), Limits::bounded(MAX_DEPTH, Some(expired)));
         assert_eq!(stats.depth, 1, "an expired deadline still owes one iteration");
         assert!(stats.best.is_some(), "a legal move is always returned");
+    }
+
+    #[test]
+    fn a_legal_move_comes_back_even_when_iteration_one_is_cut_short() {
+        // The node argument above does *not* generalise: quiescence makes iteration 1
+        // cost 25 906 nodes on Kiwipete against 41 from the start position, so the
+        // abort can land inside the very first iteration and leave nothing complete to
+        // fall back on. A move must still come back — the alternative is `bestmove
+        // 0000`, which an arena scores as an illegal move and an immediate loss.
+        let kiwipete = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .unwrap();
+        let expired = Instant::now() - Duration::from_secs(1);
+        let stats = search_timed(&kiwipete, Limits::bounded(MAX_DEPTH, Some(expired)));
+        let (mv, _) = stats.best.expect("a move, even from an unfinished iteration");
+        assert!(kiwipete.try_play(mv).is_ok(), "the returned move must be legal");
     }
 
     #[test]
