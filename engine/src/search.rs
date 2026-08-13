@@ -89,7 +89,18 @@ pub fn search_timed(pos: &Position, limits: Limits) -> SearchStats {
         let result = searcher.root(pos, depth, pv);
 
         if searcher.aborted {
-            break; // ran out of time mid-iteration: discard it, keep the last one
+            // Ran out of time mid-iteration: discard it and keep the last complete one.
+            // Unless there is none — a capture-rich position can spend more than the
+            // 2048 nodes between clock checks inside iteration 1 alone, so even the
+            // first iteration can be cut short. The partial root result is then all we
+            // have, and it is still a legal move: `root` seeds `best_move` with
+            // `moves[0]` before searching anything. Returning it beats returning
+            // nothing, which the UCI layer would report as `bestmove 0000` — an
+            // illegal move, and an instant forfeit in any arena.
+            if best.is_none() {
+                best = result;
+            }
+            break;
         }
         best = result;
         completed = depth;
@@ -491,15 +502,32 @@ mod tests {
 
     #[test]
     fn an_expired_deadline_still_returns_the_guaranteed_iteration() {
-        // A flag-fall can reach the engine as a deadline already in the past. Depth 1
-        // is owed anyway: `check_time` only reads the clock every 2048 nodes and depth
-        // 1 costs 21 from the start position, so the first iteration always completes;
-        // the deadline is then re-checked between iterations and stops the loop there.
-        // Structural, hence an equality — it holds at any speed.
+        // A flag-fall can reach the engine as a deadline already in the past. From a
+        // quiet position depth 1 is owed anyway: `check_time` only reads the clock
+        // every 2048 nodes and iteration 1 costs 41 from the start position, so it
+        // completes; the deadline is then re-checked between iterations and stops the
+        // loop there. Structural for *this* position, hence an equality.
         let expired = Instant::now() - Duration::from_secs(1);
         let stats = search_timed(&Position::initial(), Limits::bounded(MAX_DEPTH, Some(expired)));
         assert_eq!(stats.depth, 1, "an expired deadline still owes one iteration");
         assert!(stats.best.is_some(), "a legal move is always returned");
+    }
+
+    #[test]
+    fn a_legal_move_comes_back_even_when_iteration_one_is_cut_short() {
+        // The node argument above does *not* generalise: quiescence makes iteration 1
+        // cost 25 906 nodes on Kiwipete against 41 from the start position, so the
+        // abort can land inside the very first iteration and leave nothing complete to
+        // fall back on. A move must still come back — the alternative is `bestmove
+        // 0000`, which an arena scores as an illegal move and an immediate loss.
+        let kiwipete = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .unwrap();
+        let expired = Instant::now() - Duration::from_secs(1);
+        let stats = search_timed(&kiwipete, Limits::bounded(MAX_DEPTH, Some(expired)));
+        let (mv, _) = stats.best.expect("a move, even from an unfinished iteration");
+        assert!(kiwipete.try_play(mv).is_ok(), "the returned move must be legal");
     }
 
     #[test]
