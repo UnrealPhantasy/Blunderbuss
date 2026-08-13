@@ -90,6 +90,12 @@ pub struct Progress {
 /// options grows.
 pub struct Request<'a> {
     pub limits: Limits,
+    /// Zobrist keys of the positions played before this one, oldest first. Without
+    /// them the search still spots a repetition it creates itself, but not one that
+    /// returns to a position from earlier in the game — and that is the case that
+    /// decides real games, since a perpetual usually comes back to somewhere the
+    /// players have already been.
+    pub history: &'a [u64],
     /// Called once per **completed** iteration. An iteration cut short by the
     /// deadline is discarded, so it is never reported — announcing a depth the
     /// engine then walks back from would be worse than saying nothing.
@@ -97,9 +103,9 @@ pub struct Request<'a> {
 }
 
 impl<'a> Request<'a> {
-    /// A search bounded only by `limits`, reporting nothing.
+    /// A search bounded only by `limits`: no game history, no reporting.
     pub fn new(limits: Limits) -> Request<'a> {
-        Request { limits, progress: None }
+        Request { limits, history: &[], progress: None }
     }
 }
 
@@ -138,7 +144,8 @@ fn is_queen_promotion(mv: Move) -> bool {
 }
 
 /// The best move for `pos` at a fixed `depth`, or `None` at a terminal root.
-/// A convenience wrapper over [`search_timed`], bounded by depth alone.
+/// A convenience wrapper over [`search_timed`], bounded by depth alone and with no
+/// game history — draws by repetition against earlier moves cannot be seen.
 pub fn best_move(pos: &Position, depth: u32) -> Option<(Move, i32)> {
     search_timed(pos, Limits::depth(depth)).best
 }
@@ -156,6 +163,7 @@ pub fn search(pos: &Position, mut request: Request) -> SearchStats {
     let started = Instant::now();
     let limits = &request.limits;
     let mut searcher = Searcher::new(true, limits.deadline);
+    searcher.history = request.history.to_vec();
     let max_depth = limits.max_depth.max(1);
 
     let mut best: Option<(Move, i32)> = None;
@@ -222,11 +230,50 @@ struct Searcher {
     /// Lives for the whole `search_timed` call, so iteration N+1 reuses what
     /// iteration N learned. That reuse is a large part of why the table pays.
     table: Table,
+    /// Zobrist keys of the positions played *before* the search started. A draw by
+    /// repetition depends on the game, not on the board alone, so the search cannot
+    /// see one without being told what came before.
+    history: Vec<u64>,
+    /// Zobrist keys along the branch currently being explored, pushed on the way
+    /// down and popped on the way back up.
+    path: Vec<u64>,
 }
 
 impl Searcher {
     fn new(ordered: bool, deadline: Option<Instant>) -> Searcher {
-        Searcher { nodes: 0, ordered, deadline, aborted: false, table: Table::new() }
+        Searcher {
+            nodes: 0,
+            ordered,
+            deadline,
+            aborted: false,
+            table: Table::new(),
+            history: Vec::new(),
+            path: Vec::new(),
+        }
+    }
+
+    /// Whether reaching `key` again is a draw.
+    ///
+    /// The two sources are **not** treated alike, and conflating them is a real
+    /// mistake rather than a simplification.
+    ///
+    /// Along the **search path**, one earlier occurrence is enough. Both sides are
+    /// choosing their moves inside this branch, so a side able to steer back to a
+    /// position once can do it again; searching on to a literal third occurrence
+    /// spends plies reaching a conclusion already available. Every engine does this.
+    ///
+    /// Against the **game history**, one is not enough. A position played once
+    /// before and reached now has occurred *twice*, and the rules want three. Calling
+    /// that a draw makes the engine believe it can force a repetition its opponent is
+    /// still free to decline — it plays for a draw that does not exist, and finds
+    /// itself in a position it evaluated as 0.
+    fn is_repetition(&self, key: u64) -> bool {
+        if self.path.contains(&key) {
+            return true;
+        }
+        // Idiom: `iter().filter(...).count()` counts matches without allocating.
+        // Two prior occurrences, so that this one is the third.
+        self.history.iter().filter(|&&seen| seen == key).count() >= 2
     }
 
     /// Set `aborted` if the deadline has passed. Checked only every so often
@@ -261,6 +308,10 @@ impl Searcher {
         let mut best_move = moves[0];
         let mut best_score = -INF;
         let mut alpha = -INF;
+        // The root's own key goes on the path, so a branch coming back to it is seen
+        // as a repetition. The root itself is never tested against the path — it is
+        // the position we are asked about, not a repetition of anything.
+        self.path.push(pos.hash());
         for &mv in &moves {
             let score = -self.negamax(&pos.play(mv), depth.saturating_sub(1), -INF, -alpha, 1);
             if self.aborted {
@@ -274,6 +325,7 @@ impl Searcher {
                 alpha = score;
             }
         }
+        self.path.pop();
         Some((best_move, best_score))
     }
 
@@ -286,6 +338,16 @@ impl Searcher {
             return 0; // value ignored: the whole iteration is thrown away
         }
 
+        let key = pos.hash();
+        // Checked before anything else, and deliberately before the table. A draw by
+        // repetition is a property of the *path*, not of the position: the same
+        // position reached without repeating is not drawn. Probing or storing it
+        // under this key would attach a path fact to a position, which is exactly the
+        // hazard a transposition table introduces.
+        if self.is_repetition(key) {
+            return 0;
+        }
+
         // Out of depth, but not necessarily out of danger: hand over to quiescence
         // rather than evaluating a position that may be mid-exchange. Checked before
         // generating moves, since quiescence generates them itself — and it is the one
@@ -295,7 +357,6 @@ impl Searcher {
         }
 
         // Have we been here before, by another move order or in an earlier iteration?
-        let key = pos.hash();
         let hit = self.table.probe(key, depth, alpha, beta, ply);
         if let Some(score) = hit.cutoff {
             return score;
@@ -324,9 +385,11 @@ impl Searcher {
         let alpha_before = alpha;
         let mut best = -INF;
         let mut best_move = None;
+        self.path.push(key);
         for &mv in &moves {
             let score = -self.negamax(&pos.play(mv), depth - 1, -beta, -alpha, ply + 1);
             if self.aborted {
+                self.path.pop();
                 return 0; // nothing worth caching: the value is a placeholder
             }
             if score > best {
@@ -340,6 +403,8 @@ impl Searcher {
                 break; // Beta cutoff: this branch cannot improve the result.
             }
         }
+
+        self.path.pop();
 
         let bound = if best <= alpha_before {
             Bound::Upper // no move beat alpha: the true value is at most `best`
@@ -361,6 +426,11 @@ impl Searcher {
     /// No depth argument: the recursion ends on its own. Captures take a piece off the
     /// board and there are finitely many; promotions add one, but a pawn can only
     /// promote once and never moves backwards, so neither can go on forever.
+    ///
+    /// That same irreversibility is why there is no repetition check here: every move
+    /// quiescence searches changes the material on the board, so no line it explores
+    /// can return to a position seen earlier. The entry node is already covered —
+    /// [`Searcher::negamax`] tests for a repetition before handing over.
     fn quiescence(&mut self, pos: &Position, mut alpha: i32, beta: i32, ply: i32) -> i32 {
         self.nodes += 1;
         self.check_time();
@@ -520,6 +590,113 @@ mod tests {
             ordered.nodes,
             unordered.nodes
         );
+    }
+
+    // A king alone against a queen: lost by 900 centipawns, unless the game can be
+    // steered back to a position it has already been in.
+    const LOST_KING: &str = "3qk3/8/8/8/8/8/8/4K3 w - - 0 1";
+
+    #[test]
+    fn a_draw_by_repetition_saves_a_lost_position() {
+        let p = Position::from_fen(LOST_KING).unwrap();
+        let (_, lost) = best_move(&p, 4).expect("a move");
+        assert!(lost < -800, "without history this is simply lost: {lost}");
+
+        // Ke2 reaches a position the game has already been in *twice*, so playing it
+        // is the third occurrence — a real draw, worth 900 centipawns more than the
+        // alternative.
+        let after_ke2 = p.play(p.move_from_uci("e1e2").unwrap());
+        let twice = vec![after_ke2.hash(), after_ke2.hash()];
+        let stats = search(&p, Request { history: &twice, ..Request::new(Limits::depth(4)) });
+        let (mv, score) = stats.best.expect("a move");
+        assert_eq!(score, 0, "the third occurrence is a draw, not a loss");
+        assert_eq!(p.move_to_uci(mv), "e1e2", "and it is the move that reaches it");
+    }
+
+    #[test]
+    fn one_earlier_occurrence_is_not_yet_a_draw() {
+        // The defect this guards against: treating a *second* occurrence as a draw.
+        // The rules want three, and the opponent is still free to decline the
+        // repetition — so an engine that scores this 0 plays for a draw that does not
+        // exist, and lands in a position it evaluated as level.
+        let p = Position::from_fen(LOST_KING).unwrap();
+        let after_ke2 = p.play(p.move_from_uci("e1e2").unwrap());
+
+        let once = search(&p, Request { history: &[after_ke2.hash()], ..Request::new(Limits::depth(4)) });
+        let (_, score) = once.best.expect("a move");
+        assert!(score < -800, "one prior occurrence is only the second: {score}");
+
+        // Two, and it becomes the third — then it is a draw.
+        let twice = vec![after_ke2.hash(), after_ke2.hash()];
+        assert_eq!(
+            search(&p, Request { history: &twice, ..Request::new(Limits::depth(4)) }).best.map(|(_, s)| s),
+            Some(0),
+            "the third occurrence is drawn"
+        );
+    }
+
+    #[test]
+    fn a_repetition_is_not_sought_when_winning() {
+        // Same shape, colours reversed: a queen up, repeating would throw away the
+        // win. Scoring a draw 0 must not make the engine want one.
+        let p = Position::from_fen("4k3/8/8/8/8/8/8/3QK3 w - - 0 1").unwrap();
+        let after_kd2 = p.play(p.move_from_uci("e1d2").unwrap());
+        let twice = vec![after_kd2.hash(), after_kd2.hash()];
+        let stats = search(&p, Request { history: &twice, ..Request::new(Limits::depth(4)) });
+        let (mv, score) = stats.best.expect("a move");
+        assert!(score > 800, "a queen up must stay winning, got {score}");
+        assert_ne!(p.move_to_uci(mv), "e1d2", "and the drawing move must be avoided");
+    }
+
+    #[test]
+    fn the_path_needs_one_occurrence_and_the_history_needs_two() {
+        // The asymmetry itself, on the mechanism — constructing a forced in-tree
+        // repetition on the board is fragile, and this is the property that matters.
+        let mut searcher = Searcher::new(true, None);
+        assert!(!searcher.is_repetition(42), "an unseen key is not a repetition");
+
+        // In the tree: one is enough, because both sides are choosing moves here and
+        // a side that can steer back once can do it again.
+        searcher.path.push(42);
+        assert!(searcher.is_repetition(42), "one occurrence on the path suffices");
+        searcher.path.pop();
+        assert!(!searcher.is_repetition(42), "and it stops counting once popped");
+
+        // In the game: one prior occurrence makes this only the second.
+        searcher.history.push(42);
+        assert!(!searcher.is_repetition(42), "one played occurrence is not a draw yet");
+        searcher.history.push(42);
+        assert!(searcher.is_repetition(42), "two played occurrences make this the third");
+    }
+
+    #[test]
+    fn a_repetition_score_is_not_cached() {
+        // The hazard #23 introduced: a draw by repetition belongs to the *path*, not
+        // to the position. If it were stored under the position's key, every other
+        // path reaching that position would read back a draw that does not apply.
+        let p = Position::from_fen(LOST_KING).unwrap();
+        let after_ke2 = p.play(p.move_from_uci("e1e2").unwrap());
+
+        let mut searcher = Searcher::new(true, None);
+        // Two occurrences, so the position genuinely is scored 0 as a repetition.
+        // Asserting that first is the point: with one, this test would pass while
+        // exercising nothing — which is exactly what happened when the history
+        // threshold moved from one to two.
+        searcher.history = vec![after_ke2.hash(), after_ke2.hash()];
+        assert_eq!(
+            searcher.root(&p, 4, None).map(|(_, s)| s),
+            Some(0),
+            "precondition: the repetition must actually be found"
+        );
+
+        // Two complementary windows, because a single infinite one cannot see a stored
+        // draw: `probe` only returns `Some` for `Exact` unless the bound settles the
+        // window, and neither `Lower` nor `Upper` ever does against ±INF. (0, 1) admits
+        // Exact and Upper; (-1, 0) admits Exact and Lower. Between them, no bound type
+        // can hide a cached 0.
+        let key = after_ke2.hash();
+        assert_ne!(searcher.table.probe(key, 1, 0, 1, 0).cutoff, Some(0));
+        assert_ne!(searcher.table.probe(key, 1, -1, 0, 0).cutoff, Some(0));
     }
 
     #[test]
@@ -784,8 +961,10 @@ mod tests {
                 search(
                     &pos,
                     Request {
-                        limits: Limits::until(Instant::now() + Duration::from_millis(budget)),
                         progress: Some(&mut record),
+                        ..Request::new(Limits::until(
+                            Instant::now() + Duration::from_millis(budget),
+                        ))
                     },
                 )
             };

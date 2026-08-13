@@ -158,6 +158,10 @@ fn time_budget(remaining: Duration, increment: Duration) -> Duration {
 struct Uci {
     position: Position,
     default_budget: Duration,
+    /// Zobrist keys of every position the game passed through before the current
+    /// one, oldest first. A draw by repetition is a fact about the game, not about
+    /// the board, so the search cannot see one unless it is handed this.
+    history: Vec<u64>,
     /// Where `info` lines go, **as they are produced**. A GUI shows the evaluation
     /// while the engine is still thinking, so these cannot be collected and flushed
     /// with the `bestmove` — by then the search is over and there is nothing to watch.
@@ -198,6 +202,7 @@ impl Uci {
         Uci {
             position: Position::initial(),
             default_budget: Duration::from_millis(DEFAULT_BUDGET_MS),
+            history: Vec::new(),
             info,
         }
     }
@@ -215,6 +220,7 @@ impl Uci {
             Some("isready") => Response::lines(vec!["readyok".to_string()]),
             Some("ucinewgame") => {
                 self.position = Position::initial();
+                self.history.clear();
                 Response::none()
             }
             Some("position") => {
@@ -244,15 +250,25 @@ impl Uci {
             _ => return,
         };
 
+        // The history is rebuilt from scratch on every `position` command rather than
+        // appended to: a GUI may send an entirely different game, or the same one
+        // truncated, and there is no reliable way to tell from the command alone.
+        let mut history = Vec::new();
         if let Some(i) = moves_at {
             for &tok in &args[i + 1..] {
                 match pos.move_from_uci(tok).and_then(|mv| pos.try_play(mv).ok()) {
-                    Some(next) => pos = next,
+                    Some(next) => {
+                        // The key of the position we are *leaving* — the one that
+                        // would be repeated if the game came back to it.
+                        history.push(pos.hash());
+                        pos = next;
+                    }
                     None => break, // stop at the first move that does not apply
                 }
             }
         }
         self.position = pos;
+        self.history = history;
     }
 
     /// `go [depth N | movetime N | wtime N btime N winc N binc N | infinite]`
@@ -266,13 +282,17 @@ impl Uci {
 
         // The position is cloned so the reporting closure can borrow it while
         // `self.info` is borrowed mutably — `Position` is copy-make, so this is cheap.
+        // `history` is borrowed from a different field, which the borrow checker
+        // allows alongside the mutable borrow of `info`.
         let pos = self.position.clone();
+        let history = &self.history;
         let sink = &mut self.info;
         let mut report = |p: &Progress| sink(info_line(&pos, p));
         let stats = search(
             &pos,
             Request {
                 limits: Limits::bounded(plan.max_depth, deadline),
+                history,
                 progress: Some(&mut report),
             },
         );
@@ -344,6 +364,48 @@ mod tests {
             expected = expected.play(m);
         }
         assert_eq!(uci.position.hash(), expected.hash());
+    }
+
+    #[test]
+    fn the_move_list_becomes_the_game_history() {
+        // One key per move played, and each is the position *left* by that move —
+        // the one the game would repeat if it came back to it.
+        let mut uci = quick_uci();
+        uci.handle("position startpos moves e2e4 e7e5 g1f3");
+        assert_eq!(uci.history.len(), 3, "one key per move played");
+        assert_eq!(uci.history[0], Position::initial().hash(), "starting with the start");
+
+        // The knight round trip 1.Nf3 Nf6 2.Ng1 Ng8 returns to the initial position,
+        // so that key must appear both at the start of the history and as the
+        // position now on the board — which is what makes it a repetition.
+        let mut round_trip = quick_uci();
+        round_trip.handle("position startpos moves g1f3 g8f6 f3g1 f6g8");
+        assert_eq!(round_trip.position.hash(), Position::initial().hash());
+        assert!(
+            round_trip.history.contains(&Position::initial().hash()),
+            "the repeated position must be in the history the search is given"
+        );
+    }
+
+    #[test]
+    fn a_new_game_forgets_the_history() {
+        // Otherwise the next game inherits repetitions that never happened in it.
+        let mut uci = quick_uci();
+        uci.handle("position startpos moves e2e4 e7e5");
+        assert!(!uci.history.is_empty());
+        uci.handle("ucinewgame");
+        assert!(uci.history.is_empty(), "`ucinewgame` starts from nothing");
+    }
+
+    #[test]
+    fn a_new_position_replaces_the_history_rather_than_extending_it() {
+        // A GUI may send a different game, or the same one truncated. Appending would
+        // leave keys from a game that is no longer being played.
+        let mut uci = quick_uci();
+        uci.handle("position startpos moves e2e4 e7e5 g1f3 b8c6");
+        assert_eq!(uci.history.len(), 4);
+        uci.handle("position startpos moves d2d4");
+        assert_eq!(uci.history.len(), 1, "the previous game's keys must be gone");
     }
 
     #[test]
