@@ -12,7 +12,7 @@
 //! answered by the engine's single search function — see [`parse_go`].
 
 use engine::position::{Color, Position};
-use engine::search::{search_timed, Limits, MAX_DEPTH};
+use engine::search::{search, Limits, Progress, Request, MATE, MATE_THRESHOLD, MAX_DEPTH};
 use std::io::{self, BufRead, Write};
 use std::time::{Duration, Instant};
 
@@ -97,6 +97,46 @@ fn parse_go(args: &[&str], side_to_move: Color, default_budget: Duration) -> GoP
     GoPlan { max_depth, budget }
 }
 
+/// One UCI `info` line describing what an iteration found.
+///
+/// The format a GUI and an arena both parse: `info depth 6 score cp 25 nodes 12345
+/// time 100 nps 123450 pv e2e4`. c-chess-cli reads `depth` and `score` from it and
+/// writes them into the PGN, which is how a finished game can be asked what the
+/// engine believed at each move.
+fn info_line(pos: &Position, p: &Progress) -> String {
+    let ms = p.elapsed.as_millis() as u64;
+    // Nodes per second is undefined for an iteration that took no measurable time;
+    // report the raw count rather than dividing by zero.
+    let nps = if ms == 0 { p.nodes } else { p.nodes * 1000 / ms };
+    format!(
+        "info depth {} score {} nodes {} time {} nps {} pv {}",
+        p.depth,
+        score_field(p.score),
+        p.nodes,
+        ms,
+        nps,
+        pos.move_to_uci(p.best)
+    )
+}
+
+/// `score cp X` for a material judgement, `score mate N` for a forced mate.
+///
+/// The search scores a mate `MATE - ply`, which is an implementation detail: a GUI
+/// showing "29994" instead of "mate in 3" is reporting our internals. `N` counts
+/// **moves**, not plies, and is negative when it is us being mated.
+///
+/// The plies-to-moves conversion rounds up — a mate delivered on the opponent's ply
+/// still costs a whole move — and the mate/material boundary is `MATE_THRESHOLD`,
+/// shared with the engine rather than re-derived here.
+fn score_field(score: i32) -> String {
+    if score.abs() < MATE_THRESHOLD {
+        return format!("cp {score}");
+    }
+    let plies = MATE - score.abs();
+    let moves = (plies + 1) / 2;
+    format!("mate {}", if score > 0 { moves } else { -moves })
+}
+
 /// How long to spend on this move, derived from the clock. A simple, tunable
 /// rule: a thirtieth of the remaining time plus half the increment — never more
 /// than the remaining time minus a safety margin, and at least 1 ms.
@@ -118,6 +158,14 @@ fn time_budget(remaining: Duration, increment: Duration) -> Duration {
 struct Uci {
     position: Position,
     default_budget: Duration,
+    /// Where `info` lines go, **as they are produced**. A GUI shows the evaluation
+    /// while the engine is still thinking, so these cannot be collected and flushed
+    /// with the `bestmove` — by then the search is over and there is nothing to watch.
+    ///
+    /// A boxed closure rather than a `Write`: `main` sends them to stdout and flushes
+    /// each one, while a test collects them into a vector and can assert on what was
+    /// said and in which order.
+    info: Box<dyn FnMut(String)>,
 }
 
 /// What [`Uci::handle`] produced: the lines to print, and whether to stop.
@@ -136,10 +184,21 @@ impl Response {
 }
 
 impl Uci {
+    /// Ready to talk to a GUI: `info` lines go straight to stdout, flushed one by one
+    /// so nothing waits in a buffer while the engine thinks.
     fn new() -> Uci {
+        Uci::with_info(Box::new(|line| {
+            let mut out = io::stdout();
+            let _ = writeln!(out, "{line}");
+            let _ = out.flush();
+        }))
+    }
+
+    fn with_info(info: Box<dyn FnMut(String)>) -> Uci {
         Uci {
             position: Position::initial(),
             default_budget: Duration::from_millis(DEFAULT_BUDGET_MS),
+            info,
         }
     }
 
@@ -201,13 +260,25 @@ impl Uci {
     ///
     /// Every form goes through the same two steps — plan, then search — so the engine
     /// has a single search path whatever the GUI sends.
-    fn go(&self, args: &[&str]) -> String {
+    fn go(&mut self, args: &[&str]) -> String {
         let plan = parse_go(args, self.position.side_to_move(), self.default_budget);
         let deadline = plan.budget.map(|b| Instant::now() + b);
-        let stats = search_timed(&self.position, Limits::bounded(plan.max_depth, deadline));
+
+        // The position is cloned so the reporting closure can borrow it while
+        // `self.info` is borrowed mutably — `Position` is copy-make, so this is cheap.
+        let pos = self.position.clone();
+        let sink = &mut self.info;
+        let mut report = |p: &Progress| sink(info_line(&pos, p));
+        let stats = search(
+            &pos,
+            Request {
+                limits: Limits::bounded(plan.max_depth, deadline),
+                progress: Some(&mut report),
+            },
+        );
 
         match stats.best {
-            Some((mv, _score)) => format!("bestmove {}", self.position.move_to_uci(mv)),
+            Some((mv, _score)) => format!("bestmove {}", pos.move_to_uci(mv)),
             None => "bestmove 0000".to_string(), // no legal move (terminal position)
         }
     }
@@ -216,11 +287,29 @@ impl Uci {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    // A protocol instance whose default thinking time is short, so the tests that
+    // exercise a limitless `go` stay fast, and whose `info` lines are collected instead
+    // of printed. Returns the shared buffer alongside, so a test can assert on what was
+    // said and in which order.
+    //
+    // Idiom: `Rc<RefCell<…>>` gives two owners of one vector — the closure inside `Uci`
+    // and the test — with the borrow checked at runtime rather than compile time. It is
+    // the usual way to observe a callback from a test.
+    fn uci_with_log() -> (Uci, Rc<RefCell<Vec<String>>>) {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&log);
+        let mut uci = Uci::with_info(Box::new(move |line| sink.borrow_mut().push(line)));
+        uci.default_budget = Duration::from_millis(20);
+        (uci, log)
+    }
 
     // A protocol instance whose default thinking time is short, so the tests that
     // exercise a limitless `go` stay fast. Everything else matches `Uci::new`.
     fn quick_uci() -> Uci {
-        Uci { default_budget: Duration::from_millis(20), ..Uci::new() }
+        uci_with_log().0
     }
 
     // Helper: the move string a `go` reply advertises must be legal here.
@@ -378,6 +467,113 @@ mod tests {
         // Arguments we do not implement must not disturb the ones we do.
         let plan = parse_go(&["ponder", "searchmoves", "e2e4", "depth", "3"], Color::White, FALLBACK);
         assert_eq!(plan, GoPlan { max_depth: 3, budget: None });
+    }
+
+    // --- time allocation --------------------------------------------------------
+
+    // --- UCI `info` reporting ---------------------------------------------------
+
+    #[test]
+    fn every_completed_iteration_is_reported_in_order() {
+        let (mut uci, log) = uci_with_log();
+        uci.handle("position startpos");
+        let out = uci.handle("go depth 4");
+
+        let lines = log.borrow();
+        let depths: Vec<u32> = lines
+            .iter()
+            .map(|l| {
+                l.split_whitespace()
+                    .nth(2)
+                    .and_then(|d| d.parse().ok())
+                    .expect("an `info depth N` prefix")
+            })
+            .collect();
+        assert_eq!(depths, vec![1, 2, 3, 4], "one line per depth, in order");
+        for line in lines.iter() {
+            for field in ["score", "nodes", "time", "nps", "pv"] {
+                assert!(line.contains(field), "`{field}` missing from `{line}`");
+            }
+        }
+        assert_eq!(out.lines.len(), 1, "and exactly one bestmove line");
+        assert!(out.lines[0].starts_with("bestmove "));
+    }
+
+    #[test]
+    fn the_last_report_agrees_with_the_move_played() {
+        // An engine that announces one move and plays another is worse than a silent
+        // one: the analysis would describe a game that never happened.
+        let (mut uci, log) = uci_with_log();
+        uci.handle("position startpos");
+        let out = uci.handle("go depth 4");
+
+        let last = log.borrow().last().cloned().expect("at least one info line");
+        let announced = last.split_whitespace().last().expect("a pv move");
+        let played = out.lines[0].strip_prefix("bestmove ").expect("a bestmove");
+        assert_eq!(announced, played, "the pv of the final info must be the move played");
+    }
+
+    #[test]
+    fn a_mate_is_reported_in_moves_not_centipawns() {
+        // `MATE - ply` is an internal detail; a GUI showing "29994" is reading our
+        // implementation rather than the position.
+        let (mut uci, log) = uci_with_log();
+        uci.handle("position fen 6k1/5ppp/8/8/8/8/8/R6K w - - 0 1");
+        uci.handle("go depth 3");
+        let last = log.borrow().last().cloned().expect("an info line");
+        assert!(last.contains("score mate 1"), "expected `score mate 1` in `{last}`");
+    }
+
+    #[test]
+    fn being_mated_is_reported_as_a_negative_mate() {
+        let (mut uci, log) = uci_with_log();
+        uci.handle("position fen 7k/8/8/8/8/8/1R6/R6K b - - 0 1");
+        uci.handle("go depth 6");
+        let last = log.borrow().last().cloned().expect("an info line");
+        assert!(
+            last.contains("score mate -"),
+            "expected a negative mate score in `{last}`"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_position_is_reported_in_centipawns() {
+        let (mut uci, log) = uci_with_log();
+        uci.handle("position startpos");
+        uci.handle("go depth 3");
+        for line in log.borrow().iter() {
+            assert!(line.contains("score cp "), "`{line}` should be a cp score");
+            assert!(!line.contains("score mate"), "and never a mate");
+        }
+    }
+
+    #[test]
+    fn an_unfinished_iteration_is_not_reported() {
+        // The search discards an aborted iteration, so announcing its depth would mean
+        // walking the claim back — worse than saying nothing. With an expired deadline
+        // only the guaranteed first iteration completes.
+        let (mut uci, log) = uci_with_log();
+        uci.handle("position fen r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
+        uci.handle("go movetime 51");
+        let lines = log.borrow();
+        let depths: Vec<&str> = lines.iter().filter_map(|l| l.split_whitespace().nth(2)).collect();
+        assert!(
+            depths.len() <= 1,
+            "at most the completed iteration should be reported, got {depths:?}"
+        );
+    }
+
+    #[test]
+    fn score_field_converts_plies_to_moves() {
+        // The boundary cases of the conversion, without going through a search.
+        assert_eq!(score_field(0), "cp 0");
+        assert_eq!(score_field(-250), "cp -250");
+        assert_eq!(score_field(MATE_THRESHOLD - 1), format!("cp {}", MATE_THRESHOLD - 1));
+        // Mate on the ply after ours is still a whole move away: rounding up.
+        assert_eq!(score_field(MATE - 1), "mate 1");
+        assert_eq!(score_field(MATE - 2), "mate 1");
+        assert_eq!(score_field(MATE - 3), "mate 2");
+        assert_eq!(score_field(-(MATE - 3)), "mate -2");
     }
 
     // --- time allocation --------------------------------------------------------
