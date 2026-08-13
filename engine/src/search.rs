@@ -13,7 +13,7 @@
 
 use crate::evaluation::evaluate;
 use crate::ordering::{mvv_lva, order_moves};
-use crate::position::{Move, Position};
+use crate::position::{Move, Piece, Position};
 use std::time::Instant;
 
 /// A mate score, large enough to dominate any material balance. The distance to
@@ -64,6 +64,17 @@ pub struct SearchStats {
     pub best: Option<(Move, i32)>,
     pub depth: u32,
     pub nodes: u64,
+}
+
+/// Whether `mv` promotes a pawn to a queen.
+///
+/// Quiescence searches queen promotions only. Under-promotions would multiply this
+/// branch by four to cover cases that decide a game very rarely — and the point of
+/// searching a promotion here is that a queen is about to appear, which is what moves
+/// the evaluation by ~800 centipawns. A knight under-promotion that wins by fork is
+/// still found by the main search, which has no such filter.
+fn is_queen_promotion(mv: Move) -> bool {
+    mv.promotion == Some(Piece::Queen)
 }
 
 /// The best move for `pos` at a fixed `depth`, or `None` at a terminal root.
@@ -225,13 +236,15 @@ impl Searcher {
         best
     }
 
-    /// Search on past the depth limit, over **captures only**, until the position is
-    /// quiet — then evaluate. Without this, a leaf landing in the middle of an
-    /// exchange is scored as if the exchange stopped there, and the engine comes to
-    /// prefer moves that push a loss just beyond its own horizon.
+    /// Search on past the depth limit, over the moves that change material —
+    /// **captures and promotions** — until the position is quiet, then evaluate.
+    /// Without this, a leaf landing in the middle of an exchange is scored as if the
+    /// exchange stopped there, and the engine comes to prefer moves that push a loss
+    /// just beyond its own horizon.
     ///
-    /// No depth argument: the recursion ends on its own, because every capture takes
-    /// a piece off the board and there are finitely many.
+    /// No depth argument: the recursion ends on its own. Captures take a piece off the
+    /// board and there are finitely many; promotions add one, but a pawn can only
+    /// promote once and never moves backwards, so neither can go on forever.
     fn quiescence(&mut self, pos: &Position, mut alpha: i32, beta: i32, ply: i32) -> i32 {
         self.nodes += 1;
         self.check_time();
@@ -261,8 +274,11 @@ impl Searcher {
 
         // Idiom: `retain` filters the vector in place, keeping the elements the
         // closure accepts. `mvv_lva` scores quiet moves 0 and captures above it, so
-        // it doubles as the capture test.
-        moves.retain(|&mv| mvv_lva(pos, mv) > 0);
+        // it doubles as the capture test — but it reads the *destination* square, so a
+        // pawn stepping onto an empty back rank scores 0 like any quiet move. Hence the
+        // explicit promotion test: without it the leaf is evaluated as if the queen
+        // about to appear did not exist.
+        moves.retain(|&mv| mvv_lva(pos, mv) > 0 || is_queen_promotion(mv));
         if self.ordered {
             order_moves(pos, &mut moves);
         }
@@ -463,6 +479,43 @@ mod tests {
         // always allowed, so the value of the position is the static score, never the
         // best of a bad set of captures.
         let p = Position::from_fen(HORIZON).unwrap();
+        assert_eq!(quiesce(&p), evaluate(&p));
+    }
+
+    #[test]
+    fn the_promotion_is_seen_past_the_depth_limit() {
+        // Black's a2 pawn queens next move. Before promotions were searched, the leaf
+        // counted a pawn and the main search a queen — a 730 cp gap between depth 1
+        // and depth 2 on the same position. Quiescence must close it.
+        let p = Position::from_fen("4k3/8/8/8/8/8/p7/4K3 w - - 0 1").unwrap();
+        let shallow = best_move(&p, 1).expect("a move").1;
+        let deeper = best_move(&p, 2).expect("a move").1;
+        assert_eq!(
+            shallow, deeper,
+            "depth 1 must already price the queen: {shallow} vs {deeper} at depth 2"
+        );
+    }
+
+    #[test]
+    fn a_capture_promotion_is_still_searched() {
+        // `b7a8q` takes the rook *and* queens. It reached quiescence before this
+        // change, because `mvv_lva` sees the rook on the destination square — the
+        // promotion test must not have disturbed that path.
+        let p = Position::from_fen("r3k3/1P6/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        assert!(
+            quiesce(&p) >= evaluate(&p) + 1000,
+            "expected rook + promotion, got {} over {}",
+            quiesce(&p),
+            evaluate(&p)
+        );
+    }
+
+    #[test]
+    fn a_losing_promotion_is_not_forced() {
+        // The c8 rook covers a8, so queening loses the new queen at once. Standing pat
+        // applies to promotions exactly as it does to captures: the value of the
+        // position is the static score, not the best of a bad set of moves.
+        let p = Position::from_fen("2r1k3/P7/8/8/8/8/8/4K3 w - - 0 1").unwrap();
         assert_eq!(quiesce(&p), evaluate(&p));
     }
 
