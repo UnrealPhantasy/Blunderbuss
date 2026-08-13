@@ -60,16 +60,20 @@ impl Limits {
 }
 
 /// The outcome of a search: the chosen move and its score (side-to-move
-/// perspective), the deepest **completed** depth, the node count, and how often
-/// the transposition table answered a probe.
+/// perspective), the deepest **completed** depth, the node count, and what the
+/// transposition table contributed.
 pub struct SearchStats {
     pub best: Option<(Move, i32)>,
     pub depth: u32,
     pub nodes: u64,
-    /// Fraction of table probes that found a usable entry. Reported because node
-    /// counts alone cannot distinguish a table that never hits from one whose hits
-    /// are all being rejected as collisions.
-    pub table_hit_rate: f64,
+    /// Fraction of probes that found an entry for the position asked about.
+    /// Reported because node counts alone cannot distinguish a table that is never
+    /// read from one whose every match is rejected as a collision.
+    pub table_key_match_rate: f64,
+    /// Fraction of probes that returned a score, and so skipped a subtree. Always
+    /// the lower of the two: about half of the matches are too shallow to cut off
+    /// and contribute move ordering only.
+    pub table_cutoff_rate: f64,
 }
 
 /// Whether `mv` promotes a pawn to a queen.
@@ -141,7 +145,8 @@ pub fn search_timed(pos: &Position, limits: Limits) -> SearchStats {
         best,
         depth: completed,
         nodes: searcher.nodes,
-        table_hit_rate: searcher.table.hit_rate(),
+        table_key_match_rate: searcher.table.key_match_rate(),
+        table_cutoff_rate: searcher.table.cutoff_rate(),
     }
 }
 
@@ -369,7 +374,8 @@ mod tests {
             best,
             depth,
             nodes: searcher.nodes,
-            table_hit_rate: searcher.table.hit_rate(),
+            table_key_match_rate: searcher.table.key_match_rate(),
+            table_cutoff_rate: searcher.table.cutoff_rate(),
         }
     }
 
@@ -485,9 +491,14 @@ mod tests {
         .unwrap();
         let stats = search_timed(&p, Limits::depth(5));
         assert!(
-            stats.table_hit_rate > 0.05,
+            stats.table_key_match_rate > 0.05,
             "expected the table to answer some probes, got {:.3}",
-            stats.table_hit_rate
+            stats.table_key_match_rate
+        );
+        assert!(
+            stats.table_cutoff_rate > 0.0,
+            "and some of those matches must actually cut off, got {:.3}",
+            stats.table_cutoff_rate
         );
     }
 
@@ -703,4 +714,3 @@ mod tests {
         assert!(stats.depth >= 1);
     }
 }
-

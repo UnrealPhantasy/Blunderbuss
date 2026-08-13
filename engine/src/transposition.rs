@@ -66,6 +66,7 @@ pub struct Table {
     entries: Box<[Option<Entry>]>,
     hits: u64,
     probes: u64,
+    cutoffs: u64,
 }
 
 impl Default for Table {
@@ -76,19 +77,39 @@ impl Default for Table {
 
 impl Table {
     pub fn new() -> Table {
-        Table { entries: vec![None; ENTRIES].into_boxed_slice(), hits: 0, probes: 0 }
+        Table { entries: vec![None; ENTRIES].into_boxed_slice(), hits: 0, probes: 0, cutoffs: 0 }
     }
 
-    /// How often a probe found a usable entry, as a fraction of all probes.
+    /// Fraction of probes that found an entry for *this* position — a key match,
+    /// whatever came of it.
     ///
-    /// Worth reporting: a table that never hits and a table whose hits are all
-    /// being rejected as collisions look identical from the outside — node counts
-    /// alone cannot tell a working table from a decorative one.
-    pub fn hit_rate(&self) -> f64 {
+    /// Worth reporting on its own: a table that is never read and a table whose
+    /// every hit is rejected as a collision look identical from the node count, and
+    /// only this rate separates a working table from a decorative one.
+    ///
+    /// Note what it is **not**: a matched entry may still be too shallow to cut off,
+    /// in which case it contributes ordering only. Measured at depth 7, roughly half
+    /// of the key matches fall in that case — see [`Table::cutoff_rate`].
+    pub fn key_match_rate(&self) -> f64 {
         if self.probes == 0 {
             0.0
         } else {
             self.hits as f64 / self.probes as f64
+        }
+    }
+
+    /// Fraction of probes that returned a score, i.e. that saved a whole subtree.
+    ///
+    /// The stricter of the two rates, and the one that measures what the table buys
+    /// in pruning. The gap with [`Table::key_match_rate`] is the share of matches
+    /// that were useful for move ordering but not deep enough to cut off — measured
+    /// at depth 7: 0.134 against 0.231 from the start position, 0.243 against 0.467
+    /// on Kiwipete.
+    pub fn cutoff_rate(&self) -> f64 {
+        if self.probes == 0 {
+            0.0
+        } else {
+            self.cutoffs as f64 / self.probes as f64
         }
     }
 
@@ -127,6 +148,9 @@ impl Table {
                 _ => None,
             }
         };
+        if cutoff.is_some() {
+            self.cutoffs += 1;
+        }
         Hit { cutoff, best: entry.best }
     }
 
@@ -292,12 +316,21 @@ mod tests {
     }
 
     #[test]
-    fn hit_rate_counts_usable_entries() {
+    fn the_two_rates_measure_different_things() {
         let mut t = Table::new();
-        assert_eq!(t.hit_rate(), 0.0, "no probe yet");
-        t.store(1, 1, 0, Bound::Exact, None);
-        t.probe(1, 1, -1, 1, 0); // hit
-        t.probe(2, 1, -1, 1, 0); // miss
-        assert!((t.hit_rate() - 0.5).abs() < 1e-9);
+        assert_eq!(t.key_match_rate(), 0.0, "no probe yet");
+        assert_eq!(t.cutoff_rate(), 0.0, "no probe yet");
+
+        // Three probes: a match that cuts off, a match too shallow to cut off, and
+        // a miss. The point of the test is the middle one — it is a key match that
+        // buys ordering only, and counting it as a cutoff would overstate the table.
+        t.store(1, 5, 0, Bound::Exact, None);
+        t.store(2, 1, 0, Bound::Exact, None);
+        t.probe(1, 5, -1, 1, 0); // deep enough  -> match + cutoff
+        t.probe(2, 5, -1, 1, 0); // too shallow  -> match, no cutoff
+        t.probe(3, 5, -1, 1, 0); // absent       -> neither
+
+        assert!((t.key_match_rate() - 2.0 / 3.0).abs() < 1e-9, "two of three matched");
+        assert!((t.cutoff_rate() - 1.0 / 3.0).abs() < 1e-9, "only one settled the window");
     }
 }
