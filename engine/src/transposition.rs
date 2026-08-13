@@ -12,6 +12,7 @@
 //! rather than merely fast — see [`Bound`].
 
 use crate::position::Move;
+use crate::search::MATE_THRESHOLD;
 
 /// What a stored score tells us about the true value of a position.
 ///
@@ -220,11 +221,6 @@ fn from_table(score: i32, ply: i32) -> i32 {
         score
     }
 }
-
-/// Above this, a score is a mate rather than a material balance. `MATE` is
-/// 30 000 and a mate is scored `MATE - ply`, so any plausible mate stays well
-/// above a material evaluation, which cannot approach 20 000.
-const MATE_THRESHOLD: i32 = 20_000;
 
 #[cfg(test)]
 mod tests {

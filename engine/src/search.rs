@@ -15,7 +15,7 @@ use crate::evaluation::evaluate;
 use crate::ordering::{mvv_lva, order_moves};
 use crate::position::{Move, Piece, Position};
 use crate::transposition::{Bound, Table};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// A mate score, large enough to dominate any material balance. The distance to
 /// mate (`ply`) is subtracted so the search prefers shorter mates, and so a mate
@@ -26,6 +26,13 @@ pub const MATE: i32 = 30_000;
 /// unbounded for this engine; it exists only so `go infinite`-style searches
 /// terminate).
 pub const MAX_DEPTH: u32 = 64;
+
+/// Above this, a score is a mate rather than a material balance. A mate is scored
+/// `MATE - ply`, so any plausible mate stays well above a material evaluation, which
+/// cannot approach 20 000. Shared with [`crate::transposition`] and with the UCI
+/// layer, which needs the same boundary to report `score mate` instead of `score cp`
+/// — two places deriving it separately would eventually disagree.
+pub const MATE_THRESHOLD: i32 = 20_000;
 
 // A bound strictly above any reachable score (including `MATE`), used as the
 // initial alpha/beta window.
@@ -56,6 +63,49 @@ impl Limits {
     /// both, or neither.
     pub fn bounded(max_depth: u32, deadline: Option<Instant>) -> Limits {
         Limits { max_depth, deadline }
+    }
+}
+
+/// What one completed iteration of the deepening loop found.
+///
+/// Reported as it happens rather than collected and returned: a GUI shows the
+/// evaluation *while* the engine thinks, and an arena samples it per move. The engine
+/// crate never prints — it hands this to whoever asked for the search.
+pub struct Progress {
+    pub depth: u32,
+    /// Side-to-move perspective, in centipawns — or a mate score, which the caller
+    /// recognises by comparing against [`MATE_THRESHOLD`].
+    pub score: i32,
+    pub nodes: u64,
+    pub elapsed: Duration,
+    pub best: Move,
+}
+
+/// Everything a search needs besides the position.
+///
+/// A struct rather than more parameters. Each thing a caller might want — a progress
+/// callback here, the game history in #25 — would otherwise either add a parameter to
+/// every call site or spawn another `search_*` variant. #16 settled that there is
+/// exactly one entry point; this is what lets it stay that way while the list of
+/// options grows.
+pub struct Request<'a> {
+    pub limits: Limits,
+    /// Zobrist keys of the positions played before this one, oldest first. Without
+    /// them the search still spots a repetition it creates itself, but not one that
+    /// returns to a position from earlier in the game — and that is the case that
+    /// decides real games, since a perpetual usually comes back to somewhere the
+    /// players have already been.
+    pub history: &'a [u64],
+    /// Called once per **completed** iteration. An iteration cut short by the
+    /// deadline is discarded, so it is never reported — announcing a depth the
+    /// engine then walks back from would be worse than saying nothing.
+    pub progress: Option<&'a mut dyn FnMut(&Progress)>,
+}
+
+impl<'a> Request<'a> {
+    /// A search bounded only by `limits`: no game history, no reporting.
+    pub fn new(limits: Limits) -> Request<'a> {
+        Request { limits, history: &[], progress: None }
     }
 }
 
@@ -105,19 +155,15 @@ pub fn best_move(pos: &Position, depth: u32) -> Option<(Move, i32)> {
 /// always finishes, so there is always a legal move to return (unless the root is
 /// terminal).
 pub fn search_timed(pos: &Position, limits: Limits) -> SearchStats {
-    search_with_history(pos, limits, &[])
+    search(pos, Request::new(limits))
 }
 
-/// As [`search_timed`], told which positions the game already visited.
-///
-/// `history` holds the Zobrist keys of the positions played before `pos`, oldest
-/// first. Without it the search can still spot a repetition it creates itself, but
-/// not one that repeats a position from earlier in the game — and that is the case
-/// that decides real games, since a perpetual usually returns to a position the
-/// players have already been in.
-pub fn search_with_history(pos: &Position, limits: Limits, history: &[u64]) -> SearchStats {
+/// The search. Everything a caller can ask for travels in [`Request`].
+pub fn search(pos: &Position, mut request: Request) -> SearchStats {
+    let started = Instant::now();
+    let limits = &request.limits;
     let mut searcher = Searcher::new(true, limits.deadline);
-    searcher.history = history.to_vec();
+    searcher.history = request.history.to_vec();
     let max_depth = limits.max_depth.max(1);
 
     let mut best: Option<(Move, i32)> = None;
@@ -144,8 +190,18 @@ pub fn search_with_history(pos: &Position, limits: Limits, history: &[u64]) -> S
         }
         best = result;
         completed = depth;
-        if best.is_none() {
+        let Some((mv, score)) = best else {
             break; // terminal root — nothing to deepen
+        };
+        // This iteration finished, so its verdict is worth announcing.
+        if let Some(report) = request.progress.as_mut() {
+            report(&Progress {
+                depth,
+                score,
+                nodes: searcher.nodes,
+                elapsed: started.elapsed(),
+                best: mv,
+            });
         }
         // Don't open another iteration we have no time to finish.
         if let Some(deadline) = limits.deadline {
@@ -437,7 +493,6 @@ impl Searcher {
 mod tests {
     use super::*;
     use crate::position::{Color, Piece, Status};
-    use std::time::Duration;
 
     // A single fixed-depth pass — no deepening, no clock — driving `Searcher` directly.
     // The oracle these tests compare against: it gives the verdict a plain depth-D
@@ -552,7 +607,7 @@ mod tests {
         // alternative.
         let after_ke2 = p.play(p.move_from_uci("e1e2").unwrap());
         let twice = vec![after_ke2.hash(), after_ke2.hash()];
-        let stats = search_with_history(&p, Limits::depth(4), &twice);
+        let stats = search(&p, Request { history: &twice, ..Request::new(Limits::depth(4)) });
         let (mv, score) = stats.best.expect("a move");
         assert_eq!(score, 0, "the third occurrence is a draw, not a loss");
         assert_eq!(p.move_to_uci(mv), "e1e2", "and it is the move that reaches it");
@@ -567,14 +622,14 @@ mod tests {
         let p = Position::from_fen(LOST_KING).unwrap();
         let after_ke2 = p.play(p.move_from_uci("e1e2").unwrap());
 
-        let once = search_with_history(&p, Limits::depth(4), &[after_ke2.hash()]);
+        let once = search(&p, Request { history: &[after_ke2.hash()], ..Request::new(Limits::depth(4)) });
         let (_, score) = once.best.expect("a move");
         assert!(score < -800, "one prior occurrence is only the second: {score}");
 
         // Two, and it becomes the third — then it is a draw.
         let twice = vec![after_ke2.hash(), after_ke2.hash()];
         assert_eq!(
-            search_with_history(&p, Limits::depth(4), &twice).best.map(|(_, s)| s),
+            search(&p, Request { history: &twice, ..Request::new(Limits::depth(4)) }).best.map(|(_, s)| s),
             Some(0),
             "the third occurrence is drawn"
         );
@@ -587,7 +642,7 @@ mod tests {
         let p = Position::from_fen("4k3/8/8/8/8/8/8/3QK3 w - - 0 1").unwrap();
         let after_kd2 = p.play(p.move_from_uci("e1d2").unwrap());
         let twice = vec![after_kd2.hash(), after_kd2.hash()];
-        let stats = search_with_history(&p, Limits::depth(4), &twice);
+        let stats = search(&p, Request { history: &twice, ..Request::new(Limits::depth(4)) });
         let (mv, score) = stats.best.expect("a move");
         assert!(score > 800, "a queen up must stay winning, got {score}");
         assert_ne!(p.move_to_uci(mv), "e1d2", "and the drawing move must be avoided");
@@ -882,6 +937,43 @@ mod tests {
         let stats = search_timed(&kiwipete, Limits::bounded(MAX_DEPTH, Some(expired)));
         let (mv, _) = stats.best.expect("a move, even from an unfinished iteration");
         assert!(kiwipete.try_play(mv).is_ok(), "the returned move must be legal");
+    }
+
+    #[test]
+    fn every_completed_iteration_is_reported_exactly_once() {
+        // The property, stated without reference to speed: *how many* iterations
+        // finish depends on the machine, but each one that finishes is announced
+        // once — so the number of reports equals the depth reached, which
+        // `SearchStats` already carries. That makes this assertable as an equality
+        // on any hardware, including the degenerate case where nothing completes.
+        for (fen, budget) in [
+            ("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 1u64),
+            ("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 100),
+            ("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", 1),
+            ("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", 100),
+        ] {
+            let pos = Position::from_fen(fen).unwrap();
+            let mut reported = Vec::new();
+            // The closure borrows `reported` mutably, so it has to go out of scope
+            // before the assertion can read it — hence the block rather than a `drop`.
+            let stats = {
+                let mut record = |p: &Progress| reported.push(p.depth);
+                search(
+                    &pos,
+                    Request {
+                        progress: Some(&mut record),
+                        ..Request::new(Limits::until(
+                            Instant::now() + Duration::from_millis(budget),
+                        ))
+                    },
+                )
+            };
+            assert_eq!(
+                reported,
+                (1..=stats.depth).collect::<Vec<u32>>(),
+                "one report per completed depth, in order ({fen}, {budget}ms)"
+            );
+        }
     }
 
     #[test]
