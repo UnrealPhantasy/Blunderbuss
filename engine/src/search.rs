@@ -537,7 +537,6 @@ mod tests {
         );
     }
 
-
     // A king alone against a queen: lost by 900 centipawns, unless the game can be
     // steered back to a position it has already been in.
     const LOST_KING: &str = "3qk3/8/8/8/8/8/8/4K3 w - - 0 1";
