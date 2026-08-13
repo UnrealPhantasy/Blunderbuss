@@ -763,6 +763,38 @@ mod tests {
     }
 
     #[test]
+    fn every_completed_iteration_is_reported_exactly_once() {
+        // The property, stated without reference to speed: *how many* iterations
+        // finish depends on the machine, but each one that finishes is announced
+        // once — so the number of reports equals the depth reached, which
+        // `SearchStats` already carries. That makes this assertable as an equality
+        // on any hardware, including the degenerate case where nothing completes.
+        for (fen, budget) in [
+            ("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 1u64),
+            ("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 100),
+            ("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", 1),
+            ("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", 100),
+        ] {
+            let pos = Position::from_fen(fen).unwrap();
+            let mut reported = Vec::new();
+            let mut record = |p: &Progress| reported.push(p.depth);
+            let stats = search(
+                &pos,
+                Request {
+                    limits: Limits::until(Instant::now() + Duration::from_millis(budget)),
+                    progress: Some(&mut record),
+                },
+            );
+            drop(record);
+            assert_eq!(
+                reported,
+                (1..=stats.depth).collect::<Vec<u32>>(),
+                "one report per completed depth, in order ({fen}, {budget}ms)"
+            );
+        }
+    }
+
+    #[test]
     fn a_tiny_budget_still_returns_a_legal_move() {
         // Even a few milliseconds must yield at least the depth-1 result. The bound is
         // `>=`, never a particular depth: how far 5 ms reaches is a property of the
