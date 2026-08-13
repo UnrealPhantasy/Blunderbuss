@@ -370,6 +370,11 @@ impl Searcher {
     /// No depth argument: the recursion ends on its own. Captures take a piece off the
     /// board and there are finitely many; promotions add one, but a pawn can only
     /// promote once and never moves backwards, so neither can go on forever.
+    ///
+    /// That same irreversibility is why there is no repetition check here: every move
+    /// quiescence searches changes the material on the board, so no line it explores
+    /// can return to a position seen earlier. The entry node is already covered —
+    /// [`Searcher::negamax`] tests for a repetition before handing over.
     fn quiescence(&mut self, pos: &Position, mut alpha: i32, beta: i32, ply: i32) -> i32 {
         self.nodes += 1;
         self.check_time();
