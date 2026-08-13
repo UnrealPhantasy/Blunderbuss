@@ -619,18 +619,25 @@ mod tests {
         let after_ke2 = p.play(p.move_from_uci("e1e2").unwrap());
 
         let mut searcher = Searcher::new(true, None);
-        searcher.history = vec![after_ke2.hash()];
-        searcher.root(&p, 4, None);
-
-        // Same searcher, same table — but now nothing has been played before, so the
-        // position after Ke2 is not a repetition and must not be worth 0.
-        searcher.history.clear();
-        let probed = searcher.table.probe(after_ke2.hash(), 1, -INF, INF, 0);
-        assert_ne!(
-            probed.cutoff,
+        // Two occurrences, so the position genuinely is scored 0 as a repetition.
+        // Asserting that first is the point: with one, this test would pass while
+        // exercising nothing — which is exactly what happened when the history
+        // threshold moved from one to two.
+        searcher.history = vec![after_ke2.hash(), after_ke2.hash()];
+        assert_eq!(
+            searcher.root(&p, 4, None).map(|(_, s)| s),
             Some(0),
-            "the draw score must not have been written under this position's key"
+            "precondition: the repetition must actually be found"
         );
+
+        // Two complementary windows, because a single infinite one cannot see a stored
+        // draw: `probe` only returns `Some` for `Exact` unless the bound settles the
+        // window, and neither `Lower` nor `Upper` ever does against ±INF. (0, 1) admits
+        // Exact and Upper; (-1, 0) admits Exact and Lower. Between them, no bound type
+        // can hide a cached 0.
+        let key = after_ke2.hash();
+        assert_ne!(searcher.table.probe(key, 1, 0, 1, 0).cutoff, Some(0));
+        assert_ne!(searcher.table.probe(key, 1, -1, 0, 0).cutoff, Some(0));
     }
 
     #[test]
