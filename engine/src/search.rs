@@ -601,4 +601,3 @@ mod tests {
         assert!(stats.depth >= 1);
     }
 }
-
