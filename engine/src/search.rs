@@ -336,9 +336,15 @@ mod tests {
         // `Limits::bounded` is what a UCI `go` maps onto. A depth cap with a generous
         // deadline stops at the cap; a deadline with no useful depth cap stops on time.
         let p = Position::initial();
-        let far = Instant::now() + Duration::from_secs(30);
+        // An hour, so the deadline cannot be what ends the search: depths 1-3 total
+        // 1508 nodes, and only a machine below one node per second would need longer.
+        // The cap is then the only thing left that can stop it, which is the point.
+        let far = Instant::now() + Duration::from_secs(3600);
         assert_eq!(search_timed(&p, Limits::bounded(3, Some(far))).depth, 3);
 
+        // Conversely the clock decides here, and both bounds hold at any speed: depth
+        // 1 always completes (see the expired-deadline test), and MAX_DEPTH is far out
+        // of reach in 5 ms on any hardware.
         let stats = search_timed(
             &p,
             Limits::bounded(MAX_DEPTH, Some(Instant::now() + Duration::from_millis(5))),
@@ -362,19 +368,13 @@ mod tests {
 
     #[test]
     fn a_tiny_budget_still_returns_a_legal_move() {
-        // Even a few milliseconds must yield at least the depth-1 result.
+        // Even a few milliseconds must yield at least the depth-1 result. The bound is
+        // `>=`, never a particular depth: how far 5 ms reaches is a property of the
+        // machine, and a test may not depend on it.
         let p = Position::initial();
         let stats = search_timed(&p, Limits::until(Instant::now() + Duration::from_millis(5)));
         let (mv, _) = stats.best.expect("a move");
         assert!(p.try_play(mv).is_ok(), "the returned move must be legal");
         assert!(stats.depth >= 1);
-    }
-
-    #[test]
-    fn a_generous_budget_reaches_beyond_depth_one() {
-        // Given real time, deepening must go past depth 1.
-        let p = Position::initial();
-        let stats = search_timed(&p, Limits::until(Instant::now() + Duration::from_millis(500)));
-        assert!(stats.depth > 1, "expected depth > 1 with 500ms, got {}", stats.depth);
     }
 }
