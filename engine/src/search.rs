@@ -15,7 +15,7 @@ use crate::evaluation::evaluate;
 use crate::ordering::{mvv_lva, order_moves};
 use crate::position::{Move, Piece, Position};
 use crate::transposition::{Bound, Table};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// A mate score, large enough to dominate any material balance. The distance to
 /// mate (`ply`) is subtracted so the search prefers shorter mates, and so a mate
@@ -26,6 +26,13 @@ pub const MATE: i32 = 30_000;
 /// unbounded for this engine; it exists only so `go infinite`-style searches
 /// terminate).
 pub const MAX_DEPTH: u32 = 64;
+
+/// Above this, a score is a mate rather than a material balance. A mate is scored
+/// `MATE - ply`, so any plausible mate stays well above a material evaluation, which
+/// cannot approach 20 000. Shared with [`crate::transposition`] and with the UCI
+/// layer, which needs the same boundary to report `score mate` instead of `score cp`
+/// — two places deriving it separately would eventually disagree.
+pub const MATE_THRESHOLD: i32 = 20_000;
 
 // A bound strictly above any reachable score (including `MATE`), used as the
 // initial alpha/beta window.
@@ -56,6 +63,43 @@ impl Limits {
     /// both, or neither.
     pub fn bounded(max_depth: u32, deadline: Option<Instant>) -> Limits {
         Limits { max_depth, deadline }
+    }
+}
+
+/// What one completed iteration of the deepening loop found.
+///
+/// Reported as it happens rather than collected and returned: a GUI shows the
+/// evaluation *while* the engine thinks, and an arena samples it per move. The engine
+/// crate never prints — it hands this to whoever asked for the search.
+pub struct Progress {
+    pub depth: u32,
+    /// Side-to-move perspective, in centipawns — or a mate score, which the caller
+    /// recognises by comparing against [`MATE_THRESHOLD`].
+    pub score: i32,
+    pub nodes: u64,
+    pub elapsed: Duration,
+    pub best: Move,
+}
+
+/// Everything a search needs besides the position.
+///
+/// A struct rather than more parameters. Each thing a caller might want — a progress
+/// callback here, the game history in #25 — would otherwise either add a parameter to
+/// every call site or spawn another `search_*` variant. #16 settled that there is
+/// exactly one entry point; this is what lets it stay that way while the list of
+/// options grows.
+pub struct Request<'a> {
+    pub limits: Limits,
+    /// Called once per **completed** iteration. An iteration cut short by the
+    /// deadline is discarded, so it is never reported — announcing a depth the
+    /// engine then walks back from would be worse than saying nothing.
+    pub progress: Option<&'a mut dyn FnMut(&Progress)>,
+}
+
+impl<'a> Request<'a> {
+    /// A search bounded only by `limits`, reporting nothing.
+    pub fn new(limits: Limits) -> Request<'a> {
+        Request { limits, progress: None }
     }
 }
 
@@ -104,6 +148,13 @@ pub fn best_move(pos: &Position, depth: u32) -> Option<(Move, i32)> {
 /// always finishes, so there is always a legal move to return (unless the root is
 /// terminal).
 pub fn search_timed(pos: &Position, limits: Limits) -> SearchStats {
+    search(pos, Request::new(limits))
+}
+
+/// The search. Everything a caller can ask for travels in [`Request`].
+pub fn search(pos: &Position, mut request: Request) -> SearchStats {
+    let started = Instant::now();
+    let limits = &request.limits;
     let mut searcher = Searcher::new(true, limits.deadline);
     let max_depth = limits.max_depth.max(1);
 
@@ -131,8 +182,18 @@ pub fn search_timed(pos: &Position, limits: Limits) -> SearchStats {
         }
         best = result;
         completed = depth;
-        if best.is_none() {
+        let Some((mv, score)) = best else {
             break; // terminal root — nothing to deepen
+        };
+        // This iteration finished, so its verdict is worth announcing.
+        if let Some(report) = request.progress.as_mut() {
+            report(&Progress {
+                depth,
+                score,
+                nodes: searcher.nodes,
+                elapsed: started.elapsed(),
+                best: mv,
+            });
         }
         // Don't open another iteration we have no time to finish.
         if let Some(deadline) = limits.deadline {
@@ -362,7 +423,6 @@ impl Searcher {
 mod tests {
     use super::*;
     use crate::position::{Color, Piece, Status};
-    use std::time::Duration;
 
     // A single fixed-depth pass — no deepening, no clock — driving `Searcher` directly.
     // The oracle these tests compare against: it gives the verdict a plain depth-D
