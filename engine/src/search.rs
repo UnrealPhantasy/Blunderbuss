@@ -196,17 +196,28 @@ impl Searcher {
         }
     }
 
-    /// Whether `key` has already occurred, in the game before the search or along
-    /// the branch being explored.
+    /// Whether reaching `key` again is a draw.
     ///
-    /// **One** earlier occurrence is enough to call it a draw, rather than the two
-    /// the rules require for a threefold. The code therefore looks like it
-    /// implements the wrong rule, and does so deliberately: a side able to force a
-    /// position to repeat once can force it again, so searching on to a literal
-    /// third occurrence spends plies to reach a conclusion already available. This
-    /// is what every engine does.
+    /// The two sources are **not** treated alike, and conflating them is a real
+    /// mistake rather than a simplification.
+    ///
+    /// Along the **search path**, one earlier occurrence is enough. Both sides are
+    /// choosing their moves inside this branch, so a side able to steer back to a
+    /// position once can do it again; searching on to a literal third occurrence
+    /// spends plies reaching a conclusion already available. Every engine does this.
+    ///
+    /// Against the **game history**, one is not enough. A position played once
+    /// before and reached now has occurred *twice*, and the rules want three. Calling
+    /// that a draw makes the engine believe it can force a repetition its opponent is
+    /// still free to decline — it plays for a draw that does not exist, and finds
+    /// itself in a position it evaluated as 0.
     fn is_repetition(&self, key: u64) -> bool {
-        self.path.contains(&key) || self.history.contains(&key)
+        if self.path.contains(&key) {
+            return true;
+        }
+        // Idiom: `iter().filter(...).count()` counts matches without allocating.
+        // Two prior occurrences, so that this one is the third.
+        self.history.iter().filter(|&&seen| seen == key).count() >= 2
     }
 
     /// Set `aborted` if the deadline has passed. Checked only every so often
@@ -532,13 +543,37 @@ mod tests {
         let (_, lost) = best_move(&p, 4).expect("a move");
         assert!(lost < -800, "without history this is simply lost: {lost}");
 
-        // Ke2 returns to a position the game already visited, so it is a draw — and
-        // a draw is worth 900 centipawns more than the alternative.
+        // Ke2 reaches a position the game has already been in *twice*, so playing it
+        // is the third occurrence — a real draw, worth 900 centipawns more than the
+        // alternative.
         let after_ke2 = p.play(p.move_from_uci("e1e2").unwrap());
-        let stats = search_with_history(&p, Limits::depth(4), &[after_ke2.hash()]);
+        let twice = vec![after_ke2.hash(), after_ke2.hash()];
+        let stats = search_with_history(&p, Limits::depth(4), &twice);
         let (mv, score) = stats.best.expect("a move");
-        assert_eq!(score, 0, "the repetition is a draw, not a loss");
+        assert_eq!(score, 0, "the third occurrence is a draw, not a loss");
         assert_eq!(p.move_to_uci(mv), "e1e2", "and it is the move that reaches it");
+    }
+
+    #[test]
+    fn one_earlier_occurrence_is_not_yet_a_draw() {
+        // The defect this guards against: treating a *second* occurrence as a draw.
+        // The rules want three, and the opponent is still free to decline the
+        // repetition — so an engine that scores this 0 plays for a draw that does not
+        // exist, and lands in a position it evaluated as level.
+        let p = Position::from_fen(LOST_KING).unwrap();
+        let after_ke2 = p.play(p.move_from_uci("e1e2").unwrap());
+
+        let once = search_with_history(&p, Limits::depth(4), &[after_ke2.hash()]);
+        let (_, score) = once.best.expect("a move");
+        assert!(score < -800, "one prior occurrence is only the second: {score}");
+
+        // Two, and it becomes the third — then it is a draw.
+        let twice = vec![after_ke2.hash(), after_ke2.hash()];
+        assert_eq!(
+            search_with_history(&p, Limits::depth(4), &twice).best.map(|(_, s)| s),
+            Some(0),
+            "the third occurrence is drawn"
+        );
     }
 
     #[test]
@@ -547,25 +582,32 @@ mod tests {
         // win. Scoring a draw 0 must not make the engine want one.
         let p = Position::from_fen("4k3/8/8/8/8/8/8/3QK3 w - - 0 1").unwrap();
         let after_kd2 = p.play(p.move_from_uci("e1d2").unwrap());
-        let stats = search_with_history(&p, Limits::depth(4), &[after_kd2.hash()]);
+        let twice = vec![after_kd2.hash(), after_kd2.hash()];
+        let stats = search_with_history(&p, Limits::depth(4), &twice);
         let (mv, score) = stats.best.expect("a move");
         assert!(score > 800, "a queen up must stay winning, got {score}");
         assert_ne!(p.move_to_uci(mv), "e1d2", "and the drawing move must be avoided");
     }
 
     #[test]
-    fn the_search_path_counts_as_history() {
-        // The two sources are separate: a position repeated inside the tree is a draw
-        // even with no game history at all. Checked on the mechanism directly, since
-        // constructing a forced in-tree repetition on the board is fragile.
+    fn the_path_needs_one_occurrence_and_the_history_needs_two() {
+        // The asymmetry itself, on the mechanism — constructing a forced in-tree
+        // repetition on the board is fragile, and this is the property that matters.
         let mut searcher = Searcher::new(true, None);
         assert!(!searcher.is_repetition(42), "an unseen key is not a repetition");
+
+        // In the tree: one is enough, because both sides are choosing moves here and
+        // a side that can steer back once can do it again.
         searcher.path.push(42);
-        assert!(searcher.is_repetition(42), "a key on the current path is");
+        assert!(searcher.is_repetition(42), "one occurrence on the path suffices");
         searcher.path.pop();
-        assert!(!searcher.is_repetition(42), "and it stops being one once popped");
+        assert!(!searcher.is_repetition(42), "and it stops counting once popped");
+
+        // In the game: one prior occurrence makes this only the second.
         searcher.history.push(42);
-        assert!(searcher.is_repetition(42), "the game history counts too");
+        assert!(!searcher.is_repetition(42), "one played occurrence is not a draw yet");
+        searcher.history.push(42);
+        assert!(searcher.is_repetition(42), "two played occurrences make this the third");
     }
 
     #[test]
