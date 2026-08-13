@@ -90,6 +90,11 @@ impl Table {
     /// Note what it is **not**: a matched entry may still be too shallow to cut off,
     /// in which case it contributes ordering only. Measured at depth 7, roughly half
     /// of the key matches fall in that case — see [`Table::cutoff_rate`].
+    ///
+    /// Measure it through [`search_timed`](crate::search::search_timed), never by
+    /// driving `Searcher::root` in a loop: the real search feeds each iteration the
+    /// previous one's best move, which changes the move order and therefore the mix
+    /// of entries the table ends up holding.
     pub fn key_match_rate(&self) -> f64 {
         if self.probes == 0 {
             0.0
@@ -102,9 +107,14 @@ impl Table {
     ///
     /// The stricter of the two rates, and the one that measures what the table buys
     /// in pruning. The gap with [`Table::key_match_rate`] is the share of matches
-    /// that were useful for move ordering but not deep enough to cut off — measured
-    /// at depth 7: 0.134 against 0.231 from the start position, 0.243 against 0.467
-    /// on Kiwipete.
+    /// that were useful for move ordering but not deep enough to cut off. Measured
+    /// through `search_timed(pos, Limits::depth(7))`, release build:
+    ///
+    /// | position | key match | cutoff |
+    /// |---|---|---|
+    /// | start position | 0.196 | 0.116 |
+    /// | Kiwipete | 0.467 | 0.243 |
+    /// | Ruy Lopez | 0.295 | 0.159 |
     pub fn cutoff_rate(&self) -> f64 {
         if self.probes == 0 {
             0.0
