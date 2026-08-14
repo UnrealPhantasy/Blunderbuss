@@ -158,10 +158,53 @@ pub fn search_timed(pos: &Position, limits: Limits) -> SearchStats {
     search(pos, Request::new(limits))
 }
 
-/// The search. Everything a caller can ask for travels in [`Request`].
+/// What survives a search, and therefore has to be owned by the caller.
+///
+/// Only the transposition table today. It lives here rather than inside the search
+/// because two consecutive moves of a game explore largely the same tree: the
+/// opponent replies, and the engine starts again from a position it has already
+/// analysed deeply. Rebuilding the table each move threw all of that away — and cost
+/// 7.3 ms per move to do so, which late in a game is 7% of the thinking budget.
+///
+/// Deliberately **not** part of [`Request`]: a request is what a caller *asks for*,
+/// answered and finished. This is state that outlives the answer, and giving it its
+/// own type makes that lifetime visible instead of implied.
+pub struct Engine {
+    table: Table,
+}
+
+impl Default for Engine {
+    fn default() -> Engine {
+        Engine::new()
+    }
+}
+
+impl Engine {
+    pub fn new() -> Engine {
+        Engine { table: Table::new() }
+    }
+
+    /// Forget everything learned so far. Called at the start of a **new game**, never
+    /// between moves of the same one.
+    pub fn new_game(&mut self) {
+        self.table.clear();
+    }
+
+    /// Search `pos`. Everything a caller can ask for travels in [`Request`]; what
+    /// the search learns stays here, ready for the next move.
+    pub fn search(&mut self, pos: &Position, request: Request) -> SearchStats {
+        let searcher = Searcher::new(MoveOrder::Full, request.limits.deadline, &mut self.table);
+        deepen(pos, request, searcher)
+    }
+}
+
+/// A one-off search, with a table that lives and dies with the call.
+///
+/// For callers with no game to follow — tests, and [`best_move`]. A real game should
+/// hold an [`Engine`] instead, or it pays to rebuild the table on every move and
+/// learns nothing from the previous one.
 pub fn search(pos: &Position, request: Request) -> SearchStats {
-    let searcher = Searcher::new(MoveOrder::Full, request.limits.deadline);
-    deepen(pos, request, searcher)
+    Engine::new().search(pos, request)
 }
 
 /// The deepening loop itself, over a searcher the caller supplies.
@@ -291,14 +334,19 @@ struct RootResult {
 /// Carries the state shared by the whole search: the node counter, the ordering
 /// switch, and the time deadline / abort flag. Keeping `root` and `negamax` as
 /// methods on one struct keeps them in sync.
-struct Searcher {
+struct Searcher<'a> {
     nodes: u64,
     order: MoveOrder,
     deadline: Option<Instant>,
     aborted: bool,
-    /// Lives for the whole `search_timed` call, so iteration N+1 reuses what
-    /// iteration N learned. That reuse is a large part of why the table pays.
-    table: Table,
+    /// Borrowed from the [`Engine`], so it outlives this search: iteration N+1
+    /// reuses what iteration N learned, and the *next move* reuses what this whole
+    /// search learned.
+    ///
+    /// Idiom: `&'a mut` rather than an owned `Table` — the searcher works on the
+    /// caller's table for the duration of the search and gives it back. The lifetime
+    /// `'a` is what tells the compiler the table must outlive the searcher.
+    table: &'a mut Table,
     /// Zobrist keys of the positions played *before* the search started. A draw by
     /// repetition depends on the game, not on the board alone, so the search cannot
     /// see one without being told what came before.
@@ -322,14 +370,14 @@ struct Searcher {
     node_limit: Option<u64>,
 }
 
-impl Searcher {
-    fn new(order: MoveOrder, deadline: Option<Instant>) -> Searcher {
+impl<'a> Searcher<'a> {
+    fn new(order: MoveOrder, deadline: Option<Instant>, table: &'a mut Table) -> Searcher<'a> {
         Searcher {
             nodes: 0,
             order,
             deadline,
             aborted: false,
-            table: Table::new(),
+            table,
             history: Vec::new(),
             path: Vec::new(),
             killers: Killers::new(),
@@ -633,7 +681,8 @@ mod tests {
     // different move depending on how busy the machine is — the test would be measuring
     // the machine. A node count cuts at exactly the same place every run.
     fn search_cut_at(pos: &Position, max_depth: u32, node_ceiling: u64) -> (SearchStats, Vec<u32>) {
-        let mut searcher = Searcher::new(MoveOrder::Full, None);
+        let mut table = Table::new();
+        let mut searcher = Searcher::new(MoveOrder::Full, None, &mut table);
         searcher.node_limit = Some(node_ceiling);
         let mut reported = Vec::new();
         let mut report = |p: &Progress| reported.push(p.depth);
@@ -649,7 +698,8 @@ mod tests {
     // The oracle these tests compare against: it gives the verdict a plain depth-D
     // search reaches, and, with `ordered` flipped, isolates what move ordering does.
     fn search_fixed(pos: &Position, depth: u32, order: MoveOrder) -> SearchStats {
-        let mut searcher = Searcher::new(order, None);
+        let mut table = Table::new();
+        let mut searcher = Searcher::new(order, None, &mut table);
         let best = searcher.root(pos, depth, None).best;
         SearchStats {
             best,
@@ -670,11 +720,13 @@ mod tests {
         let best = p.move_from_uci("d1d5").unwrap();
         let mediocre = p.move_from_uci("e1f1").unwrap();
 
-        let overtaken = Searcher::new(MoveOrder::Full, None).root(&p, 3, Some(mediocre));
+        let mut t1 = Table::new();
+        let overtaken = Searcher::new(MoveOrder::Full, None, &mut t1).root(&p, 3, Some(mediocre));
         assert!(overtaken.improved, "Rxd5 must overtake the move tried first");
         assert_eq!(overtaken.best.map(|(mv, _)| mv), Some(best));
 
-        let already_best = Searcher::new(MoveOrder::Full, None).root(&p, 3, Some(best));
+        let mut t2 = Table::new();
+        let already_best = Searcher::new(MoveOrder::Full, None, &mut t2).root(&p, 3, Some(best));
         assert!(!already_best.improved, "nothing can overtake the best move");
         assert_eq!(already_best.best.map(|(mv, _)| mv), Some(best));
     }
@@ -988,7 +1040,8 @@ mod tests {
     fn the_path_needs_one_occurrence_and_the_history_needs_two() {
         // The asymmetry itself, on the mechanism — constructing a forced in-tree
         // repetition on the board is fragile, and this is the property that matters.
-        let mut searcher = Searcher::new(MoveOrder::Full, None);
+        let mut table = Table::new();
+        let mut searcher = Searcher::new(MoveOrder::Full, None, &mut table);
         assert!(!searcher.is_repetition(42), "an unseen key is not a repetition");
 
         // In the tree: one is enough, because both sides are choosing moves here and
@@ -1013,7 +1066,8 @@ mod tests {
         let p = Position::from_fen(LOST_KING).unwrap();
         let after_ke2 = p.play(p.move_from_uci("e1e2").unwrap());
 
-        let mut searcher = Searcher::new(MoveOrder::Full, None);
+        let mut table = Table::new();
+        let mut searcher = Searcher::new(MoveOrder::Full, None, &mut table);
         // Two occurrences, so the position genuinely is scored 0 as a repetition.
         // Asserting that first is the point: with one, this test would pass while
         // exercising nothing — which is exactly what happened when the history
@@ -1036,12 +1090,76 @@ mod tests {
     }
 
     #[test]
+    fn what_one_move_learns_is_there_for_the_next() {
+        // The behaviour the `Engine` exists for. Two consecutive moves of a game
+        // explore largely the same tree — the opponent replies, and the engine starts
+        // again from a position it just analysed deeply. On one `Engine`, the second
+        // search reads what the first wrote.
+        let start = Position::initial();
+        let mut engine = Engine::new();
+        let first = engine.search(&start, Request::new(Limits::depth(6)));
+
+        // Play a move each side, as a game would.
+        let (mv, _) = first.best.expect("a move");
+        let after = start.play(mv);
+        let (reply, _) = best_move(&after, 3).expect("a reply");
+        let next = after.play(reply);
+
+        let carried = engine.search(&next, Request::new(Limits::depth(6)));
+        let fresh = Engine::new().search(&next, Request::new(Limits::depth(6)));
+
+        assert_eq!(carried.best.map(|(_, s)| s), fresh.best.map(|(_, s)| s), "same verdict");
+        assert!(
+            carried.nodes < fresh.nodes,
+            "a carried-over table must save work: {} nodes against {} from scratch",
+            carried.nodes,
+            fresh.nodes,
+        );
+    }
+
+    #[test]
+    fn a_new_game_starts_from_nothing() {
+        // Positions from a finished game would compete for slots with the ones that
+        // matter now. `new_game` is the only thing that empties the table — and the
+        // protocol layer is the only level that knows a game has ended.
+        let p = Position::initial();
+        let mut engine = Engine::new();
+        let fresh = engine.search(&p, Request::new(Limits::depth(6)));
+
+        let warm = engine.search(&p, Request::new(Limits::depth(6)));
+        assert!(warm.nodes < fresh.nodes, "precondition: the table must be carrying something");
+
+        engine.new_game();
+        let after_clear = engine.search(&p, Request::new(Limits::depth(6)));
+        assert_eq!(after_clear.nodes, fresh.nodes, "a cleared table must search like a new one");
+    }
+
+    #[test]
+    fn a_mate_score_survives_from_one_search_to_the_next() {
+        // Mate scores are stored relative to the *node* rather than to the root, so
+        // that an entry means the same thing wherever it is read from. Persisting the
+        // table is what makes that matter: an entry is now read by a search whose root
+        // is a different position entirely. If the conversion were wrong, a mate in 2
+        // would come back as a mate in some other number — plausible enough to pass
+        // unnoticed, and wrong.
+        let p = Position::from_fen("6k1/5ppp/8/8/8/8/8/R6K w - - 0 1").unwrap();
+        let mut engine = Engine::new();
+        let first = engine.search(&p, Request::new(Limits::depth(4)));
+        let (_, score) = first.best.expect("a mate exists");
+        assert!(score > MATE_THRESHOLD, "precondition: the first search must find a mate");
+
+        let again = engine.search(&p, Request::new(Limits::depth(4)));
+        assert_eq!(again.best.map(|(_, s)| s), Some(score), "the same mate, at the same distance");
+    }
+
+    #[test]
     fn a_repeated_search_reuses_the_table() {
         // The same position, twice, on one `Searcher`. The second pass asks the very
         // questions the first one answered, so almost all of it should come out of the
         // table rather than the tree.
         let p = Position::initial();
-        let mut searcher = Searcher::new(MoveOrder::Full, None);
+        let mut table = Table::new();
+        let mut searcher = Searcher::new(MoveOrder::Full, None, &mut table);
         searcher.root(&p, 5, None);
         let first = searcher.nodes;
         searcher.nodes = 0;
@@ -1148,7 +1266,8 @@ mod tests {
 
     // Quiescence from `pos`, on a full window — what a leaf of the main search gets.
     fn quiesce(pos: &Position) -> i32 {
-        Searcher::new(MoveOrder::Full, None).quiescence(pos, -INF, INF, 0)
+        let mut table = Table::new();
+        Searcher::new(MoveOrder::Full, None, &mut table).quiescence(pos, -INF, INF, 0)
     }
 
     #[test]

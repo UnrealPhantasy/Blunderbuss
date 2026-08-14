@@ -81,6 +81,23 @@ impl Table {
         Table { entries: vec![None; ENTRIES].into_boxed_slice(), hits: 0, probes: 0, cutoffs: 0 }
     }
 
+    /// Forget everything, keeping the allocation.
+    ///
+    /// Called between **games**, not between moves. Within a game, carrying entries
+    /// from one move to the next is the whole point — consecutive moves search
+    /// largely the same tree. Across games it would only be noise: positions from a
+    /// finished game competing for slots with the new one.
+    ///
+    /// Clearing rather than reallocating matters for the same reason the table is now
+    /// kept at all: building a fresh one costs 7.3 ms, which is 7% of a late-game
+    /// thinking budget. Overwriting in place costs a memset and no page faults.
+    pub fn clear(&mut self) {
+        self.entries.fill(None);
+        self.hits = 0;
+        self.probes = 0;
+        self.cutoffs = 0;
+    }
+
     /// Fraction of probes that found an entry for *this* position — a key match,
     /// whatever came of it.
     ///
