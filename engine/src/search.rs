@@ -12,7 +12,7 @@
 //! direct depth-N pass. [`best_move`] is a thin convenience wrapper over it.
 
 use crate::evaluation::evaluate;
-use crate::ordering::{mvv_lva, order_moves};
+use crate::ordering::{mvv_lva, order_moves, KillerSlots, Killers};
 use crate::position::{Move, Piece, Position};
 use crate::transposition::{Bound, Table};
 use std::time::{Duration, Instant};
@@ -162,7 +162,7 @@ pub fn search_timed(pos: &Position, limits: Limits) -> SearchStats {
 pub fn search(pos: &Position, mut request: Request) -> SearchStats {
     let started = Instant::now();
     let limits = &request.limits;
-    let mut searcher = Searcher::new(true, limits.deadline);
+    let mut searcher = Searcher::new(MoveOrder::Full, limits.deadline);
     searcher.history = request.history.to_vec();
     let max_depth = limits.max_depth.max(1);
 
@@ -219,12 +219,37 @@ pub fn search(pos: &Position, mut request: Request) -> SearchStats {
     }
 }
 
+/// How much of the move ordering the search uses.
+///
+/// Outside the tests this is always [`MoveOrder::Full`]. The weaker settings exist
+/// so a test can isolate one heuristic and pin what it contributes on its own — a
+/// node count against a search that is identical but for that one thing.
+///
+/// Idiom: an enum rather than one boolean per heuristic, because the settings are
+/// cumulative. Two booleans would also spell "killers but no MVV-LVA", which is not
+/// a thing the search can do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MoveOrder {
+    /// Whatever order the generator produced.
+    None,
+    /// MVV-LVA: captures ranked against each other, quiet moves left untouched.
+    ///
+    /// Idiom: the search itself never selects this one — only tests do — so a
+    /// non-test build would warn that nothing constructs it. `cfg_attr` applies the
+    /// `allow` outside test builds only, which keeps the warning alive everywhere it
+    /// could still mean something.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Captures,
+    /// MVV-LVA, plus the killer moves of the current ply ahead of the other quiet moves.
+    Full,
+}
+
 /// Carries the state shared by the whole search: the node counter, the ordering
 /// switch, and the time deadline / abort flag. Keeping `root` and `negamax` as
 /// methods on one struct keeps them in sync.
 struct Searcher {
     nodes: u64,
-    ordered: bool,
+    order: MoveOrder,
     deadline: Option<Instant>,
     aborted: bool,
     /// Lives for the whole `search_timed` call, so iteration N+1 reuses what
@@ -237,18 +262,34 @@ struct Searcher {
     /// Zobrist keys along the branch currently being explored, pushed on the way
     /// down and popped on the way back up.
     path: Vec<u64>,
+    /// The quiet moves that caused a cutoff, per ply. Like the transposition table,
+    /// it lives for the whole search, so each deepening iteration starts on what the
+    /// previous one learned.
+    killers: Killers,
 }
 
 impl Searcher {
-    fn new(ordered: bool, deadline: Option<Instant>) -> Searcher {
+    fn new(order: MoveOrder, deadline: Option<Instant>) -> Searcher {
         Searcher {
             nodes: 0,
-            ordered,
+            order,
             deadline,
             aborted: false,
             table: Table::new(),
             history: Vec::new(),
             path: Vec::new(),
+            killers: Killers::new(),
+        }
+    }
+
+    /// The killers that apply to a node at `ply` — none unless the full ordering is on.
+    fn killers_at(&self, ply: i32) -> KillerSlots {
+        if self.order == MoveOrder::Full {
+            // Idiom: `as usize` on a `ply` the search only ever counts upwards from
+            // the root; `Killers::at` handles anything past its table.
+            self.killers.at(ply as usize)
+        } else {
+            KillerSlots::none()
         }
     }
 
@@ -296,8 +337,10 @@ impl Searcher {
         if moves.is_empty() {
             return None;
         }
-        if self.ordered {
-            order_moves(pos, &mut moves);
+        if self.order != MoveOrder::None {
+            // The root is ply 0 and never cuts off — no killer is ever recorded
+            // there, so there is none to apply.
+            order_moves(pos, &mut moves, KillerSlots::none());
         }
         if let Some(pv) = pv_move {
             if let Some(i) = moves.iter().position(|&mv| mv == pv) {
@@ -367,8 +410,8 @@ impl Searcher {
             // Terminal: checkmate (side to move loses) or stalemate (draw).
             return if pos.in_check() { -(MATE - ply) } else { 0 };
         }
-        if self.ordered {
-            order_moves(pos, &mut moves);
+        if self.order != MoveOrder::None {
+            order_moves(pos, &mut moves, self.killers_at(ply));
         }
         // The cached move goes first, ahead even of the best capture. A previous
         // search already found it good here, and a good first move is what makes the
@@ -400,7 +443,13 @@ impl Searcher {
                 alpha = best;
             }
             if alpha >= beta {
-                break; // Beta cutoff: this branch cannot improve the result.
+                // Beta cutoff: this branch cannot improve the result. Remember the
+                // refutation, so the sibling nodes of this ply try it first — the
+                // table itself drops the move if it is a capture or a promotion.
+                if self.order == MoveOrder::Full {
+                    self.killers.record(pos, ply as usize, mv);
+                }
+                break;
             }
         }
 
@@ -465,8 +514,10 @@ impl Searcher {
         // explicit promotion test: without it the leaf is evaluated as if the queen
         // about to appear did not exist.
         moves.retain(|&mv| mvv_lva(pos, mv) > 0 || is_queen_promotion(mv));
-        if self.ordered {
-            order_moves(pos, &mut moves);
+        if self.order != MoveOrder::None {
+            // No killers here: every move left is a capture or a promotion, and a
+            // killer is by definition quiet.
+            order_moves(pos, &mut moves, KillerSlots::none());
         }
 
         let mut best = stand_pat;
@@ -497,8 +548,8 @@ mod tests {
     // A single fixed-depth pass — no deepening, no clock — driving `Searcher` directly.
     // The oracle these tests compare against: it gives the verdict a plain depth-D
     // search reaches, and, with `ordered` flipped, isolates what move ordering does.
-    fn search_fixed(pos: &Position, depth: u32, ordered: bool) -> SearchStats {
-        let mut searcher = Searcher::new(ordered, None);
+    fn search_fixed(pos: &Position, depth: u32, order: MoveOrder) -> SearchStats {
+        let mut searcher = Searcher::new(order, None);
         let best = searcher.root(pos, depth, None);
         SearchStats {
             best,
@@ -566,8 +617,8 @@ mod tests {
             "4k3/8/8/3q4/8/8/8/3RK3 w - - 0 1",
         ] {
             let p = Position::from_fen(fen).unwrap();
-            let ordered = search_fixed(&p, 3, true).best.map(|(_, s)| s);
-            let unordered = search_fixed(&p, 3, false).best.map(|(_, s)| s);
+            let ordered = search_fixed(&p, 3, MoveOrder::Full).best.map(|(_, s)| s);
+            let unordered = search_fixed(&p, 3, MoveOrder::None).best.map(|(_, s)| s);
             assert_eq!(ordered, unordered, "score must not depend on ordering ({fen})");
         }
     }
@@ -582,14 +633,62 @@ mod tests {
             "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 0 3",
         )
         .unwrap();
-        let ordered = search_fixed(&p, 3, true);
-        let unordered = search_fixed(&p, 3, false);
+        let ordered = search_fixed(&p, 3, MoveOrder::Full);
+        let unordered = search_fixed(&p, 3, MoveOrder::None);
         assert!(
             ordered.nodes < unordered.nodes,
             "ordering should prune: ordered {} vs unordered {}",
             ordered.nodes,
             unordered.nodes
         );
+    }
+
+    #[test]
+    fn killers_prune_beyond_what_mvv_lva_can_reach() {
+        // The opening position is where the difference is starkest, and for the
+        // reason the heuristic was built: almost every move here is quiet, so
+        // MVV-LVA has nothing to rank and the search wades through the move list in
+        // generator order. Measured at depth 5: 273 833 nodes on captures-only
+        // ordering against 32 424 with killers.
+        //
+        // A factor of two is asserted rather than the measured 8.4: node counts at a
+        // fixed depth are deterministic, so `<` alone would pass on a one-node
+        // difference, while pinning the exact figure would break on any later
+        // ordering change that is perfectly legitimate.
+        let p = Position::initial();
+        let with = search_fixed(&p, 5, MoveOrder::Full);
+        let without = search_fixed(&p, 5, MoveOrder::Captures);
+        assert!(
+            with.nodes * 2 < without.nodes,
+            "killers should prune substantially: {} with vs {} without",
+            with.nodes,
+            without.nodes
+        );
+    }
+
+    #[test]
+    fn killers_do_not_change_the_score() {
+        // Same invariant as `ordering_does_not_change_the_score`, one heuristic
+        // further: killers reorder the quiet moves, and reordering must leave
+        // alpha-beta's value untouched.
+        //
+        // Only the *score* is compared, never the move: several moves can share the
+        // best score, and the one returned is whichever reached it first — which is
+        // precisely what an ordering change is allowed to alter.
+        for (fen, depth) in [
+            ("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 5),
+            ("r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 0 3", 5),
+            // Kiwipete: a tactical position where captures dominate. Killers barely
+            // prune here (0.4% of nodes), which is exactly why it belongs in this
+            // test — it is the case where the two searches differ least, so an
+            // accidental change of value would be easiest to miss.
+            ("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", 4),
+        ] {
+            let p = Position::from_fen(fen).unwrap();
+            let with = search_fixed(&p, depth, MoveOrder::Full).best.map(|(_, s)| s);
+            let without = search_fixed(&p, depth, MoveOrder::Captures).best.map(|(_, s)| s);
+            assert_eq!(with, without, "killers must not change the score ({fen})");
+        }
     }
 
     // A king alone against a queen: lost by 900 centipawns, unless the game can be
@@ -652,7 +751,7 @@ mod tests {
     fn the_path_needs_one_occurrence_and_the_history_needs_two() {
         // The asymmetry itself, on the mechanism — constructing a forced in-tree
         // repetition on the board is fragile, and this is the property that matters.
-        let mut searcher = Searcher::new(true, None);
+        let mut searcher = Searcher::new(MoveOrder::Full, None);
         assert!(!searcher.is_repetition(42), "an unseen key is not a repetition");
 
         // In the tree: one is enough, because both sides are choosing moves here and
@@ -677,7 +776,7 @@ mod tests {
         let p = Position::from_fen(LOST_KING).unwrap();
         let after_ke2 = p.play(p.move_from_uci("e1e2").unwrap());
 
-        let mut searcher = Searcher::new(true, None);
+        let mut searcher = Searcher::new(MoveOrder::Full, None);
         // Two occurrences, so the position genuinely is scored 0 as a repetition.
         // Asserting that first is the point: with one, this test would pass while
         // exercising nothing — which is exactly what happened when the history
@@ -705,7 +804,7 @@ mod tests {
         // questions the first one answered, so almost all of it should come out of the
         // table rather than the tree.
         let p = Position::initial();
-        let mut searcher = Searcher::new(true, None);
+        let mut searcher = Searcher::new(MoveOrder::Full, None);
         searcher.root(&p, 5, None);
         let first = searcher.nodes;
         searcher.nodes = 0;
@@ -767,7 +866,7 @@ mod tests {
         ] {
             let p = Position::from_fen(fen).unwrap();
             let deep = search_timed(&p, Limits::depth(4));
-            let direct = search_fixed(&p, 4, true);
+            let direct = search_fixed(&p, 4, MoveOrder::Full);
             assert_eq!(deep.best.map(|(_, s)| s), direct.best.map(|(_, s)| s));
             assert_eq!(deep.depth, 4);
         }
@@ -780,7 +879,7 @@ mod tests {
         let p = Position::from_fen("4k3/8/8/3q4/8/8/8/3RK3 w - - 0 1").unwrap();
         let wrapped = best_move(&p, 4).map(|(_, s)| s);
         assert_eq!(wrapped, search_timed(&p, Limits::depth(4)).best.map(|(_, s)| s));
-        assert_eq!(wrapped, search_fixed(&p, 4, true).best.map(|(_, s)| s));
+        assert_eq!(wrapped, search_fixed(&p, 4, MoveOrder::Full).best.map(|(_, s)| s));
     }
 
     #[test]
@@ -812,7 +911,7 @@ mod tests {
 
     // Quiescence from `pos`, on a full window — what a leaf of the main search gets.
     fn quiesce(pos: &Position) -> i32 {
-        Searcher::new(true, None).quiescence(pos, -INF, INF, 0)
+        Searcher::new(MoveOrder::Full, None).quiescence(pos, -INF, INF, 0)
     }
 
     #[test]
@@ -988,3 +1087,4 @@ mod tests {
         assert!(stats.depth >= 1);
     }
 }
+
