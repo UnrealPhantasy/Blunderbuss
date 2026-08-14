@@ -510,5 +510,3 @@ mod tests {
         assert!(is_quiet(&ep, uci_move(&ep, "e5e6")), "the pawn push is quiet");
     }
 }
-
-

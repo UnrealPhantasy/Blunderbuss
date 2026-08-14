@@ -688,14 +688,21 @@ mod tests {
         let p = Position::from_fen(CHANGES_ITS_MIND).unwrap();
         let (stats, _) = search_cut_at(&p, 6, 1_000);
 
-        // Exactly what a complete depth-3 search returns, score included: the kept
-        // score is the move's real value, not a bound and not the placeholder an
-        // aborted node returns.
         assert_eq!(
             stats.best.map(|(mv, sc)| (p.move_to_uci(mv), sc)),
             Some(("h2h3".to_string(), 450)),
         );
-        assert_eq!(best_move(&p, 3).map(|(mv, sc)| (p.move_to_uci(mv), sc)), Some(("h2h3".to_string(), 450)));
+        // What the rescue is worth is exactly this: a move the previous *complete*
+        // iteration would not have played.
+        assert_ne!(
+            best_move(&p, 2).map(|(mv, _)| p.move_to_uci(mv)),
+            Some("h2h3".to_string()),
+            "otherwise the test would pass without the rescue doing anything",
+        );
+        // And no more than that. The rescued move is an improvement found part-way
+        // through iteration 3, not iteration 3's verdict — completed, that iteration
+        // settles on a different move again. An earlier version of this test asserted
+        // the two were equal; they were, on the evaluation of the day, by coincidence.
     }
 
     #[test]
@@ -733,17 +740,31 @@ mod tests {
         // The property is worth its own test because nothing else exercises it: on a
         // winning position the placeholder loses the comparison anyway and the defect
         // stays invisible.
+        //
+        // **Every** cut point is swept rather than one being picked, and that is the
+        // point of the test rather than thoroughness for its own sake. An earlier
+        // version cut at a single fixed ceiling, which only catches the defect when
+        // the interruption happens to land *inside* a move's search — and where it
+        // lands depends on how many nodes each depth costs, which any change to the
+        // evaluation moves. That version was silently disarmed by the tapered
+        // evaluation: the mutation passed unnoticed until review.
+        //
+        // Sweeping turns a calibrated coincidence into an invariant: whatever the
+        // engine's node counts become, some ceiling in this range will land mid-move,
+        // and no ceiling may ever produce a drawn score in a lost position.
         let p = Position::from_fen("3qk3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
-        let (stats, _) = search_cut_at(&p, 5, 150);
-
-        let (_, score) = stats.best.expect("a move comes back");
-        assert_ne!(score, 0, "a placeholder must never be mistaken for a drawn position");
-        assert_eq!(
-            stats.best.map(|(mv, sc)| (p.move_to_uci(mv), sc)),
-            best_move(&p, 2).map(|(mv, sc)| (p.move_to_uci(mv), sc)),
-            "the complete depth-2 result must stand",
-        );
-        assert!(score < -800, "the position is lost, and the score must say so: {score}");
+        for ceiling in (20..=2_000).step_by(10) {
+            let (stats, _) = search_cut_at(&p, 5, ceiling);
+            let (_, score) = stats.best.expect("a move comes back");
+            assert_ne!(
+                score, 0,
+                "ceiling {ceiling}: a placeholder must never be mistaken for a drawn position",
+            );
+            assert!(
+                score < -800,
+                "ceiling {ceiling}: the position is lost and the score must say so, got {score}",
+            );
+        }
     }
 
     #[test]
@@ -1303,7 +1324,3 @@ mod tests {
         assert!(stats.depth >= 1);
     }
 }
-
-
-
-
