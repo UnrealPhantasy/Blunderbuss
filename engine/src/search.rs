@@ -688,14 +688,21 @@ mod tests {
         let p = Position::from_fen(CHANGES_ITS_MIND).unwrap();
         let (stats, _) = search_cut_at(&p, 6, 1_000);
 
-        // Exactly what a complete depth-3 search returns, score included: the kept
-        // score is the move's real value, not a bound and not the placeholder an
-        // aborted node returns.
         assert_eq!(
             stats.best.map(|(mv, sc)| (p.move_to_uci(mv), sc)),
             Some(("h2h3".to_string(), 450)),
         );
-        assert_eq!(best_move(&p, 3).map(|(mv, sc)| (p.move_to_uci(mv), sc)), Some(("h2h3".to_string(), 450)));
+        // What the rescue is worth is exactly this: a move the previous *complete*
+        // iteration would not have played.
+        assert_ne!(
+            best_move(&p, 2).map(|(mv, _)| p.move_to_uci(mv)),
+            Some("h2h3".to_string()),
+            "otherwise the test would pass without the rescue doing anything",
+        );
+        // And no more than that. The rescued move is an improvement found part-way
+        // through iteration 3, not iteration 3's verdict — completed, that iteration
+        // settles on a different move again. An earlier version of this test asserted
+        // the two were equal; they were, on the evaluation of the day, by coincidence.
     }
 
     #[test]
@@ -1303,6 +1310,7 @@ mod tests {
         assert!(stats.depth >= 1);
     }
 }
+
 
 
 
