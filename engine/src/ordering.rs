@@ -44,8 +44,11 @@ fn value(piece: Piece) -> i32 {
 pub fn mvv_lva(pos: &Position, mv: Move) -> i32 {
     // The victim is the enemy piece standing on the destination square. A legal
     // move never lands on a friendly piece, so "occupied" means "capture".
-    // (En-passant leaves the destination empty, so it reads as a quiet move here
-    // — acceptable: ordering never affects correctness, only pruning.)
+    //
+    // This function ranks captures against each other; it is *not* the test for
+    // whether a move is one. En passant scores 0 here (the captured pawn is not on
+    // `mv.to`) and a king capture scores negative (`value(King)` dwarfs any victim).
+    // [`is_quiet`] is what answers that question — see [`score`].
     match pos.piece_on(mv.to) {
         Some(victim) => {
             let attacker = pos.piece_on(mv.from).map_or(0, value);
@@ -159,18 +162,25 @@ impl Default for Killers {
 }
 
 // The ordering bands. They must not overlap: every capture is tried before every
-// killer, and every killer before every remaining quiet move. `mvv_lva` reaches
-// 89 900 (a queen taken by a pawn), so the gap between the bases is what keeps the
-// bands apart — hence a test pinning the property rather than an eyeball on the
-// constants.
+// killer, and every killer before every remaining quiet move.
+//
+// The width of the capture band is set by `mvv_lva`, which spans **−10 000 to
+// +89 900**. The top is a queen taken by a pawn. The bottom is a *king* taking a
+// pawn: `value(King)` is 20 000, so `100 * 100 − 20 000` goes negative — which is
+// why the base has to sit far enough above `KILLER_BASE` to absorb it. Worst
+// capture 990 000 against best killer 900 002. A test pins the property, rather
+// than trusting an eyeball on the constants.
 const CAPTURE_BASE: i32 = 1_000_000;
 const KILLER_BASE: i32 = 900_000;
 
 /// The ordering score of a move: captures, then killers, then the rest.
 fn score(pos: &Position, mv: Move, killers: KillerSlots) -> i32 {
-    let capture = mvv_lva(pos, mv);
-    if capture > 0 {
-        return CAPTURE_BASE + capture;
+    // `is_quiet` decides what counts as a capture — not `mvv_lva(..) > 0`, which
+    // answers a different question and gets two real captures wrong: a king capture
+    // scores negative (see above) and en passant scores 0, so both would land among
+    // the quiet moves and be tried *after* a killer. One predicate decides.
+    if !is_quiet(pos, mv) {
+        return CAPTURE_BASE + mvv_lva(pos, mv);
     }
     match killers.slot_of(mv) {
         // The most recent killer (slot 0) is tried before the older one.
@@ -345,6 +355,18 @@ mod tests {
         let best_quiet = *quiet.iter().max().expect("quiet moves exist");
         assert!(worst_capture > best_killer, "{worst_capture} vs {best_killer}");
         assert!(worst_killer > best_quiet, "{worst_killer} vs {best_quiet}");
+
+        // The extreme the bases were sized for, and the one this position does not
+        // contain: a king taking a pawn is the lowest `mvv_lva` reachable (−10 000),
+        // so it is the capture that comes closest to falling into the killer band.
+        let kp = Position::from_fen("4k3/8/8/4p3/4K3/8/8/8 w - - 0 1").unwrap();
+        let mut kk = Killers::new();
+        kk.record(&kp, 0, uci_move(&kp, "e4d3"));
+        let worst_possible = score(&kp, uci_move(&kp, "e4e5"), kk.at(0));
+        let best_possible_killer = score(&kp, uci_move(&kp, "e4d3"), kk.at(0));
+        assert_eq!(worst_possible, 990_000);
+        assert_eq!(best_possible_killer, 900_002);
+        assert!(worst_possible > best_possible_killer);
     }
 
     #[test]
@@ -389,6 +411,37 @@ mod tests {
         killers.record(&p, 2, repeated);
 
         assert_eq!(killers.table[2], [Some(repeated), None]);
+    }
+
+    #[test]
+    fn a_king_capture_is_still_a_capture() {
+        // The case `mvv_lva(pos, mv) > 0` got wrong: `value(King)` is 20 000, so
+        // Kxe5 scores 100 * 100 − 20 000 = −10 000. Read as "not a capture", it was
+        // ordered among the quiet moves, behind the killer.
+        let p = Position::from_fen("4k3/8/8/4p3/4K3/8/8/8 w - - 0 1").unwrap();
+        let capture = uci_move(&p, "e4e5");
+        assert!(mvv_lva(&p, capture) < 0, "the trap: a king capture scores negative");
+
+        let mut killers = Killers::new();
+        killers.record(&p, 0, uci_move(&p, "e4d3"));
+        let mut moves = p.legal_moves();
+        order_moves(&p, &mut moves, killers.at(0));
+        assert_eq!(moves[0], capture, "the capture must be tried first, before the killer");
+    }
+
+    #[test]
+    fn an_en_passant_capture_is_still_a_capture() {
+        // Same defect, other cause: the captured pawn stands on d5, not on the
+        // destination d6, so `mvv_lva` reads an empty square and scores 0.
+        let p = Position::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 2").unwrap();
+        let capture = uci_move(&p, "e5d6");
+        assert_eq!(mvv_lva(&p, capture), 0, "the trap: en passant scores as a quiet move");
+
+        let mut killers = Killers::new();
+        killers.record(&p, 0, uci_move(&p, "e5e6"));
+        let mut moves = p.legal_moves();
+        order_moves(&p, &mut moves, killers.at(0));
+        assert_eq!(moves[0], capture, "the capture must be tried first, before the killer");
     }
 
     #[test]
@@ -457,4 +510,5 @@ mod tests {
         assert!(is_quiet(&ep, uci_move(&ep, "e5e6")), "the pawn push is quiet");
     }
 }
+
 
