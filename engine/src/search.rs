@@ -159,10 +159,20 @@ pub fn search_timed(pos: &Position, limits: Limits) -> SearchStats {
 }
 
 /// The search. Everything a caller can ask for travels in [`Request`].
-pub fn search(pos: &Position, mut request: Request) -> SearchStats {
+pub fn search(pos: &Position, request: Request) -> SearchStats {
+    let searcher = Searcher::new(MoveOrder::Full, request.limits.deadline);
+    deepen(pos, request, searcher)
+}
+
+/// The deepening loop itself, over a searcher the caller supplies.
+///
+/// Split out of [`search`] for one reason: the tests need to interrupt an iteration at
+/// an exact node, which means handing in a `Searcher` they configured. Everything a
+/// *caller* can ask for still travels in [`Request`] — this takes the one thing that is
+/// not a caller concern.
+fn deepen(pos: &Position, mut request: Request, mut searcher: Searcher) -> SearchStats {
     let started = Instant::now();
     let limits = &request.limits;
-    let mut searcher = Searcher::new(MoveOrder::Full, limits.deadline);
     searcher.history = request.history.to_vec();
     let max_depth = limits.max_depth.max(1);
 
@@ -175,20 +185,37 @@ pub fn search(pos: &Position, mut request: Request) -> SearchStats {
         let result = searcher.root(pos, depth, pv);
 
         if searcher.aborted {
-            // Ran out of time mid-iteration: discard it and keep the last complete one.
-            // Unless there is none — a capture-rich position can spend more than the
-            // 2048 nodes between clock checks inside iteration 1 alone, so even the
-            // first iteration can be cut short. The partial root result is then all we
-            // have, and it is still a legal move: `root` seeds `best_move` with
-            // `moves[0]` before searching anything. Returning it beats returning
-            // nothing, which the UCI layer would report as `bestmove 0000` — an
-            // illegal move, and an instant forfeit in any arena.
-            if best.is_none() {
-                best = result;
+            // Ran out of time mid-iteration. The default is to discard it: the moves it
+            // managed to look at are the head of a sorted list, not a neutral sample, so
+            // "best of the first five" is not a choice. The previous iteration at least
+            // compared every move at one depth.
+            //
+            // Two cases override that.
+            //
+            // `improved` — a move other than the one we were about to play took the lead
+            // *at this depth*. That is the most valuable thing an iteration can produce,
+            // and the reason the extra ply was worth opening: the deeper search
+            // disagreeing with the shallower one. Typically the previous favourite turns
+            // out to lose material and the rescue is found just before the clock stops.
+            // Discarding it means playing the move we just learned was bad. The move was
+            // fully searched — `root` leaves its loop before adopting anything it did not
+            // finish — and the root's window makes its score exact rather than a bound.
+            //
+            // `best.is_none()` — no iteration has completed at all. A capture-rich
+            // position can spend more than the 2048 nodes between clock checks inside
+            // iteration 1, so even the first can be cut short. The partial result is then
+            // all we have, and it is at least legal: `root` seeds `best_move` with
+            // `moves[0]` before searching anything. Returning it beats `bestmove 0000`,
+            // which any arena reads as an illegal move and an instant forfeit.
+            if result.improved || best.is_none() {
+                best = result.best;
             }
+            // `completed` deliberately stays where it was: the iteration did not finish,
+            // and reporting a depth the engine only partly reached would be a lie about
+            // how far it looked.
             break;
         }
-        best = result;
+        best = result.best;
         completed = depth;
         let Some((mv, score)) = best else {
             break; // terminal root — nothing to deepen
@@ -244,6 +271,23 @@ enum MoveOrder {
     Full,
 }
 
+/// What one call to [`Searcher::root`] produced.
+///
+/// More than the move and its score, because the deepening loop has to tell two kinds
+/// of unfinished iteration apart: one that only got through the moves it was already
+/// going to play anyway, and one that **changed its mind** before running out of time.
+struct RootResult {
+    /// The best move and its score, or `None` at a terminal root.
+    best: Option<(Move, i32)>,
+    /// Whether a move other than the first one took the lead.
+    ///
+    /// The first move tried is the previous iteration's choice, so this is exactly
+    /// "this iteration found something better than what we were about to play" — and
+    /// it says so by comparing moves *at its own depth*, never against the shallower
+    /// iteration's score, which is not on the same scale.
+    improved: bool,
+}
+
 /// Carries the state shared by the whole search: the node counter, the ordering
 /// switch, and the time deadline / abort flag. Keeping `root` and `negamax` as
 /// methods on one struct keeps them in sync.
@@ -266,6 +310,16 @@ struct Searcher {
     /// it lives for the whole search, so each deepening iteration starts on what the
     /// previous one learned.
     killers: Killers,
+    /// Abort once this many nodes have been visited.
+    ///
+    /// **Tests only** — the whole field is compiled out otherwise, so it cannot cost
+    /// production a single comparison per node. It exists because the behaviour under
+    /// test is "what happens when an iteration is interrupted", and interrupting by
+    /// wall-clock would make the test measure the machine and its load rather than the
+    /// code: the same test would cut at a different move on a busy machine. A node
+    /// count is exact and reproducible.
+    #[cfg(test)]
+    node_limit: Option<u64>,
 }
 
 impl Searcher {
@@ -279,6 +333,8 @@ impl Searcher {
             history: Vec::new(),
             path: Vec::new(),
             killers: Killers::new(),
+            #[cfg(test)]
+            node_limit: None,
         }
     }
 
@@ -317,9 +373,17 @@ impl Searcher {
         self.history.iter().filter(|&&seen| seen == key).count() >= 2
     }
 
-    /// Set `aborted` if the deadline has passed. Checked only every so often
-    /// (reading the clock on every node would dominate the search cost).
-    fn check_time(&mut self) {
+    /// Set `aborted` if a limit has been reached. The clock is read only every so
+    /// often (doing it on every node would dominate the search cost).
+    fn check_limits(&mut self) {
+        // Compiled out of production builds entirely — see the field's comment.
+        #[cfg(test)]
+        if let Some(limit) = self.node_limit {
+            if self.nodes >= limit {
+                self.aborted = true;
+                return;
+            }
+        }
         if self.nodes % 2048 == 0 {
             if let Some(deadline) = self.deadline {
                 if Instant::now() >= deadline {
@@ -331,11 +395,11 @@ impl Searcher {
 
     /// The root: like [`Searcher::negamax`] but it tracks the chosen move, does not
     /// cut off (no `beta` above the root), and tries `pv_move` first if given.
-    fn root(&mut self, pos: &Position, depth: u32, pv_move: Option<Move>) -> Option<(Move, i32)> {
+    fn root(&mut self, pos: &Position, depth: u32, pv_move: Option<Move>) -> RootResult {
         self.nodes += 1;
         let mut moves = pos.legal_moves();
         if moves.is_empty() {
-            return None;
+            return RootResult { best: None, improved: false };
         }
         if self.order != MoveOrder::None {
             // The root is ply 0 and never cuts off — no killer is ever recorded
@@ -351,32 +415,42 @@ impl Searcher {
         let mut best_move = moves[0];
         let mut best_score = -INF;
         let mut alpha = -INF;
+        let mut improved = false;
         // The root's own key goes on the path, so a branch coming back to it is seen
         // as a repetition. The root itself is never tested against the path — it is
         // the position we are asked about, not a repetition of anything.
         self.path.push(pos.hash());
-        for &mv in &moves {
+        for (i, &mv) in moves.iter().enumerate() {
             let score = -self.negamax(&pos.play(mv), depth.saturating_sub(1), -INF, -alpha, 1);
             if self.aborted {
-                break; // time is up; this iteration will be discarded by the caller
+                // Time is up *inside this move's search*, so `score` is the placeholder
+                // `negamax` returns when aborting, not a value. Leaving before the
+                // comparison below is what keeps a half-searched move from ever being
+                // adopted — the property the whole partial-result rescue rests on.
+                break;
             }
             if score > best_score {
                 best_score = score;
                 best_move = mv;
+                // A move other than the one tried first has taken the lead: this
+                // iteration disagrees with what the previous one recommended, and it
+                // reached that verdict by comparing moves *at its own depth*. That is
+                // the one thing worth rescuing if the clock stops us here.
+                improved |= i > 0;
             }
             if score > alpha {
                 alpha = score;
             }
         }
         self.path.pop();
-        Some((best_move, best_score))
+        RootResult { best: Some((best_move, best_score)), improved }
     }
 
     /// Negamax with alpha-beta. Returns the value of `pos` from the side-to-move
     /// perspective. `ply` is the distance from the root, used only to score mates.
     fn negamax(&mut self, pos: &Position, depth: u32, mut alpha: i32, beta: i32, ply: i32) -> i32 {
         self.nodes += 1;
-        self.check_time();
+        self.check_limits();
         if self.aborted {
             return 0; // value ignored: the whole iteration is thrown away
         }
@@ -482,7 +556,7 @@ impl Searcher {
     /// [`Searcher::negamax`] tests for a repetition before handing over.
     fn quiescence(&mut self, pos: &Position, mut alpha: i32, beta: i32, ply: i32) -> i32 {
         self.nodes += 1;
-        self.check_time();
+        self.check_limits();
         if self.aborted {
             return 0; // value ignored: the whole iteration is thrown away
         }
@@ -545,12 +619,38 @@ mod tests {
     use super::*;
     use crate::position::{Color, Piece, Status};
 
+    // A position where the engine changes its mind as it deepens: c1d1 at depths 1-2,
+    // h2h3 at 3-4, f3e1 at 5-6. That is what makes it usable for the tests below —
+    // "an iteration found something better than the previous one" needs an iteration
+    // that actually disagrees with its predecessor.
+    const CHANGES_ITS_MIND: &str = "2r3k1/pp3pp1/4p2p/3pP3/3P4/2P2N2/PP3PPP/2R3K1 w - - 0 1";
+
+    // A search interrupted after exactly `node_ceiling` nodes, collecting the depths it
+    // reported along the way.
+    //
+    // Interrupting by node count rather than by clock is deliberate: the behaviour under
+    // test is "what survives an interruption", and a wall-clock deadline would cut at a
+    // different move depending on how busy the machine is — the test would be measuring
+    // the machine. A node count cuts at exactly the same place every run.
+    fn search_cut_at(pos: &Position, max_depth: u32, node_ceiling: u64) -> (SearchStats, Vec<u32>) {
+        let mut searcher = Searcher::new(MoveOrder::Full, None);
+        searcher.node_limit = Some(node_ceiling);
+        let mut reported = Vec::new();
+        let mut report = |p: &Progress| reported.push(p.depth);
+        let stats = deepen(
+            pos,
+            Request { progress: Some(&mut report), ..Request::new(Limits::depth(max_depth)) },
+            searcher,
+        );
+        (stats, reported)
+    }
+
     // A single fixed-depth pass — no deepening, no clock — driving `Searcher` directly.
     // The oracle these tests compare against: it gives the verdict a plain depth-D
     // search reaches, and, with `ordered` flipped, isolates what move ordering does.
     fn search_fixed(pos: &Position, depth: u32, order: MoveOrder) -> SearchStats {
         let mut searcher = Searcher::new(order, None);
-        let best = searcher.root(pos, depth, None);
+        let best = searcher.root(pos, depth, None).best;
         SearchStats {
             best,
             depth,
@@ -558,6 +658,122 @@ mod tests {
             table_key_match_rate: searcher.table.key_match_rate(),
             table_cutoff_rate: searcher.table.cutoff_rate(),
         }
+    }
+
+    #[test]
+    fn root_reports_an_improvement_only_when_a_later_move_takes_the_lead() {
+        // Black's queen on d5 hangs; Rxd5 is plainly best. Feeding `root` a mediocre
+        // move as the previous iteration's choice puts it first, so Rxd5 has to
+        // overtake it — that is an improvement. Feeding it Rxd5 directly means nothing
+        // can overtake anything.
+        let p = Position::from_fen("4k3/8/8/3q4/8/8/8/3RK3 w - - 0 1").unwrap();
+        let best = p.move_from_uci("d1d5").unwrap();
+        let mediocre = p.move_from_uci("e1f1").unwrap();
+
+        let overtaken = Searcher::new(MoveOrder::Full, None).root(&p, 3, Some(mediocre));
+        assert!(overtaken.improved, "Rxd5 must overtake the move tried first");
+        assert_eq!(overtaken.best.map(|(mv, _)| mv), Some(best));
+
+        let already_best = Searcher::new(MoveOrder::Full, None).root(&p, 3, Some(best));
+        assert!(!already_best.improved, "nothing can overtake the best move");
+        assert_eq!(already_best.best.map(|(mv, _)| mv), Some(best));
+    }
+
+    #[test]
+    fn an_improvement_found_before_the_interruption_is_kept() {
+        // The case this whole change exists for. Cut at 1 000 nodes: iterations 1 and 2
+        // complete (c1d1), iteration 3 finds h2h3 better and is then interrupted.
+        // Without keeping it, the engine plays c1d1 — the move a deeper search had just
+        // rejected — despite having already found the replacement.
+        let p = Position::from_fen(CHANGES_ITS_MIND).unwrap();
+        let (stats, _) = search_cut_at(&p, 6, 1_000);
+
+        // Exactly what a complete depth-3 search returns, score included: the kept
+        // score is the move's real value, not a bound and not the placeholder an
+        // aborted node returns.
+        assert_eq!(
+            stats.best.map(|(mv, sc)| (p.move_to_uci(mv), sc)),
+            Some(("h2h3".to_string(), 450)),
+        );
+        assert_eq!(best_move(&p, 3).map(|(mv, sc)| (p.move_to_uci(mv), sc)), Some(("h2h3".to_string(), 450)));
+    }
+
+    #[test]
+    fn an_interruption_with_nothing_better_is_still_discarded() {
+        // Same position, cut earlier: iteration 3 is interrupted *inside its first
+        // move*, so it never compared anything. Its partial result is `(c1d1, -40000)`
+        // — the initial `-INF`, never updated — which reads as "lost by force". Keeping
+        // that would have the engine report a resignable position where the truth is
+        // +445, which is what makes discarding the default rather than the exception.
+        //
+        // The cut point matters: interrupting a little later (500-800 nodes) leaves
+        // `(c1d1, 445)`, indistinguishable from the complete depth-2 result, so a test
+        // there would pass whatever the code did.
+        let p = Position::from_fen(CHANGES_ITS_MIND).unwrap();
+        let (stats, _) = search_cut_at(&p, 6, 400);
+
+        assert_eq!(
+            stats.best.map(|(mv, sc)| (p.move_to_uci(mv), sc)),
+            Some(("c1d1".to_string(), 445)),
+            "the complete depth-2 result must stand",
+        );
+        assert_eq!(best_move(&p, 2).map(|(mv, sc)| (p.move_to_uci(mv), sc)), Some(("c1d1".to_string(), 445)));
+    }
+
+    #[test]
+    fn a_move_whose_own_search_was_cut_off_is_never_adopted() {
+        // A king alone against a queen: every move is worth about -900. When the
+        // deadline fires inside a move's search, `negamax` returns the placeholder 0 —
+        // and 0 outranks -900 by a mile. Adopting it would have the engine believe it
+        // had found a miraculous draw in a lost position, and `improved` would then be
+        // set, so the bogus verdict would survive the interruption instead of being
+        // discarded with it.
+        //
+        // `root` leaves its loop before the comparison, which is what prevents this.
+        // The property is worth its own test because nothing else exercises it: on a
+        // winning position the placeholder loses the comparison anyway and the defect
+        // stays invisible.
+        let p = Position::from_fen("3qk3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let (stats, _) = search_cut_at(&p, 5, 150);
+
+        let (_, score) = stats.best.expect("a move comes back");
+        assert_ne!(score, 0, "a placeholder must never be mistaken for a drawn position");
+        assert_eq!(
+            stats.best.map(|(mv, sc)| (p.move_to_uci(mv), sc)),
+            best_move(&p, 2).map(|(mv, sc)| (p.move_to_uci(mv), sc)),
+            "the complete depth-2 result must stand",
+        );
+        assert!(score < -800, "the position is lost, and the score must say so: {score}");
+    }
+
+    #[test]
+    fn the_reported_depth_is_the_last_completed_one_even_when_a_move_is_rescued() {
+        // Keeping a partial *move* must not turn into announcing a partial *depth*:
+        // iteration 3 did not finish, so 2 is how far the engine actually looked.
+        let p = Position::from_fen(CHANGES_ITS_MIND).unwrap();
+        let (rescued, reports_rescued) = search_cut_at(&p, 6, 1_000);
+        let (discarded, reports_discarded) = search_cut_at(&p, 6, 400);
+
+        assert_eq!(rescued.depth, 2, "a rescued move does not raise the reported depth");
+        assert_eq!(discarded.depth, 2);
+        // And the interrupted iteration is announced in neither case — one report per
+        // completed iteration, exactly as before this change.
+        assert_eq!(reports_rescued, vec![1, 2]);
+        assert_eq!(reports_discarded, vec![1, 2]);
+    }
+
+    #[test]
+    fn a_legal_move_survives_an_interruption_before_any_iteration_completes() {
+        // Cut inside iteration 1, so there is no complete result at all. The partial
+        // one is all there is, and it is at least legal — returning nothing would mean
+        // `bestmove 0000`, an instant forfeit in any arena.
+        let p = Position::from_fen(CHANGES_ITS_MIND).unwrap();
+        let (stats, reports) = search_cut_at(&p, 6, 20);
+
+        let (mv, _) = stats.best.expect("a move comes back");
+        assert!(p.try_play(mv).is_ok(), "and it is legal");
+        assert_eq!(stats.depth, 0, "no iteration completed, so no depth is claimed");
+        assert!(reports.is_empty(), "and none was announced");
     }
 
     #[test]
@@ -783,7 +999,7 @@ mod tests {
         // threshold moved from one to two.
         searcher.history = vec![after_ke2.hash(), after_ke2.hash()];
         assert_eq!(
-            searcher.root(&p, 4, None).map(|(_, s)| s),
+            searcher.root(&p, 4, None).best.map(|(_, s)| s),
             Some(0),
             "precondition: the repetition must actually be found"
         );
@@ -1011,7 +1227,7 @@ mod tests {
     #[test]
     fn an_expired_deadline_still_returns_the_guaranteed_iteration() {
         // A flag-fall can reach the engine as a deadline already in the past. From a
-        // quiet position depth 1 is owed anyway: `check_time` only reads the clock
+        // quiet position depth 1 is owed anyway: `check_limits` only reads the clock
         // every 2048 nodes and iteration 1 costs 41 from the start position, so it
         // completes; the deadline is then re-checked between iterations and stops the
         // loop there. Structural for *this* position, hence an equality.
@@ -1087,4 +1303,7 @@ mod tests {
         assert!(stats.depth >= 1);
     }
 }
+
+
+
 
