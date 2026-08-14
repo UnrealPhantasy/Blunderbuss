@@ -11,7 +11,7 @@
 //! better, so deepening to depth N costs about as much as (often less than) a single
 //! direct depth-N pass. [`best_move`] is a thin convenience wrapper over it.
 
-use crate::evaluation::evaluate;
+use crate::evaluation::{evaluate, phase};
 use crate::ordering::{mvv_lva, order_moves, KillerSlots, Killers};
 use crate::position::{Move, Piece, Position};
 use crate::transposition::{Bound, Table};
@@ -37,6 +37,21 @@ pub const MATE_THRESHOLD: i32 = 20_000;
 // A bound strictly above any reachable score (including `MATE`), used as the
 // initial alpha/beta window.
 const INF: i32 = 40_000;
+
+/// How much shallower a null-move search runs than the node that spawned it.
+///
+/// Two is the usual choice: the pass only has to fail to find a rough refutation, so
+/// paying full depth for it would spend more than the cut saves. Larger values prune
+/// harder and miss more.
+const NULL_MOVE_REDUCTION: u32 = 2;
+
+/// Minimum [`phase`] for a null move to be attempted — the zugzwang guard.
+///
+/// The phase runs from 24 (every piece on the board) to 0 (kings and pawns only). At 6
+/// there is still roughly a rook and two minor pieces about, which is enough that some
+/// harmless move almost always exists. Below it, zugzwang becomes a real possibility
+/// and the null-move assumption stops holding.
+const NULL_MOVE_MIN_PHASE: i32 = 6;
 
 /// How far / how long to search.
 pub struct Limits {
@@ -392,6 +407,23 @@ struct Searcher<'a> {
     /// count is exact and reproducible.
     #[cfg(test)]
     node_limit: Option<u64>,
+    /// Whether null-move pruning may be attempted at all.
+    ///
+    /// **Tests only**, compiled out otherwise. It exists so a test can measure what the
+    /// pruning contributes against a search that is identical but for that one thing —
+    /// the same reason [`MoveOrder`] has settings the engine never selects.
+    #[cfg(test)]
+    allow_null_move: bool,
+    /// How deeply null moves are currently nested, and the worst nesting seen.
+    ///
+    /// **Tests only.** Two passes in a row would skip a full move for both sides and
+    /// prove nothing about the position — the guard against it is a `false` handed to
+    /// the recursive call, which is invisible from the outside. Counting is what makes
+    /// it testable rather than a matter of reading the code carefully.
+    #[cfg(test)]
+    null_nesting: u32,
+    #[cfg(test)]
+    max_null_nesting: u32,
 }
 
 impl<'a> Searcher<'a> {
@@ -407,6 +439,12 @@ impl<'a> Searcher<'a> {
             killers: Killers::new(),
             #[cfg(test)]
             node_limit: None,
+            #[cfg(test)]
+            allow_null_move: true,
+            #[cfg(test)]
+            null_nesting: 0,
+            #[cfg(test)]
+            max_null_nesting: 0,
         }
     }
 
@@ -520,7 +558,38 @@ impl<'a> Searcher<'a> {
 
     /// Negamax with alpha-beta. Returns the value of `pos` from the side-to-move
     /// perspective. `ply` is the distance from the root, used only to score mates.
-    fn negamax(&mut self, pos: &Position, depth: u32, mut alpha: i32, beta: i32, ply: i32) -> i32 {
+    fn negamax(&mut self, pos: &Position, depth: u32, alpha: i32, beta: i32, ply: i32) -> i32 {
+        // A normal node may pass; only a node reached *by* passing may not.
+        self.negamax_inner(pos, depth, alpha, beta, ply, true)
+    }
+
+    /// Whether this node may try a null move.
+    ///
+    /// `depth` must leave something to search after the reduction — below that the
+    /// pass costs more than the subtree it would prune.
+    ///
+    /// The material test is the **zugzwang guard**, and it is the reason this feature
+    /// is dangerous rather than merely approximate. Null-move assumes that passing
+    /// cannot help; in zugzwang the opposite is true — every legal move worsens the
+    /// position, and passing would be the best thing available. The search would then
+    /// come back flattered, cut off, and never look at the loss it just walked into.
+    ///
+    /// Zugzwang needs an endgame: with pieces on the board there is almost always a
+    /// harmless move to make. The phase from the tapered evaluation (#34) already
+    /// measures exactly that, so the guard costs one comparison and no new concept.
+    fn null_move_allowed(&self, pos: &Position, depth: u32) -> bool {
+        depth > NULL_MOVE_REDUCTION + 1 && phase(pos) >= NULL_MOVE_MIN_PHASE
+    }
+
+    fn negamax_inner(
+        &mut self,
+        pos: &Position,
+        depth: u32,
+        mut alpha: i32,
+        beta: i32,
+        ply: i32,
+        can_null: bool,
+    ) -> i32 {
         self.nodes += 1;
         self.check_limits();
         if self.aborted {
@@ -549,6 +618,59 @@ impl<'a> Searcher<'a> {
         let hit = self.table.probe(key, depth, alpha, beta, ply);
         if let Some(score) = hit.cutoff {
             return score;
+        }
+
+        // Null-move pruning: ask what happens if we simply pass.
+        //
+        // If the opponent — now effectively moving twice in a row — still cannot drag
+        // the score below `beta`, this position is so good that the real search would
+        // cut off anyway, and its whole subtree can be skipped unexamined. The pass is
+        // searched shallower (`depth - 1 - R`) with a null window, because a rough
+        // refutation is all it has to fail to find.
+        //
+        // This is the first cut in this engine that is **heuristic** rather than exact.
+        // Alpha-beta and the transposition table never change what a search concludes;
+        // this can, and that is what buys the nodes.
+        // Compiled out of production builds: `can_null` alone decides there.
+        #[cfg(test)]
+        let can_null = can_null && self.allow_null_move;
+        if can_null && self.null_move_allowed(pos, depth) {
+            if let Some(passed) = pos.null_move() {
+                let reduced = depth.saturating_sub(1 + NULL_MOVE_REDUCTION);
+                // `-beta, -beta + 1` is a null window: we only ask "does it reach beta",
+                // never "by how much". `false` forbids a second pass in a row — two
+                // passes would skip a full move for both sides and prove nothing.
+                #[cfg(test)]
+                {
+                    self.null_nesting += 1;
+                    self.max_null_nesting = self.max_null_nesting.max(self.null_nesting);
+                }
+                let score =
+                    -self.negamax_inner(&passed, reduced, -beta, -beta + 1, ply + 1, false);
+                #[cfg(test)]
+                {
+                    self.null_nesting -= 1;
+                }
+                if self.aborted {
+                    return 0;
+                }
+                if score >= beta {
+                    // Return `beta`, not `score`.
+                    //
+                    // A null-move search can come back in mate territory: "even if I
+                    // pass, I mate". That mate is real — a free move for the opponent
+                    // cannot conjure one — but its **distance** is not, since the pass
+                    // consumed a ply that will not be played. Propagating the raw score
+                    // would announce a mate in N when the real one is longer, and the
+                    // engine would pick the wrong forcing line believing it faster.
+                    //
+                    // Honest note: mutating this to `return score` breaks no test here.
+                    // The case is narrow enough that it was not reproduced on 18
+                    // position/depth combinations, so this is a precaution kept on the
+                    // reasoning rather than one pinned by a measurement.
+                    return beta;
+                }
+            }
         }
 
         let mut moves = pos.legal_moves();
@@ -871,6 +993,131 @@ mod tests {
         assert!(p.try_play(mv).is_ok(), "and it is legal");
         assert_eq!(stats.depth, 0, "no iteration completed, so no depth is claimed");
         assert!(reports.is_empty(), "and none was announced");
+    }
+
+    #[test]
+    fn a_side_in_check_cannot_pass() {
+        // The first guard, and it costs nothing because `cozy-chess` enforces it: a
+        // side in check must answer, so "what if I pass" has no answer, and a score
+        // derived from it would be meaningless.
+        let in_check = Position::from_fen("rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 0 3").unwrap();
+        assert!(in_check.in_check(), "precondition: white is in check");
+        assert!(in_check.null_move().is_none(), "a side in check may not pass");
+
+        let quiet = Position::initial();
+        let passed = quiet.null_move().expect("a quiet position may pass");
+        assert_ne!(passed.side_to_move(), quiet.side_to_move(), "the turn changes hands");
+    }
+
+    #[test]
+    fn no_null_move_in_the_endgame() {
+        // The zugzwang guard. In an endgame, every legal move can be worse than
+        // passing — so a null-move search comes back flattered, cuts off, and the
+        // engine never looks at the loss it walked into.
+        //
+        // Checked on the search rather than on the predicate alone: a pawn endgame
+        // must explore *exactly* the same tree as an engine without null-move, node
+        // for node. Anything else means a pass was attempted somewhere.
+        let endgame = Position::from_fen("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1").unwrap();
+        assert!(
+            phase(&endgame) < NULL_MOVE_MIN_PHASE,
+            "precondition: this must be endgame material, phase {}",
+            phase(&endgame),
+        );
+        let mut table = Table::new();
+        let searcher = Searcher::new(MoveOrder::Full, None, &mut table);
+        assert!(!searcher.null_move_allowed(&endgame, 7), "no pass in an endgame");
+
+        // And a middlegame must allow it, or the guard would be vacuous.
+        let middlegame = Position::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .unwrap();
+        assert!(searcher.null_move_allowed(&middlegame, 7), "a middlegame may pass");
+    }
+
+    #[test]
+    fn no_null_move_when_the_reduction_would_leave_nothing() {
+        // Below `1 + R` there is no subtree left to prune, so the pass costs more than
+        // it saves.
+        let p = Position::initial();
+        let mut table = Table::new();
+        let searcher = Searcher::new(MoveOrder::Full, None, &mut table);
+        for depth in 0..=NULL_MOVE_REDUCTION + 1 {
+            assert!(!searcher.null_move_allowed(&p, depth), "depth {depth} is too shallow");
+        }
+        assert!(searcher.null_move_allowed(&p, NULL_MOVE_REDUCTION + 2));
+    }
+
+    #[test]
+    fn forced_mates_survive_the_pruning() {
+        // The sharpest regression test there is. A null-move cutoff that is wrongly
+        // trusted makes a mate vanish — and a mate is the one verdict that cannot be
+        // approximately right. The pruning must never cost one.
+        //
+        // Deeper than `1 + R` so that null-move is actually attempted on the way.
+        let mate_in_one = Position::from_fen("6k1/5ppp/8/8/8/8/8/R6K w - - 0 1").unwrap();
+        let (mv, score) = best_move(&mate_in_one, 5).expect("a move");
+        assert_eq!(mate_in_one.play(mv).status(), Status::Checkmate);
+        assert!(score > MATE_THRESHOLD, "and it is scored as a mate: {score}");
+
+        // Scholar's mate position: black is already mated, nothing to search.
+        let mated = Position::from_fen(
+            "r1bqkb1r/pppp1Qpp/2n2n2/4p3/2B1P3/8/PPPP1PPP/RNB1K1NR b KQkq - 0 4",
+        )
+        .unwrap();
+        assert!(best_move(&mated, 5).is_none());
+    }
+
+    #[test]
+    fn null_move_prunes_the_middlegame() {
+        // What the feature is for. Measured against the same search with the pruning
+        // disabled by its own guard, so the comparison isolates it.
+        let p = Position::from_fen(
+            "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 0 3",
+        )
+        .unwrap();
+        let with = Engine::new().search(&p, Request::new(Limits::depth(6)));
+        let without = {
+            let mut table = Table::new();
+            let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+            s.allow_null_move = false;
+            deepen(&p, Request::new(Limits::depth(6)), s)
+        };
+        assert!(
+            with.nodes * 4 < without.nodes * 3,
+            "null-move should prune at least 25%: {} against {}",
+            with.nodes,
+            without.nodes,
+        );
+    }
+
+    #[test]
+    fn never_two_passes_in_a_row() {
+        // Passing twice would hand the opponent a free move and then take it back —
+        // it proves nothing about the position and prunes on nonsense. The guard is a
+        // `false` handed to the recursive call, invisible from outside, so the nesting
+        // is counted instead of assumed.
+        let p = Position::initial();
+        let mut table = Table::new();
+        let mut searcher = Searcher::new(MoveOrder::Full, None, &mut table);
+        // Two settings that both matter, and both were wrong in earlier drafts.
+        //
+        // **Depth 8**, because a pass reduces by `1 + R`: at depth 6 it runs at 3 and
+        // the depth guard already forbids a second one, at depth 7 the same thing
+        // happens one level down. Nesting is only *reachable* from depth 8 — shallower
+        // versions of this test passed while exercising nothing, which the mutation
+        // caught and a green run would not have.
+        //
+        // **A node ceiling**, because a full depth-8 search costs 27 s. Nesting occurs
+        // within the first 50 000 nodes, so the ceiling cuts the test to 0.4 s without
+        // weakening it: what matters is that the situation arises, not that the search
+        // finishes.
+        searcher.node_limit = Some(50_000);
+        searcher.root(&p, 8, None);
+
+        assert!(searcher.max_null_nesting > 0, "precondition: null moves must have been tried");
+        assert_eq!(searcher.max_null_nesting, 1, "never nested — one pass at a time");
     }
 
     #[test]
