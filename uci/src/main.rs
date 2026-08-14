@@ -12,7 +12,7 @@
 //! answered by the engine's single search function — see [`parse_go`].
 
 use engine::position::{Color, Position};
-use engine::search::{search, Limits, Progress, Request, MATE, MATE_THRESHOLD, MAX_DEPTH};
+use engine::search::{Engine, Limits, Progress, Request, MATE, MATE_THRESHOLD, MAX_DEPTH};
 use std::io::{self, BufRead, Write};
 use std::time::{Duration, Instant};
 
@@ -170,6 +170,12 @@ struct Uci {
     /// each one, while a test collects them into a vector and can assert on what was
     /// said and in which order.
     info: Box<dyn FnMut(String)>,
+    /// What the engine has learned and keeps between moves — the transposition table.
+    ///
+    /// It lives here, at the protocol layer, because this is the only level that knows
+    /// where one game ends and the next begins: `ucinewgame`. The search itself sees a
+    /// sequence of positions and cannot tell a reply from a fresh start.
+    engine: Engine,
 }
 
 /// What [`Uci::handle`] produced: the lines to print, and whether to stop.
@@ -204,6 +210,7 @@ impl Uci {
             default_budget: Duration::from_millis(DEFAULT_BUDGET_MS),
             history: Vec::new(),
             info,
+            engine: Engine::new(),
         }
     }
 
@@ -221,6 +228,10 @@ impl Uci {
             Some("ucinewgame") => {
                 self.position = Position::initial();
                 self.history.clear();
+                // A new game must not inherit the previous one's positions: they would
+                // compete for slots with the ones that matter now. Within a game the
+                // opposite is true, and that is the point of keeping the table at all.
+                self.engine.new_game();
                 Response::none()
             }
             Some("position") => {
@@ -288,7 +299,7 @@ impl Uci {
         let history = &self.history;
         let sink = &mut self.info;
         let mut report = |p: &Progress| sink(info_line(&pos, p));
-        let stats = search(
+        let stats = self.engine.search(
             &pos,
             Request {
                 limits: Limits::bounded(plan.max_depth, deadline),
@@ -534,6 +545,44 @@ mod tests {
     // --- time allocation --------------------------------------------------------
 
     // --- UCI `info` reporting ---------------------------------------------------
+
+    #[test]
+    fn ucinewgame_forgets_what_the_previous_game_taught() {
+        // The table now outlives a single `go`, which is the point — but it must not
+        // outlive a *game*. This is the only level that can tell the difference: the
+        // search sees a sequence of positions and cannot know which one starts afresh.
+        //
+        // Observed through the node counts the engine reports: a warm table searches
+        // the same position for less, and `ucinewgame` must put it back to cold.
+        fn nodes_of_last_info(log: &Rc<RefCell<Vec<String>>>) -> u64 {
+            let lines = log.borrow();
+            let last = lines.last().expect("at least one info line");
+            let mut it = last.split_whitespace();
+            while let Some(tok) = it.next() {
+                if tok == "nodes" {
+                    return it.next().and_then(|n| n.parse().ok()).expect("a node count");
+                }
+            }
+            panic!("no node count in {last}");
+        }
+
+        let (mut uci, log) = uci_with_log();
+        uci.handle("position startpos");
+        uci.handle("go depth 6");
+        let cold = nodes_of_last_info(&log);
+
+        log.borrow_mut().clear();
+        uci.handle("go depth 6");
+        let warm = nodes_of_last_info(&log);
+        assert!(warm < cold, "precondition: the table must carry over between moves ({warm} vs {cold})");
+
+        log.borrow_mut().clear();
+        uci.handle("ucinewgame");
+        uci.handle("position startpos");
+        uci.handle("go depth 6");
+        let after_newgame = nodes_of_last_info(&log);
+        assert_eq!(after_newgame, cold, "`ucinewgame` must leave the table as cold as a fresh engine");
+    }
 
     #[test]
     fn every_completed_iteration_is_reported_in_order() {
