@@ -169,6 +169,30 @@ pub fn search_timed(pos: &Position, limits: Limits) -> SearchStats {
 /// Deliberately **not** part of [`Request`]: a request is what a caller *asks for*,
 /// answered and finished. This is state that outlives the answer, and giving it its
 /// own type makes that lifetime visible instead of implied.
+///
+/// # The score of a position now depends on which searches preceded it
+///
+/// Two `Engine`s asked about the same position, one fresh and one that has been
+/// playing, can return **different scores**. Measured over 60 plies of self-play at
+/// depth 6: they disagreed once, by 3 centipawns; a longer run found 2 disagreements
+/// in 100 plies with a worst gap of 29.
+///
+/// This is not a bug and not the repetition hazard described on [`Searcher::table`].
+/// It is what a transposition table does: a stored **bound** — `Bound::Lower` or
+/// `Bound::Upper` — is not a position's value, only a fact about it that was true
+/// under one alpha-beta window. Reused under a different window it can cut a search
+/// short at a different place, and the value that comes back is a different, equally
+/// valid one. Persisting the table does not create the effect; it multiplies the
+/// occasions for it, since entries now arrive from searches with other roots, depths
+/// and windows.
+///
+/// What is guaranteed is that the score is *a valid alpha-beta value* for the
+/// position, not that it is the same number every time.
+///
+/// **Consequence for anything that wants reproducible numbers**: a caller that must
+/// quote the same evaluation for the same position twice — a game analyst, for
+/// instance — should hold a fresh `Engine` per position rather than reuse one, and
+/// pay the search cost. Playing does not care; reporting does.
 pub struct Engine {
     table: Table,
 }
