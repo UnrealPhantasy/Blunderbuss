@@ -740,17 +740,31 @@ mod tests {
         // The property is worth its own test because nothing else exercises it: on a
         // winning position the placeholder loses the comparison anyway and the defect
         // stays invisible.
+        //
+        // **Every** cut point is swept rather than one being picked, and that is the
+        // point of the test rather than thoroughness for its own sake. An earlier
+        // version cut at a single fixed ceiling, which only catches the defect when
+        // the interruption happens to land *inside* a move's search — and where it
+        // lands depends on how many nodes each depth costs, which any change to the
+        // evaluation moves. That version was silently disarmed by the tapered
+        // evaluation: the mutation passed unnoticed until review.
+        //
+        // Sweeping turns a calibrated coincidence into an invariant: whatever the
+        // engine's node counts become, some ceiling in this range will land mid-move,
+        // and no ceiling may ever produce a drawn score in a lost position.
         let p = Position::from_fen("3qk3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
-        let (stats, _) = search_cut_at(&p, 5, 150);
-
-        let (_, score) = stats.best.expect("a move comes back");
-        assert_ne!(score, 0, "a placeholder must never be mistaken for a drawn position");
-        assert_eq!(
-            stats.best.map(|(mv, sc)| (p.move_to_uci(mv), sc)),
-            best_move(&p, 2).map(|(mv, sc)| (p.move_to_uci(mv), sc)),
-            "the complete depth-2 result must stand",
-        );
-        assert!(score < -800, "the position is lost, and the score must say so: {score}");
+        for ceiling in (20..=2_000).step_by(10) {
+            let (stats, _) = search_cut_at(&p, 5, ceiling);
+            let (_, score) = stats.best.expect("a move comes back");
+            assert_ne!(
+                score, 0,
+                "ceiling {ceiling}: a placeholder must never be mistaken for a drawn position",
+            );
+            assert!(
+                score < -800,
+                "ceiling {ceiling}: the position is lost and the score must say so, got {score}",
+            );
+        }
     }
 
     #[test]
@@ -1310,8 +1324,3 @@ mod tests {
         assert!(stats.depth >= 1);
     }
 }
-
-
-
-
-
