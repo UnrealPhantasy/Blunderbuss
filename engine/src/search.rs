@@ -1760,7 +1760,18 @@ mod tests {
         // changes which ones rank late enough to be reduced and by how much, so a single
         // line can come out worse while the whole is better. Measured with the growing
         // curve, one line of play gave 33 102 nodes carried against 31 691 fresh — the
-        // sweep over eight gives 181 636 against 198 460.
+        // sweep over eight gives 181 636 against 198 460, which is 8.5% of margin.
+        //
+        // The curve does erode what the table saves, and on one position nature it erases it.
+        // Carried against fresh, by nature:
+        //
+        //     curve off   0.803  0.989  0.998  0.855
+        //     curve on    0.915  0.987  1.002  0.902
+        //
+        // Mechanical — reductions shrink both trees, so there is less left for the table to
+        // save — but the tactical position crosses 1.0 with the curve on, so the honest
+        // statement is **three natures of four**, not all four. It stays a property of the
+        // whole rather than of every continuation, which is what this test measures.
         let start = Position::initial();
         let (mut carried_nodes, mut fresh_nodes) = (0u64, 0u64);
         for mv in start.legal_moves().into_iter().take(8) {
