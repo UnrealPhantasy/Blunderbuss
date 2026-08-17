@@ -12,7 +12,7 @@
 //! direct depth-N pass. [`best_move`] is a thin convenience wrapper over it.
 
 use crate::evaluation::{evaluate, phase};
-use crate::ordering::{mvv_lva, order_moves, KillerSlots, Killers};
+use crate::ordering::{mvv_lva, order_moves, History, KillerSlots, Killers};
 use crate::position::{Move, Piece, Position};
 use crate::transposition::{Bound, Table};
 use std::time::{Duration, Instant};
@@ -255,7 +255,7 @@ pub fn search(pos: &Position, request: Request) -> SearchStats {
 fn deepen(pos: &Position, mut request: Request, mut searcher: Searcher) -> SearchStats {
     let started = Instant::now();
     let limits = &request.limits;
-    searcher.history = request.history.to_vec();
+    searcher.game_history = request.history.to_vec();
     let max_depth = limits.max_depth.max(1);
 
     let mut best: Option<(Move, i32)> = None;
@@ -389,7 +389,12 @@ struct Searcher<'a> {
     /// Zobrist keys of the positions played *before* the search started. A draw by
     /// repetition depends on the game, not on the board alone, so the search cannot
     /// see one without being told what came before.
-    history: Vec<u64>,
+    ///
+    /// Named `game_history` and not `history` because the searcher now holds two
+    /// unrelated things that word could mean: this, and the history *heuristic*
+    /// below. One is a list of positions the game passed through; the other is a
+    /// count of which quiet moves refute branches.
+    game_history: Vec<u64>,
     /// Zobrist keys along the branch currently being explored, pushed on the way
     /// down and popped on the way back up.
     path: Vec<u64>,
@@ -397,6 +402,9 @@ struct Searcher<'a> {
     /// it lives for the whole search, so each deepening iteration starts on what the
     /// previous one learned.
     killers: Killers,
+    /// Which quiet moves have caused cutoffs, and how often — across the whole tree
+    /// rather than per ply. Lives for a search, like the killers.
+    history: History,
     /// Abort once this many nodes have been visited.
     ///
     /// **Tests only** — the whole field is compiled out otherwise, so it cannot cost
@@ -434,9 +442,10 @@ impl<'a> Searcher<'a> {
             deadline,
             aborted: false,
             table,
-            history: Vec::new(),
+            game_history: Vec::new(),
             path: Vec::new(),
             killers: Killers::new(),
+            history: History::new(),
             #[cfg(test)]
             node_limit: None,
             #[cfg(test)]
@@ -480,7 +489,7 @@ impl<'a> Searcher<'a> {
         }
         // Idiom: `iter().filter(...).count()` counts matches without allocating.
         // Two prior occurrences, so that this one is the third.
-        self.history.iter().filter(|&&seen| seen == key).count() >= 2
+        self.game_history.iter().filter(|&&seen| seen == key).count() >= 2
     }
 
     /// Set `aborted` if a limit has been reached. The clock is read only every so
@@ -514,7 +523,7 @@ impl<'a> Searcher<'a> {
         if self.order != MoveOrder::None {
             // The root is ply 0 and never cuts off — no killer is ever recorded
             // there, so there is none to apply.
-            order_moves(pos, &mut moves, KillerSlots::none());
+            order_moves(pos, &mut moves, KillerSlots::none(), &self.history);
         }
         if let Some(pv) = pv_move {
             if let Some(i) = moves.iter().position(|&mv| mv == pv) {
@@ -695,7 +704,7 @@ impl<'a> Searcher<'a> {
             return if pos.in_check() { -(MATE - ply) } else { 0 };
         }
         if self.order != MoveOrder::None {
-            order_moves(pos, &mut moves, self.killers_at(ply));
+            order_moves(pos, &mut moves, self.killers_at(ply), &self.history);
         }
         // The cached move goes first, ahead even of the best capture. A previous
         // search already found it good here, and a good first move is what makes the
@@ -732,6 +741,10 @@ impl<'a> Searcher<'a> {
                 // table itself drops the move if it is a capture or a promotion.
                 if self.order == MoveOrder::Full {
                     self.killers.record(pos, ply as usize, mv);
+                    // Same cutoff, second ledger. The killers remember it *here*; the
+                    // history remembers it *everywhere*, weighted by the depth that
+                    // proved it. Both refuse non-quiet moves themselves.
+                    self.history.record(pos, mv, depth);
                 }
                 break;
             }
@@ -801,7 +814,7 @@ impl<'a> Searcher<'a> {
         if self.order != MoveOrder::None {
             // No killers here: every move left is a capture or a promotion, and a
             // killer is by definition quiet.
-            order_moves(pos, &mut moves, KillerSlots::none());
+            order_moves(pos, &mut moves, KillerSlots::none(), &self.history);
         }
 
         let mut best = stand_pat;
@@ -1279,6 +1292,27 @@ mod tests {
     }
 
     #[test]
+    fn the_search_feeds_the_history_table() {
+        // The one thing the unit tests on `History` cannot say: that anything is
+        // plugged in. They drive `record` and `get` directly, so a heuristic wired to
+        // nothing would pass all of them — which is exactly what the mutation
+        // "stop recording cutoffs" demonstrated, surviving every test until this one.
+        let p = Position::from_fen(
+            "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 0 3",
+        )
+        .unwrap();
+        let mut table = Table::new();
+        let mut searcher = Searcher::new(MoveOrder::Full, None, &mut table);
+        assert_eq!(searcher.history.entries(), 0, "precondition: nothing learned yet");
+
+        searcher.root(&p, 6, None);
+        assert!(
+            searcher.history.entries() > 0,
+            "a search must credit the quiet moves that cut off",
+        );
+    }
+
+    #[test]
     fn killers_prune_beyond_what_mvv_lva_can_reach() {
         // The opening position is where the difference is starkest, and for the
         // reason the heuristic was built: almost every move here is quiet, so
@@ -1398,9 +1432,9 @@ mod tests {
         assert!(!searcher.is_repetition(42), "and it stops counting once popped");
 
         // In the game: one prior occurrence makes this only the second.
-        searcher.history.push(42);
+        searcher.game_history.push(42);
         assert!(!searcher.is_repetition(42), "one played occurrence is not a draw yet");
-        searcher.history.push(42);
+        searcher.game_history.push(42);
         assert!(searcher.is_repetition(42), "two played occurrences make this the third");
     }
 
@@ -1418,7 +1452,7 @@ mod tests {
         // Asserting that first is the point: with one, this test would pass while
         // exercising nothing — which is exactly what happened when the history
         // threshold moved from one to two.
-        searcher.history = vec![after_ke2.hash(), after_ke2.hash()];
+        searcher.game_history = vec![after_ke2.hash(), after_ke2.hash()];
         assert_eq!(
             searcher.root(&p, 4, None).best.map(|(_, s)| s),
             Some(0),
@@ -1789,3 +1823,4 @@ mod tests {
         assert!(stats.depth >= 1);
     }
 }
+

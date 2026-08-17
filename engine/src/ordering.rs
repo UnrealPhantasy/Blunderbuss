@@ -161,8 +161,104 @@ impl Default for Killers {
     }
 }
 
+/// The quiet moves that have caused cutoffs, and how often — a counter per
+/// (side to move, from square, to square).
+///
+/// The complement to [`Killers`], and the difference is what each one remembers.
+/// A killer is *local*: two slots at one ply, forgotten as soon as a third quiet
+/// move cuts off there. History is *global*: a rook lift that refutes branches all
+/// over the tree accumulates credit wherever it does so, and carries it to plies
+/// where it has never been tried.
+///
+/// Indexed by side to move, because the same pair of squares means opposite things
+/// for the two colours: `e2e4` is a White pawn push and cannot be a Black move at
+/// all. Sharing one table would have each side ranking its moves on the other's
+/// evidence.
+pub struct History {
+    /// `[colour][from][to]`. 8 KB, allocated once per search.
+    ///
+    /// Idiom: a fixed-size nested array rather than a `HashMap` — the index is
+    /// always in range, so there is nothing to look up and nothing to allocate.
+    counts: Box<[[[i32; 64]; 64]; 2]>,
+}
+
+/// Above this, every counter is halved. See [`History::record`].
+pub const HISTORY_CEILING: i32 = 1 << 14;
+
+impl History {
+    pub fn new() -> History {
+        History { counts: Box::new([[[0; 64]; 64]; 2]) }
+    }
+
+    /// How many square pairs carry any credit at all.
+    ///
+    /// **Tests only.** Every other test drives `record` and `get` directly, which says
+    /// the table works but not that the *search* feeds it — a distinction that matters,
+    /// since a heuristic wired to nothing passes every unit test it has.
+    #[cfg(test)]
+    pub fn entries(&self) -> usize {
+        self.counts.iter().flatten().flatten().filter(|&&c| c > 0).count()
+    }
+
+    /// How often `mv` has caused a cutoff for the side to move in `pos`.
+    pub fn get(&self, pos: &Position, mv: Move) -> i32 {
+        self.counts[pos.side_to_move() as usize][mv.from as usize][mv.to as usize]
+    }
+
+    /// Credit `mv` with a cutoff found at `depth`.
+    ///
+    /// The weight is `depth * depth`, the conventional choice: a cutoff proven deep
+    /// in the tree survived more scrutiny than one found at a leaf, and squaring
+    /// separates them sharply enough that a handful of deep cutoffs outrank a crowd
+    /// of shallow ones.
+    ///
+    /// Non-quiet moves are refused here rather than at the call site, for the same
+    /// reason as [`Killers::record`]: an invariant the caller must remember is one a
+    /// later caller forgets. Captures are already ranked by `mvv_lva`; crediting them
+    /// would add noise to a band that does not read this table.
+    pub fn record(&mut self, pos: &Position, mv: Move, depth: u32) {
+        if !is_quiet(pos, mv) {
+            return;
+        }
+        let entry =
+            &mut self.counts[pos.side_to_move() as usize][mv.from as usize][mv.to as usize];
+        *entry += (depth * depth) as i32;
+        if *entry > HISTORY_CEILING {
+            self.age();
+        }
+    }
+
+    /// Halve every counter.
+    ///
+    /// Two things at once. It bounds the values, which an unbounded counter would
+    /// eventually overflow — but more importantly it lets the ordering **keep
+    /// adapting**: without ageing, a move that cut off often in the opening keeps its
+    /// lead for the rest of the game, long after the position stopped resembling the
+    /// one where it earned it.
+    ///
+    /// Halving rather than clamping, because it preserves the *relative* order of the
+    /// entries. Clamping would flatten the top of the table into a mass of ties —
+    /// destroying exactly the information the heuristic exists to carry.
+    fn age(&mut self) {
+        for side in self.counts.iter_mut() {
+            for from in side.iter_mut() {
+                for count in from.iter_mut() {
+                    *count /= 2;
+                }
+            }
+        }
+    }
+}
+
+impl Default for History {
+    fn default() -> History {
+        History::new()
+    }
+}
+
 // The ordering bands. They must not overlap: every capture is tried before every
-// killer, and every killer before every remaining quiet move.
+// killer, every killer before every move with history, and those before the quiet
+// moves that have never cut off anything.
 //
 // The width of the capture band is set by `mvv_lva`, which spans **−10 000 to
 // +89 900**. The top is a queen taken by a pawn. The bottom is a *king* taking a
@@ -170,11 +266,15 @@ impl Default for Killers {
 // why the base has to sit far enough above `KILLER_BASE` to absorb it. Worst
 // capture 990 000 against best killer 900 002. A test pins the property, rather
 // than trusting an eyeball on the constants.
+//
+// The history band sits between the killers and zero, and its width is what
+// `HISTORY_CEILING` bounds: a counter cannot reach the killers, because ageing
+// halves everything before it gets close.
 const CAPTURE_BASE: i32 = 1_000_000;
 const KILLER_BASE: i32 = 900_000;
 
-/// The ordering score of a move: captures, then killers, then the rest.
-fn score(pos: &Position, mv: Move, killers: KillerSlots) -> i32 {
+/// The ordering score of a move: captures, then killers, then history, then the rest.
+fn score(pos: &Position, mv: Move, killers: KillerSlots, history: &History) -> i32 {
     // `is_quiet` decides what counts as a capture — not `mvv_lva(..) > 0`, which
     // answers a different question and gets two real captures wrong: a king capture
     // scores negative (see above) and en passant scores 0, so both would land among
@@ -185,16 +285,19 @@ fn score(pos: &Position, mv: Move, killers: KillerSlots) -> i32 {
     match killers.slot_of(mv) {
         // The most recent killer (slot 0) is tried before the older one.
         Some(slot) => KILLER_BASE + (KILLER_SLOTS - slot) as i32,
-        None => 0,
+        // Not a killer here, but it may have refuted branches elsewhere. A move that
+        // never cut off anything scores 0 and keeps the generator's order, which is
+        // the only band left where order carries no information.
+        None => history.get(pos, mv),
     }
 }
 
-/// Sorts `moves` in place: best captures first, then the killers of this node,
-/// then the remaining quiet moves.
-pub fn order_moves(pos: &Position, moves: &mut [Move], killers: KillerSlots) {
+/// Sorts `moves` in place: best captures first, then this node's killers, then the
+/// quiet moves that have cut off elsewhere, then the rest.
+pub fn order_moves(pos: &Position, moves: &mut [Move], killers: KillerSlots, history: &History) {
     // Idiom: `sort_by_key` with `Reverse` sorts by the key in *descending* order,
     // so the highest score comes first.
-    moves.sort_by_key(|&mv| std::cmp::Reverse(score(pos, mv, killers)));
+    moves.sort_by_key(|&mv| std::cmp::Reverse(score(pos, mv, killers, history)));
 }
 
 #[cfg(test)]
@@ -259,7 +362,7 @@ mod tests {
         // pawn a6) plus quiet moves.
         let p = Position::from_fen("7k/8/p7/2n1q3/3P4/8/8/R5K1 w - - 0 1").unwrap();
         let mut moves = p.legal_moves();
-        order_moves(&p, &mut moves, KillerSlots::none());
+        order_moves(&p, &mut moves, KillerSlots::none(), &History::new());
 
         let is_capture = |mv: Move| p.piece_on(mv.to).is_some();
         let captures = moves.iter().copied().filter(|&mv| is_capture(mv)).count();
@@ -287,17 +390,176 @@ mod tests {
     }
 
     #[test]
+    fn a_move_that_has_cut_off_beats_one_that_never_has() {
+        // The band killers cannot reach. A killer is two slots at one ply; history is
+        // every quiet move, everywhere, and it carries credit to plies where the move
+        // has never been tried.
+        let p = Position::from_fen(CAPTURES_AND_QUIETS).unwrap();
+        let veteran = uci_move(&p, QUIET_A);
+        let unknown = uci_move(&p, QUIET_B);
+
+        let mut history = History::new();
+        history.record(&p, veteran, 5);
+
+        let mut moves = p.legal_moves();
+        order_moves(&p, &mut moves, KillerSlots::none(), &history);
+        let at = |mv: Move| moves.iter().position(|&m| m == mv).unwrap();
+        assert!(at(veteran) < at(unknown), "a move with history goes first");
+    }
+
+    #[test]
+    fn a_deeper_cutoff_counts_for_more() {
+        // Weighted by `depth * depth`: a cutoff proven deep in the tree survived more
+        // scrutiny than one found at a leaf. Squaring separates them sharply enough
+        // that a few deep cutoffs outrank a crowd of shallow ones — which is the
+        // point, since a shallow cutoff is cheap to come by.
+        let p = Position::from_fen(CAPTURES_AND_QUIETS).unwrap();
+        let deep = uci_move(&p, QUIET_A);
+        let shallow = uci_move(&p, QUIET_B);
+
+        let mut history = History::new();
+        history.record(&p, deep, 6);
+        // Four shallow cutoffs against one deep: 4 × 4 = 16 against 36.
+        for _ in 0..4 {
+            history.record(&p, shallow, 2);
+        }
+        assert!(
+            history.get(&p, deep) > history.get(&p, shallow),
+            "one cutoff at depth 6 ({}) must outrank four at depth 2 ({})",
+            history.get(&p, deep),
+            history.get(&p, shallow),
+        );
+    }
+
+    #[test]
+    fn the_history_bands_stay_below_the_killers() {
+        // A counter must never climb into the killer band, whatever it accumulates —
+        // ageing is what guarantees it, and this pins the guarantee rather than the
+        // arithmetic that currently produces it.
+        let p = Position::from_fen(CAPTURES_AND_QUIETS).unwrap();
+        let busy = uci_move(&p, QUIET_A);
+        let mut history = History::new();
+        // Enough to fire ageing many times over. Kept modest on purpose: each ageing
+        // walks all 8 192 entries, and in a debug build a five-figure loop here turns
+        // a 0.1 s test into minutes.
+        for _ in 0..200 {
+            history.record(&p, busy, MAX_DEPTH);
+        }
+        assert!(
+            history.get(&p, busy) < KILLER_BASE,
+            "history {} must stay under the killer band {KILLER_BASE}",
+            history.get(&p, busy),
+        );
+
+        let mut killers = Killers::new();
+        killers.record(&p, 0, uci_move(&p, QUIET_B));
+        let mut moves = p.legal_moves();
+        order_moves(&p, &mut moves, killers.at(0), &history);
+        let at = |mv: Move| moves.iter().position(|&m| m == mv).unwrap();
+        assert!(at(uci_move(&p, QUIET_B)) < at(busy), "the killer still goes first");
+    }
+
+    #[test]
+    fn ageing_preserves_the_order_it_shrinks() {
+        // Halving rather than clamping, and this is the reason. Clamping would flatten
+        // the top of the table into ties — destroying exactly the ranking the
+        // heuristic exists to carry. Ageing must bound the values *and* keep them
+        // ordered.
+        let p = Position::from_fen(CAPTURES_AND_QUIETS).unwrap();
+        let (a, b) = (uci_move(&p, QUIET_A), uci_move(&p, QUIET_B));
+        let mut history = History::new();
+        history.record(&p, a, 8);
+        history.record(&p, b, 4);
+        let (before_a, before_b) = (history.get(&p, a), history.get(&p, b));
+        assert!(before_a > before_b, "precondition: a ranks above b");
+
+        // Enough to fire ageing once, not enough to bury the smaller entry.
+        //
+        // Counted, not waited for. `record` ages *as soon as* an entry crosses the
+        // ceiling, so the value read back is never above it — a loop waiting for
+        // `get(..) > HISTORY_CEILING` never terminates. It did not, while this test
+        // was being written, and the test suite hung rather than failed.
+        let steps = HISTORY_CEILING / (8 * 8) + 1;
+        for _ in 0..steps {
+            history.record(&p, a, 8);
+        }
+        assert!(history.get(&p, a) <= HISTORY_CEILING, "bounded");
+        assert!(history.get(&p, a) > history.get(&p, b), "and still ordered");
+        assert!(history.get(&p, b) > 0, "one ageing shrinks the smaller entry, it does not erase it");
+    }
+
+    #[test]
+    fn ageing_eventually_forgets_a_move_that_stops_cutting_off() {
+        // The other half of ageing, and it is a feature rather than a limit of integer
+        // division. A move that earned credit in the opening and has not cut off since
+        // is *supposed* to lose its rank — otherwise the ordering would keep
+        // recommending it long after the position stopped resembling the one where it
+        // worked.
+        //
+        // Written as its own test because the previous one asserts the opposite over a
+        // shorter horizon, and the two are easy to confuse into a single wrong
+        // assertion — which is exactly what happened while writing them.
+        let p = Position::from_fen(CAPTURES_AND_QUIETS).unwrap();
+        let (busy, forgotten) = (uci_move(&p, QUIET_A), uci_move(&p, QUIET_B));
+        let mut history = History::new();
+        history.record(&p, forgotten, 4);
+        assert!(history.get(&p, forgotten) > 0, "precondition: it starts with credit");
+
+        for _ in 0..200 {
+            history.record(&p, busy, MAX_DEPTH);
+        }
+        assert_eq!(history.get(&p, forgotten), 0, "never renewed, eventually forgotten");
+        assert!(history.get(&p, busy) > 0, "while the move still cutting off keeps its rank");
+    }
+
+    #[test]
+    fn history_is_kept_per_side() {
+        // The same pair of squares means different things for the two colours: `e2e4`
+        // is a White pawn push and cannot be a Black move at all. One shared table
+        // would have each side ranking its moves on the other's evidence.
+        let white = Position::initial();
+        let black = Position::from_fen(
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1",
+        )
+        .unwrap();
+        let mv = white.move_from_uci("e2e4").expect("a legal move");
+
+        let mut history = History::new();
+        history.record(&white, mv, 5);
+        assert!(history.get(&white, mv) > 0, "White's cutoff is recorded");
+        assert_eq!(history.get(&black, mv), 0, "and does not rank Black's moves");
+    }
+
+    #[test]
+    fn a_capture_never_enters_the_history() {
+        // Same rule as the killers, refused inside `record` rather than trusted to the
+        // caller. Captures are ranked by `mvv_lva` and read a different band; crediting
+        // them would be noise no one consults.
+        let p = Position::from_fen(CAPTURES_AND_QUIETS).unwrap();
+        let capture = uci_move(&p, "d4e5");
+        let mut history = History::new();
+        history.record(&p, capture, 8);
+        assert_eq!(history.get(&p, capture), 0, "a capture earns no history");
+
+        let ep = Position::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 2").unwrap();
+        let en_passant = ep.move_from_uci("e5d6").expect("a legal move");
+        let mut h2 = History::new();
+        h2.record(&ep, en_passant, 8);
+        assert_eq!(h2.get(&ep, en_passant), 0, "en passant is a capture too");
+    }
+
+    #[test]
     fn a_killer_is_tried_before_the_other_quiet_moves() {
         let p = Position::from_fen(CAPTURES_AND_QUIETS).unwrap();
         let killer = uci_move(&p, QUIET_A);
 
         let mut moves = p.legal_moves();
-        order_moves(&p, &mut moves, KillerSlots::none());
+        order_moves(&p, &mut moves, KillerSlots::none(), &History::new());
         let without = moves.iter().position(|&mv| mv == killer).unwrap();
 
         let mut killers = Killers::new();
         killers.record(&p, 3, killer);
-        order_moves(&p, &mut moves, killers.at(3));
+        order_moves(&p, &mut moves, killers.at(3), &History::new());
         let with = moves.iter().position(|&mv| mv == killer).unwrap();
 
         assert!(with < without, "the killer must move up: {without} -> {with}");
@@ -316,7 +578,7 @@ mod tests {
         killers.record(&p, 0, killer);
 
         let mut moves = p.legal_moves();
-        order_moves(&p, &mut moves, killers.at(0));
+        order_moves(&p, &mut moves, killers.at(0), &History::new());
 
         let killer_at = moves.iter().position(|&mv| mv == killer).unwrap();
         let captures_after =
@@ -336,7 +598,8 @@ mod tests {
         let slots = killers.at(0);
 
         let moves = p.legal_moves();
-        let band = |mv: Move| score(&p, mv, slots);
+        let empty = History::new();
+        let band = |mv: Move| score(&p, mv, slots, &empty);
         let captures: Vec<i32> =
             moves.iter().copied().filter(|&mv| !is_quiet(&p, mv)).map(band).collect();
         let killer_scores: Vec<i32> =
@@ -362,8 +625,8 @@ mod tests {
         let kp = Position::from_fen("4k3/8/8/4p3/4K3/8/8/8 w - - 0 1").unwrap();
         let mut kk = Killers::new();
         kk.record(&kp, 0, uci_move(&kp, "e4d3"));
-        let worst_possible = score(&kp, uci_move(&kp, "e4e5"), kk.at(0));
-        let best_possible_killer = score(&kp, uci_move(&kp, "e4d3"), kk.at(0));
+        let worst_possible = score(&kp, uci_move(&kp, "e4e5"), kk.at(0), &History::new());
+        let best_possible_killer = score(&kp, uci_move(&kp, "e4d3"), kk.at(0), &History::new());
         assert_eq!(worst_possible, 990_000);
         assert_eq!(best_possible_killer, 900_002);
         assert!(worst_possible > best_possible_killer);
@@ -379,7 +642,7 @@ mod tests {
         killers.record(&p, 1, fresher);
 
         let mut moves = p.legal_moves();
-        order_moves(&p, &mut moves, killers.at(1));
+        order_moves(&p, &mut moves, killers.at(1), &History::new());
         let at = |mv: Move| moves.iter().position(|&m| m == mv).unwrap();
         assert!(at(fresher) < at(older), "the most recent killer goes first");
     }
@@ -425,7 +688,7 @@ mod tests {
         let mut killers = Killers::new();
         killers.record(&p, 0, uci_move(&p, "e4d3"));
         let mut moves = p.legal_moves();
-        order_moves(&p, &mut moves, killers.at(0));
+        order_moves(&p, &mut moves, killers.at(0), &History::new());
         assert_eq!(moves[0], capture, "the capture must be tried first, before the killer");
     }
 
@@ -440,7 +703,7 @@ mod tests {
         let mut killers = Killers::new();
         killers.record(&p, 0, uci_move(&p, "e5e6"));
         let mut moves = p.legal_moves();
-        order_moves(&p, &mut moves, killers.at(0));
+        order_moves(&p, &mut moves, killers.at(0), &History::new());
         assert_eq!(moves[0], capture, "the capture must be tried first, before the killer");
     }
 
