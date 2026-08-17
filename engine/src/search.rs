@@ -1373,10 +1373,15 @@ mod tests {
         //
         // Two separate properties, because they hold on different domains. **That it
         // prunes at all** is true from the floor upwards and is what a regression would
-        // break. **How much** grows sharply with depth — measured 4.5% at depth 5 against
-        // 41% at depth 6 — since the deeper the tree, the larger the share of nodes with
-        // enough depth left to pass. Asserting the amplitude across the whole sweep would
-        // only pin the weakest depth and say nothing about the rest.
+        // break. **How much** grows sharply with depth — measured with this test's own
+        // protocol: **4.5 % at depth 5, 30.7 % at depth 6, 41.6 % at depth 7** — since the
+        // deeper the tree, the larger the share of nodes with enough depth left to pass. A
+        // sevenfold rise between two adjacent depths is the whole point, and it is why
+        // asserting the amplitude across the sweep would only pin the weakest depth.
+        //
+        // So the 25 % threshold below has **5.7 points of headroom** at `DEEPEST`, not the
+        // 16 that the depth-7 figure would suggest. Anyone weighing whether it survives a
+        // change to the tree should read it against 30.7 %, not against 41.6 %.
         const DEEPEST: u32 = 6;
         for depth in (NULL_MOVE_REDUCTION + 3)..=DEEPEST {
             let (with, without) = (nodes(true, depth), nodes(false, depth));
@@ -2396,4 +2401,5 @@ mod tests {
     }
 
 }
+
 
