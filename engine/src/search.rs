@@ -2128,8 +2128,14 @@ mod tests {
         // The test the history heuristic did not have, and the reason it shipped wired to
         // a measurement nobody had made. Eight unit tests covered that component, all
         // green, and unplugging it from the search broke none of them — every one drove it
-        // directly. This goes through `Engine::search`, the entry point a game uses,
-        // deepening and transposition table included.
+        // directly.
+        //
+        // This goes through `deepen`, which is the path `Engine::search` takes: that method
+        // is exactly `Searcher::new(Full, deadline, table)` followed by this call, so
+        // deepening and the transposition table are both in play. The searcher is built by
+        // hand rather than by calling `Engine::search` because asserting on
+        // `lmr_reductions` means still holding it afterwards — which is why `deepen`
+        // borrows its searcher instead of consuming it.
         let mut table = Table::new();
         let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
         let stats = deepen(
