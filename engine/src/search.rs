@@ -12,7 +12,7 @@
 //! direct depth-N pass. [`best_move`] is a thin convenience wrapper over it.
 
 use crate::evaluation::{evaluate, phase};
-use crate::ordering::{mvv_lva, order_moves, KillerSlots, Killers};
+use crate::ordering::{is_quiet, mvv_lva, order_moves, KillerSlots, Killers};
 use crate::position::{Move, Piece, Position};
 use crate::transposition::{Bound, Table};
 use std::time::{Duration, Instant};
@@ -52,6 +52,32 @@ const NULL_MOVE_REDUCTION: u32 = 2;
 /// harmless move almost always exists. Below it, zugzwang becomes a real possibility
 /// and the null-move assumption stops holding.
 const NULL_MOVE_MIN_PHASE: i32 = 6;
+
+/// How much shallower a late quiet move is searched.
+///
+/// One ply, which is the whole reduction for now. A growing reduction — larger for
+/// deeper nodes and later moves — is the natural follow-up and is expected to be worth
+/// more, but it adds constants to calibrate: this establishes whether the mechanism pays
+/// here at all, and the growing form is then measured against it rather than bundled in.
+const LMR_REDUCTION: u32 = 1;
+
+/// Below this depth nothing is reduced.
+///
+/// At depth 2 a reduced move is searched at depth 0, which is quiescence — captures
+/// only. A quiet move judged by captures alone is barely judged at all, and the subtree
+/// saved is one node deep, so there is nothing to win and a verdict to lose.
+const LMR_MIN_DEPTH: u32 = 3;
+
+/// How many moves are searched at full depth before reductions begin.
+///
+/// **The most arbitrary of the three constants**, and worth saying so. The moves are
+/// tried in order: the transposition table's move first, then the captures ranked by
+/// MVV-LVA, then the killers, then everything else. So the index at which genuinely
+/// unlikely moves begin is not fixed — it slides with how capture-rich the position is.
+/// Three protects the head of the list in the case that matters most, an opening
+/// position where nearly every move is quiet and the first quiet move may well be the
+/// best one. It is a floor on trust in the ordering, not a measurement.
+const LMR_FULL_DEPTH_MOVES: usize = 3;
 
 /// How far / how long to search.
 pub struct Limits {
@@ -232,8 +258,9 @@ impl Engine {
     /// Search `pos`. Everything a caller can ask for travels in [`Request`]; what
     /// the search learns stays here, ready for the next move.
     pub fn search(&mut self, pos: &Position, request: Request) -> SearchStats {
-        let searcher = Searcher::new(MoveOrder::Full, request.limits.deadline, &mut self.table);
-        deepen(pos, request, searcher)
+        let mut searcher =
+            Searcher::new(MoveOrder::Full, request.limits.deadline, &mut self.table);
+        deepen(pos, request, &mut searcher)
     }
 }
 
@@ -252,7 +279,12 @@ pub fn search(pos: &Position, request: Request) -> SearchStats {
 /// an exact node, which means handing in a `Searcher` they configured. Everything a
 /// *caller* can ask for still travels in [`Request`] — this takes the one thing that is
 /// not a caller concern.
-fn deepen(pos: &Position, mut request: Request, mut searcher: Searcher) -> SearchStats {
+///
+/// Borrowed rather than consumed, for the other half of the same reason: a test that
+/// configures a searcher usually also wants to read what it recorded — how many moves
+/// were reduced, how many had to be re-searched — and those counters are the only way to
+/// check a guard whose whole effect is that something did *not* happen.
+fn deepen(pos: &Position, mut request: Request, searcher: &mut Searcher) -> SearchStats {
     let started = Instant::now();
     let limits = &request.limits;
     searcher.history = request.history.to_vec();
@@ -424,6 +456,35 @@ struct Searcher<'a> {
     null_nesting: u32,
     #[cfg(test)]
     max_null_nesting: u32,
+    /// Whether late move reductions may be applied at all.
+    ///
+    /// **Tests only**, compiled out otherwise — same device as `allow_null_move`, and for
+    /// the same reason: a node count only means something against a search identical but
+    /// for the one thing being measured.
+    #[cfg(test)]
+    allow_lmr: bool,
+    /// Whether a reduced move that beats `alpha` is searched again at full depth.
+    ///
+    /// **Tests only.** Without this switch the re-search could only be checked by counting
+    /// that it happens, never that it *matters* — and "the code runs" is not the claim. The
+    /// null-move PR left an equivalent gap on the record: mutating its `return beta` to
+    /// `return score` broke no test, so that line rests on reasoning alone. This is the
+    /// same gap, closed rather than documented.
+    #[cfg(test)]
+    allow_lmr_research: bool,
+    /// How many moves were searched at reduced depth, and how many of those had to be
+    /// searched again at full depth.
+    ///
+    /// **Tests only.** These exist because of what happened to the history heuristic
+    /// (#40): eight unit tests covered the component, all green, and unplugging it from
+    /// the search entirely broke none of them — every test drove the component directly.
+    /// A heuristic wired to nothing passes every unit test it owns. Counting from inside
+    /// the search is what lets a test assert the *use* rather than the mechanism, and it
+    /// is also the only way to check a guard whose effect is an absence.
+    #[cfg(test)]
+    lmr_reductions: u64,
+    #[cfg(test)]
+    lmr_researches: u64,
 }
 
 impl<'a> Searcher<'a> {
@@ -445,6 +506,14 @@ impl<'a> Searcher<'a> {
             null_nesting: 0,
             #[cfg(test)]
             max_null_nesting: 0,
+            #[cfg(test)]
+            allow_lmr: true,
+            #[cfg(test)]
+            allow_lmr_research: true,
+            #[cfg(test)]
+            lmr_reductions: 0,
+            #[cfg(test)]
+            lmr_researches: 0,
         }
     }
 
@@ -581,6 +650,66 @@ impl<'a> Searcher<'a> {
         depth > NULL_MOVE_REDUCTION + 1 && phase(pos) >= NULL_MOVE_MIN_PHASE
     }
 
+    /// How many plies to shave off the search of `mv`, the move at index `rank` — zero
+    /// when it must be searched at full depth.
+    ///
+    /// The idea is a bet on the move ordering: if MVV-LVA, the killers and the
+    /// transposition table have done their job, a move sitting far down the list is
+    /// unlikely to be the best one, and paying full depth to confirm that is what makes
+    /// the tree wide. So it is searched shallower — and if the shallow search comes back
+    /// above `alpha` after all, the caller re-searches it at full depth. **The bet is on
+    /// the cost, never on the answer**: being wrong costs one wasted shallow search, not
+    /// a wrong move.
+    ///
+    /// That is what makes this the milder of the engine's two heuristic cuts. Null-move
+    /// (#38) skips a subtree it never looks at; this one looks at every move, only less
+    /// closely at first.
+    ///
+    /// # The guards, each for a different way the bet fails
+    ///
+    /// **Ordering must be on.** "Late" is meaningless in generator order — index 7 would
+    /// then say nothing about a move's prospects. This also keeps the existing
+    /// ordering-isolation tests measuring what they claim to.
+    ///
+    /// **Quiet moves only**, and **no killers**. A capture or a promotion changes the
+    /// material, which is the one thing the evaluation reads directly; a killer refuted a
+    /// sibling of this very node moments ago. Both are evidence the move deserves full
+    /// depth, and both are already the reason the ordering put them where it did —
+    /// reducing them would be betting against our own information.
+    ///
+    /// **Not in check, and not giving check.** Both are cases where the move list is
+    /// short and forced: nearly every reply matters, so the premise "most of these moves
+    /// are irrelevant" does not hold. Reducing a check is also how a reduction turns into
+    /// a missed mate, since a forcing line is exactly what a shallower search stops
+    /// seeing.
+    fn late_move_reduction(
+        &self,
+        pos: &Position,
+        child: &Position,
+        mv: Move,
+        depth: u32,
+        rank: usize,
+        ply: i32,
+    ) -> u32 {
+        // Compiled out of production builds: the ordering test alone decides there.
+        #[cfg(test)]
+        if !self.allow_lmr {
+            return 0;
+        }
+        let reducible = self.order == MoveOrder::Full
+            && depth >= LMR_MIN_DEPTH
+            && rank >= LMR_FULL_DEPTH_MOVES
+            && is_quiet(pos, mv)
+            && !self.killers_at(ply).contains(mv)
+            && !pos.in_check()
+            && !child.in_check();
+        if reducible {
+            LMR_REDUCTION
+        } else {
+            0
+        }
+    }
+
     fn negamax_inner(
         &mut self,
         pos: &Position,
@@ -713,11 +842,74 @@ impl<'a> Searcher<'a> {
         let mut best = -INF;
         let mut best_move = None;
         self.path.push(key);
-        for &mv in &moves {
-            let score = -self.negamax(&pos.play(mv), depth - 1, -beta, -alpha, ply + 1);
+        // Idiom: `enumerate` pairs each move with its index, which is what "late" means
+        // here — how far down the ordered list the move sits.
+        for (rank, &mv) in moves.iter().enumerate() {
+            // Bound to a local rather than left as a temporary inside the call: the
+            // gives-check guard needs to look at the resulting position, and the move was
+            // going to be played anyway, so asking costs nothing extra.
+            let child = pos.play(mv);
+            let reduction = self.late_move_reduction(pos, &child, mv, depth, rank, ply);
+            #[cfg(test)]
+            if reduction > 0 {
+                self.lmr_reductions += 1;
+            }
+            // Idiom: `saturating_sub` floors at zero instead of wrapping around, which for
+            // an unsigned type is the difference between falling into quiescence and
+            // asking for a search four billion plies deep. `LMR_MIN_DEPTH` makes the
+            // subtraction safe today, but that is a relationship between two constants
+            // sitting far apart in the file, and nothing would flag it if one moved —
+            // raising `LMR_REDUCTION` to 3 while the floor stayed at 3 would underflow.
+            //
+            // Kept because of *how* the two profiles fail, which is the real argument.
+            // Mutating this to a plain subtraction and removing the floor gives, in debug,
+            // **32 test failures all reading "attempt to subtract with overflow"** — loud
+            // and diagnosable. The same mutation in `--release`, where overflow checks are
+            // off, wraps silently and ends in **`fatal runtime error: stack overflow`**:
+            // the search recurses on a depth near 2^32 until the stack is gone. Release is
+            // the profile every performance measurement in this repository uses, and in an
+            // arena that failure would read as an engine that simply died mid-game.
+            let reduced = (depth - 1).saturating_sub(reduction);
+            let mut score = -self.negamax(&child, reduced, -beta, -alpha, ply + 1);
             if self.aborted {
                 self.path.pop();
                 return 0; // nothing worth caching: the value is a placeholder
+            }
+            // The reduction was a bet that this move is not the best one, and the bet just
+            // lost: a shallower search already puts it above `alpha`. Search it again at
+            // full depth and let *that* verdict be the one the node uses — otherwise the
+            // reduction would decide the move, which is precisely what it must never do.
+            //
+            // Checking `aborted` first matters: an interrupted search returns a
+            // placeholder `0`, which would clear a negative `alpha` and trigger a
+            // re-search of a value that means nothing.
+            // Compiled out of production builds: there, a reduced move above `alpha` is
+            // always re-searched.
+            #[cfg(test)]
+            let may_research = self.allow_lmr_research;
+            #[cfg(not(test))]
+            let may_research = true;
+            if reduction > 0 && score > alpha && may_research {
+                #[cfg(test)]
+                {
+                    self.lmr_researches += 1;
+                }
+                score = -self.negamax(&child, depth - 1, -beta, -alpha, ply + 1);
+                // Honest note, in the same spirit as the null move's `return beta`:
+                // removing this guard breaks no test. It matters in principle — a node
+                // that ran out of time inside the re-search would otherwise fall through
+                // to `store_at` and cache a score derived from a placeholder, under a
+                // depth claiming real work, in a table that since #36 outlives the move.
+                // Reaching it needs the abort to land inside a re-search of the *last*
+                // move of a list, or one that then fails high on the placeholder; a
+                // counter of writes-after-abort swept over 200 node ceilings never saw it,
+                // and neither did removing every abort guard in the loop at once. Kept as
+                // reasoning rather than dressed up as tested — and the inert test that
+                // looked like coverage was deleted rather than left counting.
+                if self.aborted {
+                    self.path.pop();
+                    return 0;
+                }
             }
             if score > best {
                 best = score;
@@ -851,7 +1043,7 @@ mod tests {
         let stats = deepen(
             pos,
             Request { progress: Some(&mut report), ..Request::new(Limits::depth(max_depth)) },
-            searcher,
+            &mut searcher,
         );
         (stats, reported)
     }
@@ -859,9 +1051,19 @@ mod tests {
     // A single fixed-depth pass — no deepening, no clock — driving `Searcher` directly.
     // The oracle these tests compare against: it gives the verdict a plain depth-D
     // search reaches, and, with `ordered` flipped, isolates what move ordering does.
+    //
+    // **Late move reductions are off here**, because this function exists to vary one
+    // thing at a time and reductions would silently break that. They only apply under
+    // `MoveOrder::Full` — "late" is meaningless in generator order — so a `Full` against
+    // `None` comparison would be measuring ordering *and* reductions while claiming to
+    // measure ordering, and the two callers that assert ordering leaves the score alone
+    // would be asserting something reductions are entitled to change. A search *with*
+    // reductions is what `Engine::search` and `search_timed` give; this is the oracle,
+    // and an oracle holds everything else still.
     fn search_fixed(pos: &Position, depth: u32, order: MoveOrder) -> SearchStats {
         let mut table = Table::new();
         let mut searcher = Searcher::new(order, None, &mut table);
+        searcher.allow_lmr = false;
         let best = searcher.root(pos, depth, None).best;
         SearchStats {
             best,
@@ -1148,23 +1350,59 @@ mod tests {
     fn null_move_prunes_the_middlegame() {
         // What the feature is for. Measured against the same search with the pruning
         // disabled by its own guard, so the comparison isolates it.
+        //
+        // Late move reductions are off on **both** sides. The two cuts overlap — they
+        // both decline to spend full depth on branches the ordering ranks low — so with
+        // reductions on, what null-move prunes *in addition to them* is a fraction of
+        // what it prunes alone: 12% here against 41%. Leaving them on would quietly turn
+        // this into a test of the pair, under a name that claims otherwise.
         let p = Position::from_fen(
             "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 0 3",
         )
         .unwrap();
-        let with = Engine::new().search(&p, Request::new(Limits::depth(6)));
-        let without = {
+        let nodes = |null_move: bool, depth: u32| {
             let mut table = Table::new();
             let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
-            s.allow_null_move = false;
-            deepen(&p, Request::new(Limits::depth(6)), s)
+            s.allow_null_move = null_move;
+            s.allow_lmr = false;
+            deepen(&p, Request::new(Limits::depth(depth)), &mut s).nodes
         };
-        assert!(
-            with.nodes * 4 < without.nodes * 3,
-            "null-move should prune at least 25%: {} against {}",
-            with.nodes,
-            without.nodes,
-        );
+        // Swept rather than measured at one chosen depth: a threshold that holds at
+        // exactly one depth is a calibrated coincidence, and the next change to the tree
+        // silently turns it into a test that passes without exercising anything.
+        //
+        // The floor is derived from the reduction rather than picked, and the sweep is
+        // what found it: at depth 4 the pruning is provably unreachable — the shallowest
+        // internal node sits at `depth - 1`, `null_move_allowed` wants `depth > R + 1`,
+        // so nothing can pass below `R + 3` — and the two searches returned the identical
+        // node count. Deriving it means a change to `NULL_MOVE_REDUCTION` moves the floor
+        // with it instead of leaving a silently inert first iteration.
+        //
+        // Two separate properties, because they hold on different domains. **That it
+        // prunes at all** is true from the floor upwards and is what a regression would
+        // break. **How much** grows sharply with depth — measured with this test's own
+        // protocol: **4.5 % at depth 5, 30.7 % at depth 6, 41.6 % at depth 7** — since the
+        // deeper the tree, the larger the share of nodes with enough depth left to pass. A
+        // sevenfold rise between two adjacent depths is the whole point, and it is why
+        // asserting the amplitude across the sweep would only pin the weakest depth.
+        //
+        // So the 25 % threshold below has **5.7 points of headroom** at `DEEPEST`, not the
+        // 16 that the depth-7 figure would suggest. Anyone weighing whether it survives a
+        // change to the tree should read it against 30.7 %, not against 41.6 %.
+        const DEEPEST: u32 = 6;
+        for depth in (NULL_MOVE_REDUCTION + 3)..=DEEPEST {
+            let (with, without) = (nodes(true, depth), nodes(false, depth));
+            assert!(
+                with < without,
+                "null-move must prune something at depth {depth}: {with} against {without}",
+            );
+            if depth == DEEPEST {
+                assert!(
+                    with * 4 < without * 3,
+                    "and at least 25% at depth {depth}: {with} against {without}",
+                );
+            }
+        }
     }
 
     #[test]
@@ -1454,7 +1692,20 @@ mod tests {
         let carried = engine.search(&next, Request::new(Limits::depth(6)));
         let fresh = Engine::new().search(&next, Request::new(Limits::depth(6)));
 
-        assert_eq!(carried.best.map(|(_, s)| s), fresh.best.map(|(_, s)| s), "same verdict");
+        // The saved work is the whole contract, and it is the only thing asserted. The
+        // two searches are **not** required to agree on the score: a stored bound is a
+        // fact about a position under one alpha-beta window, and reused under another it
+        // cuts elsewhere and returns a different, equally valid value — which is why
+        // `Engine`'s own documentation tells a caller who needs reproducible numbers to
+        // hold a fresh one per position.
+        //
+        // Reductions do not merely expose that; they are what makes it happen here.
+        // Measured over four positions × 12 first moves × depths 4-6, carried table
+        // against fresh: **0 divergences out of 144 with reductions off, 6 out of 144
+        // with them on**, worst gap 15 cp. So the reason to drop a score assertion is not
+        // that it was already failing — it was not — but that it demands reproducibility
+        // the contract never offered. This repository has retired four criteria of exactly
+        // that shape (#19, #27, #36, and #42's own rule against it).
         assert!(
             carried.nodes < fresh.nodes,
             "a carried-over table must save work: {} nodes against {} from scratch",
@@ -1561,12 +1812,28 @@ mod tests {
     fn iterative_deepening_matches_direct_search() {
         // With no deadline, deepening to depth D returns the same score as a single
         // direct depth-D pass, and reports having reached D.
+        //
+        // Both sides run without late move reductions, and the reason is the property
+        // itself rather than convenience. A reduction is decided from a move's *rank*, so
+        // it depends on the order the moves are in — and the two searches order
+        // differently by construction: deepening arrives at depth D with a filled
+        // transposition table and killers from D-1, the direct pass with neither. Same
+        // tree, different moves reduced, so the scores may legitimately differ (measured:
+        // 0 against 50 on the initial position at depth 4). What deepening promises is
+        // that *it* does not change the answer; with an order-dependent cut on, the two
+        // are no longer comparable at all, and asserting they are would demand
+        // reproducibility where the contract is a valid bound.
         for fen in [
             "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
             "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 0 3",
         ] {
             let p = Position::from_fen(fen).unwrap();
-            let deep = search_timed(&p, Limits::depth(4));
+            let deep = {
+                let mut table = Table::new();
+                let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+                s.allow_lmr = false;
+                deepen(&p, Request::new(Limits::depth(4)), &mut s)
+            };
             let direct = search_fixed(&p, 4, MoveOrder::Full);
             assert_eq!(deep.best.map(|(_, s)| s), direct.best.map(|(_, s)| s));
             assert_eq!(deep.depth, 4);
@@ -1788,4 +2055,370 @@ mod tests {
         assert!(p.try_play(mv).is_ok(), "the returned move must be legal");
         assert!(stats.depth >= 1);
     }
+    // --- late move reductions ---------------------------------------------------
+
+    // A search through the ordinary deepening loop, plus what the reductions did along
+    // the way. The counters are the point: a guard whose whole effect is that a reduction
+    // did *not* happen cannot be observed from the node count alone.
+    struct Reduced {
+        stats: SearchStats,
+        reductions: u64,
+    }
+
+    fn search_reducing(pos: &Position, depth: u32, allow: bool) -> Reduced {
+        let mut table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        s.allow_lmr = allow;
+        let stats = deepen(pos, Request::new(Limits::depth(depth)), &mut s);
+        Reduced { reductions: s.lmr_reductions, stats }
+    }
+
+    // The four positions every node-count measurement in this repository uses, chosen to
+    // be of different natures: a heuristic only pays where there is something for it to
+    // work on, and one that helps enormously in the opening can be dead weight in a
+    // tactical position. Quoting the worst alongside the best is the rule here.
+    const NATURES: [(&str, &str); 4] = [
+        ("opening", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
+        ("quiet middlegame", "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 0 3"),
+        ("tactical", "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"),
+        ("endgame", "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1"),
+    ];
+
+    #[test]
+    fn reductions_shrink_the_tree_on_every_nature_of_position() {
+        // What the feature is for, measured against a search identical but for the
+        // reduction, swept over depths and over positions of different natures rather
+        // than shown at the one pair that flatters it.
+        //
+        // The weakest position carries the amplitude assertion, and that is the whole
+        // point of measuring four. The history heuristic (#40) went into a branch on an
+        // *average* node ratio of 0.94 while being negative on two positions out of four;
+        // its Elo measurement then came back at -10. An ordering or pruning heuristic only
+        // pays where there is something for it to work on, but its per-node cost is paid
+        // everywhere, so the position it helps least is the one that decides.
+        //
+        // Two properties on two domains, as for the null move. **That it reduces** holds
+        // from the floor upwards and is what a regression breaks. **How much** grows with
+        // depth — the tactical position sheds 1% at depth 4 and 37% at depth 5 — because a
+        // deeper tree offers more late quiet moves and each reduction compounds over the
+        // levels beneath it. So the amplitude is read at the deepest swept depth;
+        // asserting it across the sweep would only ever pin the shallowest one.
+        const DEEPEST: u32 = 5;
+        let mut worst: Option<(&str, f64)> = None;
+        for (nature, fen) in NATURES {
+            let p = Position::from_fen(fen).unwrap();
+            for depth in (LMR_MIN_DEPTH + 1)..=DEEPEST {
+                let with = search_reducing(&p, depth, true);
+                let without = search_reducing(&p, depth, false);
+                assert!(
+                    with.stats.nodes < without.stats.nodes,
+                    "{nature} at depth {depth}: {} nodes against {}",
+                    with.stats.nodes,
+                    without.stats.nodes,
+                );
+                assert!(
+                    with.reductions > 0,
+                    "precondition: {nature} at depth {depth} must actually reduce something",
+                );
+                if depth == DEEPEST {
+                    let ratio = with.stats.nodes as f64 / without.stats.nodes as f64;
+                    if worst.is_none_or(|(_, w)| ratio > w) {
+                        worst = Some((nature, ratio));
+                    }
+                }
+            }
+        }
+        let (nature, ratio) = worst.expect("the sweep reached DEEPEST");
+        assert!(
+            ratio < 0.75,
+            "at depth {DEEPEST} even the least favourable position must shed a quarter of \
+             its tree: {nature} at {ratio:.3}",
+        );
+    }
+
+    #[test]
+    fn a_real_search_reduces_and_re_searches() {
+        // The test the history heuristic did not have, and the reason it shipped wired to
+        // a measurement nobody had made. Eight unit tests covered that component, all
+        // green, and unplugging it from the search broke none of them — every one drove it
+        // directly.
+        //
+        // This goes through `deepen`, which is the path `Engine::search` takes: that method
+        // is exactly `Searcher::new(Full, deadline, table)` followed by this call, so
+        // deepening and the transposition table are both in play. The searcher is built by
+        // hand rather than by calling `Engine::search` because asserting on
+        // `lmr_reductions` means still holding it afterwards — which is why `deepen`
+        // borrows its searcher instead of consuming it.
+        let mut table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        let stats = deepen(
+            &Position::initial(),
+            Request::new(Limits::depth(6)),
+            &mut s,
+        );
+        assert!(stats.best.is_some(), "precondition: the search returns a move");
+        assert!(s.lmr_reductions > 0, "a real search must reduce late quiet moves");
+        // The re-search is the half that keeps the feature honest: without it a reduction
+        // decides the move rather than only its cost. If it never fires, the reduction is
+        // never being contradicted, and that is a claim about the whole engine no test
+        // would otherwise catch.
+        assert!(
+            s.lmr_researches > 0,
+            "and must re-search at least one of them at full depth",
+        );
+    }
+
+    // The reduction the search would apply to `mv` sitting at `rank`, with `killer`
+    // recorded at this ply if given.
+    //
+    // Every guard below is tested as a **pair**: the case that must not be reduced, and a
+    // control that differs only in the thing being guarded and *is* reduced. Without the
+    // control a guard test proves nothing — it passes just as happily when some unrelated
+    // condition is what returned zero, which is how a test ends up green while watching
+    // the wrong thing.
+    fn reduction_for(
+        pos: &Position,
+        mv: Move,
+        depth: u32,
+        rank: usize,
+        killer: Option<Move>,
+    ) -> u32 {
+        const PLY: i32 = 1;
+        let mut table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        if let Some(k) = killer {
+            s.killers.record(pos, PLY as usize, k);
+        }
+        s.late_move_reduction(pos, &pos.play(mv), mv, depth, rank, PLY)
+    }
+
+    // Deep enough and late enough that only the guard under test can return zero.
+    const DEEP: u32 = 6;
+    const LATE: usize = LMR_FULL_DEPTH_MOVES + 2;
+
+    #[test]
+    fn a_node_in_check_is_never_reduced() {
+        // In check the move list is short and every reply is forced, so "most of these
+        // moves are irrelevant" — the premise the reduction rests on — is false.
+        let in_check = Position::from_fen("4k3/8/8/8/8/8/4r3/4K3 w - - 0 1").unwrap();
+        assert!(in_check.in_check(), "precondition: white is in check");
+        let flight = in_check.move_from_uci("e1d1").unwrap();
+        assert_eq!(reduction_for(&in_check, flight, DEEP, LATE, None), 0);
+
+        // The control: the same king step, from a position that differs only in not being
+        // in check. Without this the test above would also pass if `d1` were a capture, or
+        // if the rank were too early, or if the whole feature were switched off.
+        let safe = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let same_step = safe.move_from_uci("e1d1").unwrap();
+        assert_eq!(reduction_for(&safe, same_step, DEEP, LATE, None), LMR_REDUCTION);
+    }
+
+    #[test]
+    fn a_move_that_gives_check_is_never_reduced() {
+        // A check is forcing, and forcing lines are exactly what a shallower search stops
+        // seeing — this is the guard that keeps reductions from costing mates.
+        //
+        // Both moves come from the same position, so the pair differs in nothing but
+        // whether the rook lands on the eighth rank.
+        let p = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
+        let checking = p.move_from_uci("a1a8").unwrap();
+        assert!(p.play(checking).in_check(), "precondition: Ra8 is check");
+        assert_eq!(reduction_for(&p, checking, DEEP, LATE, None), 0);
+
+        let quiet = p.move_from_uci("a1a7").unwrap();
+        assert!(!p.play(quiet).in_check(), "precondition: Ra7 is not");
+        assert_eq!(reduction_for(&p, quiet, DEEP, LATE, None), LMR_REDUCTION);
+    }
+
+    #[test]
+    fn a_move_that_touches_material_is_never_reduced() {
+        // A capture or a promotion moves the one quantity the evaluation reads directly,
+        // and the ordering has already ranked it on that basis. Reducing it would be
+        // betting against our own information.
+        let capture_available = Position::from_fen("4k3/8/8/8/3p4/4P3/8/4K3 w - - 0 1").unwrap();
+        let capture = capture_available.move_from_uci("e3d4").unwrap();
+        assert!(!is_quiet(&capture_available, capture), "precondition: exd4 takes a pawn");
+        assert_eq!(reduction_for(&capture_available, capture, DEEP, LATE, None), 0);
+
+        // Control: the same pawn, one square forward instead of diagonally.
+        let push = capture_available.move_from_uci("e3e4").unwrap();
+        assert_eq!(
+            reduction_for(&capture_available, push, DEEP, LATE, None),
+            LMR_REDUCTION
+        );
+
+        // A promotion reaches an empty square, so `mvv_lva` alone would read it as quiet —
+        // the same blind spot that once kept promotions out of quiescence. `is_quiet` is
+        // what catches it, and this pins that it is `is_quiet` being consulted here.
+        let promoting = Position::from_fen("4k3/P7/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let promotion = promoting.move_from_uci("a7a8q").unwrap();
+        assert_eq!(reduction_for(&promoting, promotion, DEEP, LATE, None), 0);
+    }
+
+    #[test]
+    fn a_killer_is_never_reduced() {
+        // A killer refuted a sibling of this very node moments ago. That is evidence, and
+        // it is why the ordering placed it high; reducing it would discard the evidence.
+        let p = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
+        let mv = p.move_from_uci("a1a7").unwrap();
+        assert_eq!(reduction_for(&p, mv, DEEP, LATE, Some(mv)), 0);
+        // Control: the same move at the same rank and depth, with no killer recorded.
+        assert_eq!(reduction_for(&p, mv, DEEP, LATE, None), LMR_REDUCTION);
+    }
+
+    #[test]
+    fn the_first_moves_are_searched_at_full_depth() {
+        // The head of the list is what the ordering believes in — the transposition
+        // table's move, the good captures, the killers. Swept over every rank up to the
+        // boundary and one past it, so an off-by-one shows up as a failure rather than as
+        // a test that happens to sample the right side of it.
+        let p = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
+        let mv = p.move_from_uci("a1a7").unwrap();
+        for rank in 0..LMR_FULL_DEPTH_MOVES {
+            assert_eq!(
+                reduction_for(&p, mv, DEEP, rank, None),
+                0,
+                "move {rank} is still in the trusted head of the list",
+            );
+        }
+        assert_eq!(
+            reduction_for(&p, mv, DEEP, LMR_FULL_DEPTH_MOVES, None),
+            LMR_REDUCTION,
+            "and the first move past it is reduced",
+        );
+    }
+
+    #[test]
+    fn the_depth_floor_is_a_boundary_not_a_slope() {
+        // Same shape as the rank test: sweep both sides of the floor rather than sample
+        // one. Below it a reduced move would be searched by quiescence alone, which judges
+        // a quiet move on captures it does not have.
+        let p = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
+        let mv = p.move_from_uci("a1a7").unwrap();
+        for depth in 0..LMR_MIN_DEPTH {
+            assert_eq!(reduction_for(&p, mv, depth, LATE, None), 0, "depth {depth} is below the floor");
+        }
+        for depth in LMR_MIN_DEPTH..=DEEP {
+            assert_eq!(
+                reduction_for(&p, mv, depth, LATE, None),
+                LMR_REDUCTION,
+                "depth {depth} is at or above the floor",
+            );
+        }
+    }
+
+    #[test]
+    fn forced_mates_survive_the_reductions() {
+        // The sharpest regression test there is, and the one a reduction is most likely to
+        // fail: a mate is the one verdict that cannot be approximately right, and a
+        // shallower search on a quiet forcing line is exactly how one goes missing.
+        //
+        // The assertion is "once seen, never lost", swept over depths, with the
+        // precondition that it is seen at all. Not "seen from depth N": how deep the search
+        // must go to find a mate is a property of how hard it prunes, and reductions
+        // legitimately cost a nominal ply on quiet forcing lines — measured on the ladder
+        // mate below, the mate moves from depth 6 to depth 7 while being found in *fewer
+        // nodes* (38 618 against 43 108), so it arrives sooner in real time. Pinning a
+        // depth would assert the pruning strength instead of the correctness.
+        for fen in [
+            "6k1/5ppp/8/8/8/8/8/R6K w - - 0 1",       // mate in one, ours to give
+            "7k/8/8/8/8/8/1R6/R6K b - - 0 1",         // rook ladder, ours to receive
+            "3k4/8/3K4/8/8/8/8/6R1 w - - 0 1",        // mate in two with a quiet key move
+        ] {
+            let p = Position::from_fen(fen).unwrap();
+            let mut seen_at = None;
+            for depth in 3..=8 {
+                let (_, score) = best_move(&p, depth).expect("a move");
+                let is_mate = score.abs() > MATE_THRESHOLD;
+                match seen_at {
+                    None if is_mate => seen_at = Some(depth),
+                    Some(first) => assert!(
+                        is_mate,
+                        "{fen} announced a mate at depth {first} and lost it by {depth}: {score}",
+                    ),
+                    None => {}
+                }
+            }
+            assert!(
+                seen_at.is_some(),
+                "precondition: the mate in `{fen}` must be found somewhere in depths 3..=8",
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_is_reduced_without_move_ordering() {
+        // "Late" is a statement about the ordering: in generator order, index 7 says
+        // nothing about a move's prospects, so a reduction there would be a coin flip
+        // rather than a bet. The guard is one comparison, and in production `order` is
+        // always `Full` — which is exactly why it needs a test of its own. Mutating it away
+        // broke nothing until this existed, because the searches that use a weaker ordering
+        // all disable reductions for their own reasons.
+        let p = Position::from_fen(NATURES[0].1).unwrap();
+        for order in [MoveOrder::None, MoveOrder::Captures] {
+            let mut table = Table::new();
+            let mut s = Searcher::new(order, None, &mut table);
+            s.allow_lmr = true;
+            deepen(&p, Request::new(Limits::depth(5)), &mut s);
+            assert_eq!(
+                s.lmr_reductions, 0,
+                "a search that does not order its moves cannot know which are late",
+            );
+        }
+        // Control: the same search, ordered, does reduce — so the assertion above is about
+        // the ordering and not about the position being unreducible.
+        let mut table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        deepen(&p, Request::new(Limits::depth(5)), &mut s);
+        assert!(s.lmr_reductions > 0, "precondition: ordered, this position reduces");
+    }
+
+    #[test]
+    fn the_re_search_changes_the_verdict_it_is_there_to_change() {
+        // Counting that re-searches happen is not enough: it would pass just as well if
+        // their result were thrown away. This asserts they *decide* — that on at least one
+        // of the four positions, the value the node returns is the full-depth one and not
+        // the reduced one.
+        //
+        // Without this, the re-search would be in the same position as the null move's
+        // `return beta`: correct by argument, unprotected by any test, and free to be
+        // removed by a later change that measures faster and looks fine.
+        let differs = NATURES.iter().any(|(_, fen)| {
+            let p = Position::from_fen(fen).unwrap();
+            let score = |research: bool| {
+                let mut table = Table::new();
+                let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+                s.allow_lmr_research = research;
+                deepen(&p, Request::new(Limits::depth(5)), &mut s).best.map(|(_, sc)| sc)
+            };
+            score(true) != score(false)
+        });
+        assert!(
+            differs,
+            "dropping the full-depth re-search must change what at least one of these \
+             positions is worth — if it changes nothing, the reduction is deciding moves \
+             on its own and no test would notice",
+        );
+    }
+
+    #[test]
+    fn nothing_is_reduced_below_the_depth_floor() {
+        // Swept from depth 1 up to the floor, not checked at one depth below it: the
+        // interesting failure is a floor that is off by one, and a single sample cannot
+        // tell an off-by-one from a floor that works.
+        for depth in 1..LMR_MIN_DEPTH {
+            for (nature, fen) in NATURES {
+                let p = Position::from_fen(fen).unwrap();
+                let run = search_reducing(&p, depth, true);
+                assert_eq!(
+                    run.reductions, 0,
+                    "{nature} reduced {} moves at depth {depth}, below the floor of {LMR_MIN_DEPTH}",
+                    run.reductions,
+                );
+            }
+        }
+    }
+
 }
+
+

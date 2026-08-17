@@ -637,14 +637,33 @@ mod tests {
 
     #[test]
     fn being_mated_is_reported_as_a_negative_mate() {
+        // Black is a rook-ladder mate away and it is Black to move, so the mate the
+        // engine reports is one it receives: the sign has to survive the trip from the
+        // search's side-to-move score to the `info` line.
+        //
+        // Swept over depths, with the precondition asserted, rather than run at the one
+        // depth where the mate happens to be visible. How deep the search must go to see
+        // a mate is a property of how hard it prunes, not of the reporting this test is
+        // about: late move reductions cost one nominal ply on quiet forcing lines, which
+        // moved the mate from depth 6 to depth 7 and left the old fixed `go depth 6`
+        // asserting a mate that was no longer there. `found` is what keeps the sweep
+        // honest — if pruning ever pushes the mate past the whole range, the test says so
+        // loudly instead of passing while checking nothing.
         let (mut uci, log) = uci_with_log();
         uci.handle("position fen 7k/8/8/8/8/8/1R6/R6K b - - 0 1");
-        uci.handle("go depth 6");
-        let last = log.borrow().last().cloned().expect("an info line");
-        assert!(
-            last.contains("score mate -"),
-            "expected a negative mate score in `{last}`"
-        );
+        let mut found = 0;
+        for depth in 6..=10 {
+            uci.handle(&format!("go depth {depth}"));
+            let last = log.borrow().last().cloned().expect("an info line");
+            if last.contains("score mate") {
+                assert!(
+                    last.contains("score mate -"),
+                    "a mate being received must be reported negative, got `{last}`"
+                );
+                found += 1;
+            }
+        }
+        assert!(found > 0, "precondition: the search finds the mate somewhere in depths 6..=10");
     }
 
     #[test]

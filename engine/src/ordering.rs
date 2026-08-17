@@ -107,6 +107,15 @@ impl KillerSlots {
     fn slot_of(&self, mv: Move) -> Option<usize> {
         self.0.iter().position(|&killer| killer == Some(mv))
     }
+
+    /// Whether `mv` is one of this node's killers.
+    ///
+    /// The search needs the question without the answer's detail: late move reductions
+    /// exempt killers from being reduced, and for that "is it one" is enough — which of
+    /// the two slots holds it only matters to the ordering.
+    pub fn contains(&self, mv: Move) -> bool {
+        self.slot_of(mv).is_some()
+    }
 }
 
 /// The killer moves found so far, one set of slots per ply.
