@@ -168,6 +168,22 @@ impl Position {
         moves
     }
 
+    /// Hands the turn to the opponent **without playing a move** — a position that
+    /// cannot occur in a real game, used by the search to ask "how bad is it if I do
+    /// nothing here?".
+    ///
+    /// Returns `None` when the side to move is **in check**, and that refusal is the
+    /// point rather than an edge case: a side in check must answer, so "what if I
+    /// pass" is not a question with an answer, and a score computed from it would be
+    /// meaningless. Delegating the test to `cozy-chess` means the search cannot forget
+    /// it.
+    ///
+    /// The en-passant square is cleared and the halfmove clock advanced, both by the
+    /// crate: after passing, the opponent's pawn is no longer capturable en passant.
+    pub fn null_move(&self) -> Option<Position> {
+        self.0.null_move().map(Position)
+    }
+
     /// Plays a move and returns the **new** position; `self` is left untouched
     /// (copy-make).
     ///
