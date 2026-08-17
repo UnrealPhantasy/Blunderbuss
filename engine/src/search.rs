@@ -664,10 +664,26 @@ impl<'a> Searcher<'a> {
                     // would announce a mate in N when the real one is longer, and the
                     // engine would pick the wrong forcing line believing it faster.
                     //
-                    // Honest note: mutating this to `return score` breaks no test here.
-                    // The case is narrow enough that it was not reproduced on 18
-                    // position/depth combinations, so this is a precaution kept on the
-                    // reasoning rather than one pinned by a measurement.
+                    // There is a second reason, found in review and worth stating
+                    // because it protects a case this code does not otherwise guard.
+                    // The null move is tried *before* the move list is generated, so it
+                    // also runs at **stalemate** nodes — `null_move` only refuses when
+                    // in check. A side stalemated while materially ahead would have its
+                    // node cut off here rather than scored 0.
+                    //
+                    // Returning `beta` is what makes that harmless: the move is then
+                    // worth exactly the parent's `alpha` and can never take the lead,
+                    // since `score > best_score` is false. A fail-high can make the
+                    // search *miss* something better inside the pruned subtree; it can
+                    // never make it *choose* something worse. Verified on
+                    // `5bnr/4p1pq/5pkr/4Q2p/2P4P/8/PP1PPPP1/RNB1KBNR w`, where White is
+                    // +1051 and `Qe6` stalemates: at depths 3 to 7 the engine plays
+                    // `Qc5`, `Qc3`, `Qc7` — never `Qe6`.
+                    //
+                    // Honest note: mutating this to `return score` still breaks no test.
+                    // The mate-distance case is narrow enough that it was not reproduced
+                    // on 18 position/depth combinations, so the line rests on reasoning
+                    // rather than on a measurement — but on two independent reasons now.
                     return beta;
                 }
             }
@@ -1015,9 +1031,9 @@ mod tests {
         // passing — so a null-move search comes back flattered, cuts off, and the
         // engine never looks at the loss it walked into.
         //
-        // Checked on the search rather than on the predicate alone: a pawn endgame
-        // must explore *exactly* the same tree as an engine without null-move, node
-        // for node. Anything else means a pass was attempted somewhere.
+        // This test checks the *predicate*. The node-for-node comparison it used to
+        // claim lives in `no_pass_in_a_zugzwang` below, where it belongs — on
+        // positions that are actually zugzwangs.
         let endgame = Position::from_fen("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1").unwrap();
         assert!(
             phase(&endgame) < NULL_MOVE_MIN_PHASE,
@@ -1034,6 +1050,43 @@ mod tests {
         )
         .unwrap();
         assert!(searcher.null_move_allowed(&middlegame, 7), "a middlegame may pass");
+    }
+
+    #[test]
+    fn no_pass_in_a_zugzwang() {
+        // AC#6, and the regression the whole guard exists for. The endgame test above
+        // uses an endgame; this uses two genuine **zugzwangs**, where the side to move
+        // would be strictly better off passing — which is the assumption null-move
+        // makes and the one that is false here.
+        //
+        // Checked on the search, not on the predicate: the tree must be identical node
+        // for node to one searched with the feature switched off. A predicate test
+        // says the guard answers correctly; this says nothing slipped past it.
+        for (name, fen) in [
+            // Trébuchet: whoever moves loses the pawn, and with it the game.
+            ("trebuchet", "8/8/8/p1p5/P1P5/8/8/K6k w - - 0 1"),
+            // Opposition: White to move cannot make progress; Black to move loses.
+            ("opposition", "8/8/8/3k4/8/3K4/3P4/8 w - - 0 1"),
+        ] {
+            let p = Position::from_fen(fen).unwrap();
+            assert!(
+                phase(&p) < NULL_MOVE_MIN_PHASE,
+                "{name}: precondition — must be endgame material, phase {}",
+                phase(&p),
+            );
+
+            let mut t1 = Table::new();
+            let mut with = Searcher::new(MoveOrder::Full, None, &mut t1);
+            let a = with.root(&p, 8, None);
+
+            let mut t2 = Table::new();
+            let mut without = Searcher::new(MoveOrder::Full, None, &mut t2);
+            without.allow_null_move = false;
+            let b = without.root(&p, 8, None);
+
+            assert_eq!(with.nodes, without.nodes, "{name}: a pass was attempted in an endgame");
+            assert_eq!(a.best.map(|(_, s)| s), b.best.map(|(_, s)| s), "{name}: score moved");
+        }
     }
 
     #[test]
