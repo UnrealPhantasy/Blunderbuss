@@ -1690,9 +1690,15 @@ mod tests {
         // fact about a position under one alpha-beta window, and reused under another it
         // cuts elsewhere and returns a different, equally valid value — which is why
         // `Engine`'s own documentation tells a caller who needs reproducible numbers to
-        // hold a fresh one per position. Late move reductions widen the gap, since the
-        // carried table also changes which moves rank late enough to be reduced (measured
-        // here: 20 against 25).
+        // hold a fresh one per position.
+        //
+        // Reductions do not merely expose that; they are what makes it happen here.
+        // Measured over four positions × 12 first moves × depths 4-6, carried table
+        // against fresh: **0 divergences out of 144 with reductions off, 6 out of 144
+        // with them on**, worst gap 15 cp. So the reason to drop a score assertion is not
+        // that it was already failing — it was not — but that it demands reproducibility
+        // the contract never offered. This repository has retired four criteria of exactly
+        // that shape (#19, #27, #36, and #42's own rule against it).
         assert!(
             carried.nodes < fresh.nodes,
             "a carried-over table must save work: {} nodes against {} from scratch",
