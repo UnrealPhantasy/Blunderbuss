@@ -860,8 +860,15 @@ impl<'a> Searcher<'a> {
             // subtraction safe today, but that is a relationship between two constants
             // sitting far apart in the file, and nothing would flag it if one moved —
             // raising `LMR_REDUCTION` to 3 while the floor stayed at 3 would underflow.
-            // Found by mutating the floor away: 31 tests failed at once, which is what an
-            // underflow panic looks like rather than a wrong answer.
+            //
+            // Kept because of *how* the two profiles fail, which is the real argument.
+            // Mutating this to a plain subtraction and removing the floor gives, in debug,
+            // **32 test failures all reading "attempt to subtract with overflow"** — loud
+            // and diagnosable. The same mutation in `--release`, where overflow checks are
+            // off, wraps silently and ends in **`fatal runtime error: stack overflow`**:
+            // the search recurses on a depth near 2^32 until the stack is gone. Release is
+            // the profile every performance measurement in this repository uses, and in an
+            // arena that failure would read as an engine that simply died mid-game.
             let reduced = (depth - 1).saturating_sub(reduction);
             let mut score = -self.negamax(&child, reduced, -beta, -alpha, ply + 1);
             if self.aborted {
