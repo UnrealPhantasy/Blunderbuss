@@ -1062,6 +1062,12 @@ mod tests {
         // Checked on the search, not on the predicate: the tree must be identical node
         // for node to one searched with the feature switched off. A predicate test
         // says the guard answers correctly; this says nothing slipped past it.
+        //
+        // What is at stake is not only the shape of the tree. With the guard removed,
+        // the opposition is **misevaluated by 15 centipawns at depth 9** (120 against
+        // 135) — AC#6 failing in the literal sense rather than by proxy. Worth knowing
+        // before anyone lowers `NULL_MOVE_MIN_PHASE` for the extra nodes: the cost is
+        // a wrong verdict, one ply past where this test looks.
         for (name, fen) in [
             // Trébuchet: whoever moves loses the pawn, and with it the game.
             ("trebuchet", "8/8/8/p1p5/P1P5/8/8/K6k w - - 0 1"),
@@ -1075,17 +1081,33 @@ mod tests {
                 phase(&p),
             );
 
-            let mut t1 = Table::new();
-            let mut with = Searcher::new(MoveOrder::Full, None, &mut t1);
-            let a = with.root(&p, 8, None);
+            // Swept rather than fixed at one depth, and the reason is measured: with
+            // the guard removed, the node difference is **0 at depth 4** on both
+            // positions — a single-depth test there would be green whether or not the
+            // guard exists — and only **1 node** on the trébuchet at depth 6. One
+            // depth is one constant away from being inert, and nothing in the test
+            // would say so. Eight opportunities have to go quiet at once instead of
+            // one. Costs 0.5 s, and under the mutation it fails at depth 5.
+            for depth in 5..=8 {
+                let mut t1 = Table::new();
+                let mut with = Searcher::new(MoveOrder::Full, None, &mut t1);
+                let a = with.root(&p, depth, None);
 
-            let mut t2 = Table::new();
-            let mut without = Searcher::new(MoveOrder::Full, None, &mut t2);
-            without.allow_null_move = false;
-            let b = without.root(&p, 8, None);
+                let mut t2 = Table::new();
+                let mut without = Searcher::new(MoveOrder::Full, None, &mut t2);
+                without.allow_null_move = false;
+                let b = without.root(&p, depth, None);
 
-            assert_eq!(with.nodes, without.nodes, "{name}: a pass was attempted in an endgame");
-            assert_eq!(a.best.map(|(_, s)| s), b.best.map(|(_, s)| s), "{name}: score moved");
+                assert_eq!(
+                    with.nodes, without.nodes,
+                    "{name} at depth {depth}: a pass was attempted in an endgame",
+                );
+                assert_eq!(
+                    a.best.map(|(_, s)| s),
+                    b.best.map(|(_, s)| s),
+                    "{name} at depth {depth}: score moved",
+                );
+            }
         }
     }
 
