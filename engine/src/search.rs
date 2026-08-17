@@ -2369,10 +2369,48 @@ mod tests {
     }
 
     #[test]
+    fn the_depth_floor_and_the_ceiling_currently_say_the_same_thing() {
+        // Two mechanisms forbid a reduction at shallow depth, and **at today's constants they
+        // forbid exactly the same set**: the guard `depth >= LMR_MIN_DEPTH` excludes depths
+        // 0-2, and the ceiling `min(depth - 2)` returns zero for those same depths. Removing
+        // the guard changes nothing — verified byte for byte, node counts and reduction counts
+        // alike, on four positions over depths 3-7 — and the whole suite stays green without
+        // it.
+        //
+        // That is worth a test of its own rather than a comment, because `LMR_MIN_DEPTH` is a
+        // lever #44 deliberately left at its measured value for someone to come back to, and
+        // it currently acts *only* through a guard that does nothing. Raise it to 6 and
+        // reductions vanish below depth 7; delete the redundant-looking guard first and the
+        // constant is permanently inoperative, with 138 tests still green and nothing to say
+        // so.
+        //
+        // **If this test fails, the redundancy has ended** — the two mechanisms now forbid
+        // different sets, the guard has regained an effect, and the two tests below become
+        // genuinely discriminating instead of resting on the ceiling.
+        for depth in 0..=MAX_DEPTH {
+            let guard_allows = depth >= LMR_MIN_DEPTH;
+            let ceiling_allows = depth.saturating_sub(2) >= 1;
+            assert_eq!(
+                guard_allows, ceiling_allows,
+                "depth {depth}: the guard says {guard_allows} and the ceiling says \
+                 {ceiling_allows} — they have stopped covering each other, so the depth-floor \
+                 tests are no longer resting on the ceiling and should be re-read",
+            );
+        }
+    }
+
+    #[test]
     fn the_depth_floor_is_a_boundary_not_a_slope() {
-        // Same shape as the rank test: sweep both sides of the floor rather than sample
-        // one. Below it a reduced move would be searched by quiescence alone, which judges
-        // a quiet move on captures it does not have.
+        // Sweeps both sides of the floor rather than sampling one. Below it a reduced move
+        // would be searched by quiescence alone, which judges a quiet move on captures it
+        // does not have.
+        //
+        // **What this pins is the behaviour, not the guard.** At today's constants the
+        // ceiling `min(depth - 2)` already returns zero for depths 0-2, so deleting
+        // `depth >= LMR_MIN_DEPTH` leaves this test green — it cannot tell which mechanism
+        // produced the zero. That is fine as long as it is stated:
+        // `the_depth_floor_and_the_ceiling_currently_say_the_same_thing` is what fails if the
+        // two ever diverge, and at that point this test starts discriminating again.
         let p = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
         let mv = p.move_from_uci("a1a7").unwrap();
         for depth in 0..LMR_MIN_DEPTH {
@@ -2654,6 +2692,10 @@ mod tests {
         // Swept from depth 1 up to the floor, not checked at one depth below it: the
         // interesting failure is a floor that is off by one, and a single sample cannot
         // tell an off-by-one from a floor that works.
+        //
+        // Like its unit-level counterpart above, this pins the **behaviour** — no reduction
+        // is counted below the floor — and not which of the two mechanisms enforces it. The
+        // counter never increments because the ceiling zeroed the reduction before it looked.
         for depth in 1..LMR_MIN_DEPTH {
             for (nature, fen) in NATURES {
                 let p = Position::from_fen(fen).unwrap();
