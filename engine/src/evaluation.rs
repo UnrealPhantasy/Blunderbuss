@@ -25,6 +25,8 @@
 //! capture crosses the boundary, and the engine would chase or avoid that capture
 //! for a reason that has nothing to do with chess.
 
+use std::sync::LazyLock;
+
 use crate::position::{Color, Piece, Position, Square};
 
 // Material values in centipawns. The king is not scored (both sides always have
@@ -75,6 +77,79 @@ pub fn phase(pos: &Position) -> i32 {
 
 /// The material + positional value of `pos`, in centipawns, from the side-to-move
 /// perspective.
+/// For each colour and square, every square from which an enemy pawn could stop the pawn
+/// standing there: its own file and the two beside it, on every rank ahead of it.
+///
+/// A pawn is passed exactly when this mask and the enemy pawns do not intersect — one `&`
+/// instead of walking up to 21 squares. Computed once, because `evaluate` is the hottest
+/// function in the engine and #29 died of costing 0.23 µs a node.
+///
+/// Idiom: `LazyLock` runs its closure on first access and hands out the same value
+/// thereafter. Needed because the loops below are not `const`-evaluable in the form written
+/// here, and a table computed per call would defeat the point of having one.
+static PASSED_MASK: LazyLock<[[u64; 64]; 2]> = LazyLock::new(|| {
+    let mut masks = [[0u64; 64]; 2];
+    // Idiom: split the two colour rows first, so each inner loop writes through a plain
+    // `&mut [u64; 64]` indexed by the loop variable — clippy flags `masks[c][square]` inside
+    // a loop over `square` as a pattern better expressed by iterating.
+    let (white, black) = masks.split_at_mut(1);
+    let (white, black) = (&mut white[0], &mut black[0]);
+    for square in 0..64usize {
+        let (file, rank) = (square % 8, square / 8);
+        for other in 0..64usize {
+            let (other_file, other_rank) = (other % 8, other / 8);
+            // Adjacent files include the pawn's own: a pawn on the same file ahead blocks
+            // just as surely as one that can capture.
+            if other_file.abs_diff(file) > 1 {
+                continue;
+            }
+            // "Ahead" is the direction the pawn moves, so it flips with the colour.
+            if other_rank > rank {
+                white[square] |= 1u64 << other;
+            }
+            if other_rank < rank {
+                black[square] |= 1u64 << other;
+            }
+        }
+    }
+    masks
+});
+
+/// What a passed pawn is worth, by the rank it has reached from its own side's view — index
+/// 0 is the home rank, index 7 the promotion square.
+///
+/// Two schedules, read by the same phase interpolation as the piece-square tables, and the
+/// endgame one is far steeper. That difference *is* the term: in a middlegame a passed pawn
+/// is a long-term asset among many, while in an endgame it is often the whole position. The
+/// growth is faster than linear because a pawn two squares from queening is not twice a pawn
+/// four squares away — the defender's task changes in kind, not in degree.
+///
+/// Ranks 0 and 7 are zero on purpose: a pawn cannot stand on its own home rank, and one that
+/// reaches the eighth is no longer a pawn.
+const PASSED_MIDDLEGAME: [i32; 8] = [0, 5, 10, 18, 32, 55, 85, 0];
+const PASSED_ENDGAME: [i32; 8] = [0, 8, 13, 21, 36, 60, 90, 0];
+
+/// The square immediately in front of a pawn of `color` standing on `square`, or `None` if
+/// there is none — which for a pawn can only mean the promotion rank, since a pawn never
+/// stands on its own first rank.
+///
+/// "In front" is the direction of travel, so it flips with the colour: one rank up the board
+/// for White, one down for Black. The board is laid out `a1` = 0 with eight squares per rank,
+/// so that is ±8.
+fn square_ahead(square: usize, color: Color) -> Option<usize> {
+    match color {
+        Color::White if square < 56 => Some(square + 8),
+        Color::Black if square >= 8 => Some(square - 8),
+        _ => None,
+    }
+}
+
+/// Whether the pawn on `square` (given as an index, `a1` = 0) has no enemy pawn able to stop
+/// it — nothing on its file or the two beside it, anywhere ahead.
+fn is_passed(square: usize, color: Color, enemy_pawns: u64) -> bool {
+    PASSED_MASK[color as usize][square] & enemy_pawns == 0
+}
+
 pub fn evaluate(pos: &Position) -> i32 {
     // Two running scores — one reading the middlegame tables, one the endgame tables
     // — plus the phase, all accumulated in the **same** pass over the board.
@@ -88,6 +163,10 @@ pub fn evaluate(pos: &Position) -> i32 {
     let mut endgame = 0;
     let mut phase = 0;
 
+    // Read once, outside the loop: both are needed for every pawn encountered, and they do
+    // not change while the board is being walked.
+    let pawns = [pos.pawns(Color::White), pos.pawns(Color::Black)];
+
     for sq in Square::ALL {
         if let Some(piece) = pos.piece_on(sq) {
             let color = pos.color_on(sq).expect("an occupied square has a colour");
@@ -95,8 +174,37 @@ pub fn evaluate(pos: &Position) -> i32 {
             // rank for Black), so a single White-oriented table serves both sides.
             let square = sq.relative_to(color) as usize;
             let material = value(piece);
-            let mg = material + PST_MIDDLEGAME[piece as usize][square];
-            let eg = material + PST_ENDGAME[piece as usize][square];
+            let mut mg = material + PST_MIDDLEGAME[piece as usize][square];
+            let mut eg = material + PST_ENDGAME[piece as usize][square];
+            // The passed-pawn bonus, added in this same pass rather than in a second walk
+            // over the board — the cost of a second walk is what ended #29.
+            //
+            // `square` is already oriented to the pawn's own side, so `square / 8` is the
+            // rank it has advanced to whatever its colour. The mask lookup, however, needs
+            // the *absolute* square, since it is about where the enemy pawns really are.
+            if piece == Piece::Pawn {
+                let enemy = pawns[!color as usize];
+                if is_passed(sq as usize, color, enemy) {
+                    let rank = square / 8;
+                    let (mut bonus_mg, mut bonus_eg) =
+                        (PASSED_MIDDLEGAME[rank], PASSED_ENDGAME[rank]);
+                    // A passed pawn with something standing on the square in front of it is
+                    // not running anywhere. The schedule above prices a pawn by how far it
+                    // has come; this asks whether it can still go further, which is the one
+                    // piece of context that costs a single lookup.
+                    //
+                    // Halved rather than removed: a blockaded passer still ties down the
+                    // piece blockading it, and the blockade can be broken.
+                    if square_ahead(sq as usize, color)
+                        .is_some_and(|front| pos.piece_on(Square::index(front)).is_some())
+                    {
+                        bonus_mg /= 2;
+                        bonus_eg /= 2;
+                    }
+                    mg += bonus_mg;
+                    eg += bonus_eg;
+                }
+            }
             phase += phase_weight(piece);
             // Idiom: a `match` used as an expression — it yields +1 or -1, so the two
             // running scores are updated without branching into two near-identical
@@ -420,5 +528,267 @@ mod tests {
         let a = Position::from_fen("4k3/8/8/8/3N4/8/8/4K3 w - - 0 1").unwrap();
         let b = Position::from_fen("4k3/8/8/3n4/8/8/8/4K3 b - - 0 1").unwrap();
         assert_eq!(evaluate(&a), evaluate(&b));
+
+        // The same property with a passed pawn on the board, because the passed term is the
+        // one that reads a *direction* — "ahead" flips with the colour, and a mask indexed
+        // by the wrong side would pass every test above while scoring one colour's pawns as
+        // permanently passed.
+        //
+        // The mirror is *computed*, not written out. Transcribing one by hand is how this
+        // test first failed: rank 6 was mirrored to rank 4 instead of rank 3, and the
+        // evaluation was blamed for a typo in its own test.
+        for fen in [
+            "4k3/8/8/3P4/8/8/8/4K3 w - - 0 1",   // lone passer
+            "4k3/8/8/3P4/2p5/8/8/4K3 w - - 0 1", // enemy pawn behind: still passed
+            "4k3/8/2p5/3P4/8/8/8/4K3 w - - 0 1", // enemy pawn ahead on an adjacent file
+            "4k3/8/8/3P4/3p4/8/8/4K3 w - - 0 1", // blocked head on
+        ] {
+            let mirrored = mirror(fen);
+            let (a, b) = (
+                Position::from_fen(fen).unwrap(),
+                Position::from_fen(&mirrored).unwrap(),
+            );
+            assert_eq!(evaluate(&a), evaluate(&b), "`{fen}` mirrors to `{mirrored}`");
+        }
+    }
+
+    // The same position seen from the other side: ranks reversed, colours swapped, side to
+    // move swapped. Only the board and the side-to-move fields matter here, and every test
+    // position below is castling- and en-passant-free.
+    fn mirror(fen: &str) -> String {
+        let (board, rest) = fen.split_once(' ').expect("a board and a side to move");
+        let flipped: Vec<String> = board
+            .split('/')
+            .rev() // rank 8 first becomes rank 1 first
+            .map(|rank| {
+                rank.chars()
+                    .map(|c| {
+                        if c.is_ascii_uppercase() {
+                            c.to_ascii_lowercase()
+                        } else if c.is_ascii_lowercase() {
+                            c.to_ascii_uppercase()
+                        } else {
+                            c // a digit: a run of empty squares, unchanged
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let side = if rest.starts_with('w') { 'b' } else { 'w' };
+        format!("{} {} {}", flipped.join("/"), side, &rest[2..])
+    }
+
+    // --- passed pawns ---------------------------------------------------------
+
+    // Is the pawn on `square` passed, given the enemy pawns of the position in `fen`?
+    //
+    // Drives the same predicate the evaluation uses, rather than reading a score difference:
+    // a score can move for a dozen reasons and would make a failure here ambiguous.
+    fn passed_in(fen: &str, square: &str, color: Color) -> bool {
+        let pos = Position::from_fen(fen).unwrap();
+        let sq: Square = square.parse().expect("a square name");
+        is_passed(sq as usize, color, pos.pawns(!color))
+    }
+
+    #[test]
+    fn the_mask_rows_are_indexed_by_colour_the_way_the_lookup_assumes() {
+        // `PASSED_MASK` is built by splitting the array in two and filling `[0]` with White's
+        // masks, then read back as `PASSED_MASK[color as usize]`. That is only correct while
+        // `White as usize == 0`, which is a fact about a borrowed crate rather than about this
+        // file — so it is asserted here instead of assumed. If it ever flips, every pawn of
+        // both colours is judged against the wrong direction, and the engine would still
+        // compile and still play.
+        assert_eq!(Color::White as usize, 0);
+        assert_eq!(Color::Black as usize, 1);
+        // And the rows really do differ, so a symmetric bug cannot hide behind the indices
+        // being right: a pawn on d5 looks forwards for White and backwards for Black.
+        let d5 = Square::D5 as usize;
+        assert_ne!(
+            PASSED_MASK[Color::White as usize][d5],
+            PASSED_MASK[Color::Black as usize][d5],
+        );
+    }
+
+    #[test]
+    fn a_pawn_is_passed_when_no_enemy_pawn_can_stop_it() {
+        // Every way a pawn can be stopped, and the two ways it cannot. Swept as a table so
+        // that adding a case is one line, and so a failure names which relationship broke.
+        // No type annotation at all: the literals below determine both the element type and
+        // the length, so adding a row is one line. The original spelled the count into the
+        // type (`; 8]`), which turns adding a row into a compile error to chase — friction on
+        // exactly the action this table exists to make cheap, and part of why the row replaced
+        // below sat here unexamined.
+        //
+        // Not `[_; _]` either, tempting as it reads: inferring an array length is
+        // `generic_arg_infer`, stabilised well after the `rust-version = "1.85"` this workspace
+        // declares. Omitting the annotation needs no such feature.
+        let cases = [
+            ("8/8/8/3P4/8/8/8/K6k w - - 0 1", "d5", Color::White, true,
+             "nothing in front at all"),
+            ("8/3p4/8/3P4/8/8/8/K6k w - - 0 1", "d5", Color::White, false,
+             "enemy pawn on the same file ahead"),
+            ("8/2p5/8/3P4/8/8/8/K6k w - - 0 1", "d5", Color::White, false,
+             "enemy pawn on the file to the left, ahead"),
+            ("8/4p3/8/3P4/8/8/8/K6k w - - 0 1", "d5", Color::White, false,
+             "enemy pawn on the file to the right, ahead"),
+            ("8/8/8/3P4/2p5/8/8/K6k w - - 0 1", "d5", Color::White, true,
+             "enemy pawn adjacent but BEHIND — it can never come back"),
+            // `f7` is exactly two files from `d5` and ahead of it — the first square
+            // *outside* the window. The row it replaces used `a3`, which is three files away
+            // *and* behind: excluded twice over, so it could not discriminate the file
+            // boundary, while its comment claimed it did. Raised in review, and it is the
+            // seventh comment in this repository describing a stronger check than the code
+            // performs.
+            ("8/5p2/8/3P4/8/8/8/K6k w - - 0 1", "d5", Color::White, true,
+             "two files away and ahead — just outside the window"),
+            // `c5` is on an adjacent file at the *same* rank. A pawn beside ours moves away
+            // from us and can never come back, so it must not count as a stopper. This is the
+            // rank boundary, and nothing tested it either.
+            ("8/8/8/2pP4/8/8/8/K6k w - - 0 1", "d5", Color::White, true,
+             "adjacent file, same rank — it moves away, it cannot stop us"),
+            // Black pawns run the other way: the same geometry must flip.
+            ("8/8/8/3p4/8/8/8/K6k w - - 0 1", "d5", Color::Black, true,
+             "black pawn with nothing in front of it"),
+            ("8/8/8/3p4/2P5/8/8/K6k w - - 0 1", "d5", Color::Black, false,
+             "black pawn with a white pawn ahead on an adjacent file"),
+        ];
+        for (fen, square, color, expected, why) in cases {
+            assert_eq!(
+                passed_in(fen, square, color),
+                expected,
+                "{why} — `{fen}` square {square} for {color:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_blockaded_passer_is_worth_less_than_a_running_one() {
+        // The context the bare schedule ignores: a passed pawn with something standing in
+        // front of it is not going anywhere, yet a rank-6 passer blocked by a king was priced
+        // exactly like one with an open road.
+        //
+        // Compared against its own baseline rather than against the free pawn directly: the
+        // blocking piece carries its own material and square value, which would swamp the
+        // difference being measured.
+        let free = Position::from_fen("4k3/8/8/3P4/8/8/8/4K3 w - - 0 1").unwrap();
+        let blocked = Position::from_fen("4k3/8/3n4/3P4/8/8/8/4K3 w - - 0 1").unwrap();
+        let bare = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let knight_only = Position::from_fen("4k3/8/3n4/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let running = evaluate(&free) - evaluate(&bare);
+        let stopped = evaluate(&blocked) - evaluate(&knight_only);
+        assert!(
+            stopped < running,
+            "a blockaded passer must be worth less: {stopped} against {running}",
+        );
+        // And still worth *more than a pawn that is not passed at all*, because halving rather
+        // than removing is the design choice.
+        //
+        // Comparing `stopped > 0` would not test that: a pawn is worth 100 centipawns before
+        // any bonus, so that assertion stays true with the bonus zeroed. Found by mutation —
+        // "zero the bonus instead of halving it" broke nothing. The residual has to be
+        // isolated against a pawn on the *same square* that is blocked *and* not passed.
+        let blocked_not_passed =
+            Position::from_fen("4k3/8/3p4/3P4/8/8/8/4K3 w - - 0 1").unwrap();
+        let pawn_only = Position::from_fen("4k3/8/3p4/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let no_bonus_at_all = evaluate(&blocked_not_passed) - evaluate(&pawn_only);
+        assert!(
+            stopped > no_bonus_at_all,
+            "a blockaded passer must keep part of its bonus: {stopped} against \
+             {no_bonus_at_all} for a pawn that is blocked and not passed",
+        );
+    }
+
+    #[test]
+    fn the_square_ahead_follows_the_direction_of_travel() {
+        // "In front" flips with the colour, and getting it backwards would halve the bonus of
+        // every pawn with a piece *behind* it while leaving genuinely blockaded ones at full
+        // value — a mistake that changes no test above and no compile.
+        assert_eq!(square_ahead(Square::D5 as usize, Color::White), Some(Square::D6 as usize));
+        assert_eq!(square_ahead(Square::D5 as usize, Color::Black), Some(Square::D4 as usize));
+        // The promotion rank has nothing ahead of it. A pawn never stands there, but the
+        // lookup must not wrap around the board into a square on the other side.
+        assert_eq!(square_ahead(Square::D8 as usize, Color::White), None);
+        assert_eq!(square_ahead(Square::D1 as usize, Color::Black), None);
+        // Every other square yields a real neighbour on the same file.
+        for sq in 8..56usize {
+            for color in [Color::White, Color::Black] {
+                let ahead = square_ahead(sq, color).expect("a square in the middle has one");
+                assert_eq!(ahead % 8, sq % 8, "the file must not change");
+                assert_eq!(ahead.abs_diff(sq), 8, "exactly one rank");
+            }
+        }
+    }
+
+    #[test]
+    fn a_friendly_piece_blocks_just_as_an_enemy_one_does() {
+        // A deliberate choice, recorded because the usual engines only count enemy blockers:
+        // this one counts any piece. A pawn cannot advance through its own knight either, and
+        // the simpler rule is the one being measured. If a later brick distinguishes the two,
+        // this test is what will have to change, and on purpose.
+        // The black king sits on a8, not e8: a white knight on d6 attacks e8, and a position
+        // where the side *not* to move is in check is illegal — `from_fen` rejects it.
+        let own = Position::from_fen("k7/8/3N4/3P4/8/8/8/4K3 w - - 0 1").unwrap();
+        let own_baseline = Position::from_fen("k7/8/3N4/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let free = Position::from_fen("k7/8/8/3P4/8/8/8/4K3 w - - 0 1").unwrap();
+        let bare = Position::from_fen("k7/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        assert!(
+            evaluate(&own) - evaluate(&own_baseline) < evaluate(&free) - evaluate(&bare),
+            "a pawn cannot advance through its own piece either",
+        );
+    }
+
+    #[test]
+    fn the_passed_bonus_grows_with_rank() {
+        // Asserted as monotonicity over the whole schedule rather than as values, so that
+        // retuning the numbers cannot fail this test for a reason unrelated to its name.
+        // Ranks 0 and 7 are excluded: a pawn cannot stand on its home rank, and one on the
+        // eighth is no longer a pawn — both are zero by construction.
+        for table in [PASSED_MIDDLEGAME, PASSED_ENDGAME] {
+            for rank in 1..6 {
+                assert!(
+                    table[rank + 1] > table[rank],
+                    "rank {rank} -> {} went {} -> {}",
+                    rank + 1,
+                    table[rank],
+                    table[rank + 1],
+                );
+            }
+            assert_eq!(table[0], 0, "a pawn cannot stand on its own home rank");
+            assert_eq!(table[7], 0, "a pawn on the eighth rank has already promoted");
+        }
+    }
+
+    #[test]
+    fn a_passed_pawn_is_worth_more_in_the_endgame() {
+        // The whole reason this term is tapered rather than a single schedule: in a
+        // middlegame a passed pawn is one asset among many, in an endgame it is often the
+        // position. Checked at every rank a pawn can occupy, not at one chosen rank.
+        for rank in 1..7 {
+            assert!(
+                PASSED_ENDGAME[rank] > PASSED_MIDDLEGAME[rank],
+                "rank {rank}: endgame {} is not above middlegame {}",
+                PASSED_ENDGAME[rank],
+                PASSED_MIDDLEGAME[rank],
+            );
+        }
+    }
+
+    #[test]
+    fn a_passed_pawn_scores_above_an_identical_blocked_one() {
+        // The end-to-end check: the predicate and the schedule reaching `evaluate`. Two
+        // positions differing only in whether one enemy pawn stands in the way.
+        let passed = Position::from_fen("4k3/8/8/3P4/8/8/8/4K3 w - - 0 1").unwrap();
+        let blocked = Position::from_fen("4k3/3p4/8/3P4/8/8/8/4K3 w - - 0 1").unwrap();
+        // The blocked position also contains an extra enemy pawn, so compare each against
+        // its own baseline rather than against the other directly.
+        let bare = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let with_enemy = Position::from_fen("4k3/3p4/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let gain_when_passed = evaluate(&passed) - evaluate(&bare);
+        let gain_when_blocked = evaluate(&blocked) - evaluate(&with_enemy);
+        assert!(
+            gain_when_passed > gain_when_blocked,
+            "a passed pawn must be worth more than a blocked one: {gain_when_passed} \
+             against {gain_when_blocked}",
+        );
     }
 }

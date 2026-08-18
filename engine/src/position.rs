@@ -119,6 +119,24 @@ impl Position {
         (self.0.colors(color) & self.0.pieces(piece)).len()
     }
 
+    /// Every pawn of `color`, as a bitboard — one bit per square, `a1` in bit 0.
+    ///
+    /// A bitboard rather than a square-by-square scan because of what reads it: deciding
+    /// whether a pawn is passed asks "is there any enemy pawn on my file or the two beside
+    /// it, on any rank ahead of me". As a scan that is up to 21 lookups per pawn; against a
+    /// precomputed mask it is one `&` and a comparison. `evaluate` runs at every leaf, and
+    /// this engine has already abandoned one term (king safety, #29) for costing 0.23 µs a
+    /// node.
+    ///
+    /// Returned as a plain `u64` rather than `cozy_chess::BitBoard` so the dependency stays
+    /// confined to this module, which is the rule the rest of this type follows. A bitboard
+    /// is a *fact about the position*, so borrowing it sits on the "borrow" side of the
+    /// project's guiding principle; what has a design space — which pawns count as passed,
+    /// and what each is worth — is written by hand in `evaluation`.
+    pub fn pawns(&self, color: Color) -> u64 {
+        (self.0.colors(color) & self.0.pieces(Piece::Pawn)).0
+    }
+
     /// The piece sitting on `square`, if any (regardless of color).
     ///
     /// Used by move ordering to read a capture's victim and attacker while

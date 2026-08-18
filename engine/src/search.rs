@@ -2213,16 +2213,31 @@ mod tests {
             for depth in (LMR_MIN_DEPTH + 1)..=DEEPEST {
                 let with = search_reducing(&p, depth, true);
                 let without = search_reducing(&p, depth, false);
+                // `<=`, not `<`: at the shallowest swept depth the tree can be too small
+                // for reductions to remove anything, and that is not a regression. Measured
+                // after the passed-pawn term (#46) changed the shape of every tree: the
+                // endgame position at depth 4 reads exactly 1.000, having read 0.727 before.
+                // What must never happen is reductions *costing* nodes; that they gain is
+                // asserted strictly at `DEEPEST` below, which is where there is matter to
+                // work on.
                 assert!(
-                    with.stats.nodes < without.stats.nodes,
-                    "{nature} at depth {depth}: {} nodes against {}",
+                    with.stats.nodes <= without.stats.nodes,
+                    "{nature} at depth {depth}: reductions cost nodes, {} against {}",
                     with.stats.nodes,
                     without.stats.nodes,
                 );
-                assert!(
-                    with.reductions > 0,
-                    "precondition: {nature} at depth {depth} must actually reduce something",
-                );
+                // The precondition belongs where the amplitude is read, not at every swept
+                // depth. A small tree can legitimately offer no move at rank 3 or beyond —
+                // the endgame position at depth 4 stopped reducing entirely once the
+                // passed-pawn term (#46) changed which branches get cut. Requiring a
+                // reduction there asserted a property of the position, not of the feature.
+                if depth == DEEPEST {
+                    assert!(
+                        with.reductions > 0,
+                        "precondition: {nature} at depth {depth} must reduce something for \
+                         the ratio below to mean anything",
+                    );
+                }
                 if depth == DEEPEST {
                     let ratio = with.stats.nodes as f64 / without.stats.nodes as f64;
                     if worst.is_none_or(|(_, w)| ratio > w) {
