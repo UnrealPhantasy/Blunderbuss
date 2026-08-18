@@ -613,10 +613,16 @@ mod tests {
     fn a_pawn_is_passed_when_no_enemy_pawn_can_stop_it() {
         // Every way a pawn can be stopped, and the two ways it cannot. Swept as a table so
         // that adding a case is one line, and so a failure names which relationship broke.
-        // Idiom: `[_; _]` lets the compiler infer both the element type and the length, so
-        // adding a row is one line rather than two — the count written in the type is exactly
-        // the kind of thing that goes stale and turns a compile error into a chore.
-        let cases: [(&str, &str, Color, bool, &str); _] = [
+        // No type annotation at all: the literals below determine both the element type and
+        // the length, so adding a row is one line. The original spelled the count into the
+        // type (`; 8]`), which turns adding a row into a compile error to chase — friction on
+        // exactly the action this table exists to make cheap, and part of why the row replaced
+        // below sat here unexamined.
+        //
+        // Not `[_; _]` either, tempting as it reads: inferring an array length is
+        // `generic_arg_infer`, stabilised well after the `rust-version = "1.85"` this workspace
+        // declares. Omitting the annotation needs no such feature.
+        let cases = [
             ("8/8/8/3P4/8/8/8/K6k w - - 0 1", "d5", Color::White, true,
              "nothing in front at all"),
             ("8/3p4/8/3P4/8/8/8/K6k w - - 0 1", "d5", Color::White, false,
