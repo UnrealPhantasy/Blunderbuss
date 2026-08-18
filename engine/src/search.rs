@@ -72,6 +72,27 @@ const NULL_MOVE_MIN_PHASE: i32 = 6;
 const LMR_BASE: f64 = 0.75;
 const LMR_DIVISOR: f64 = 2.25;
 
+/// The most depth a reduction may take away at `depth` — the ceiling on the curve's output.
+///
+/// A function rather than an expression inlined in the loop, because a test watches it. The
+/// equivalence test below asserts that this ceiling and `LMR_MIN_DEPTH` currently forbid the
+/// same set of depths; written as a transcription of the formula, that test compared the guard
+/// against its own private copy and stayed silent when the ceiling itself moved — verified by
+/// loosening this to `depth - 1`, which brings the guard back to life while the test passed.
+/// One source, read from both sides, is what makes either of them moving observable.
+///
+/// **Why two is the floor**: reducing further hands the move to quiescence, which judges a quiet
+/// move on captures it does not have — the same reason `LMR_MIN_DEPTH` exists. One ply of real
+/// search is the minimum worth doing.
+///
+/// **Why `saturating_sub`**, for the reason #42 learned the hard way: `reducible` guarantees
+/// `depth >= LMR_MIN_DEPTH`, so a plain subtraction is safe at today's value of 3 — but that is a
+/// relationship between two constants far apart in this file, and an unsigned underflow wraps
+/// silently in release and ends in a stack overflow rather than an error anyone can read.
+fn reduction_ceiling(depth: u32) -> u32 {
+    depth.saturating_sub(2)
+}
+
 /// The reduction for every reachable (depth, rank) pair, computed once.
 ///
 /// Idiom: `LazyLock` runs its closure on the first access and hands out the same value
@@ -772,17 +793,9 @@ impl<'a> Searcher<'a> {
         // Compiled out of production builds, where the curve always applies.
         #[cfg(test)]
         let reduction = if self.lmr_growing { reduction } else { 1 };
-        // Leave the search something to do. Reducing to zero hands the move to quiescence,
-        // which judges a quiet move on captures it does not have — the same reason
-        // `LMR_MIN_DEPTH` exists. One ply of real search is the floor, and it is enforced
-        // here because this is the only place that knows how much depth is left.
-        //
-        // `saturating_sub` rather than `depth - 2`, for the reason #42 learned the hard way:
-        // `reducible` guarantees `depth >= LMR_MIN_DEPTH`, so the subtraction is safe at
-        // today's value of 3 — but that is a relationship between two constants far apart in
-        // the file, and an unsigned underflow here wraps silently in release and ends in a
-        // stack overflow rather than an error anyone can read.
-        reduction.min(depth.saturating_sub(2))
+        // Leave the search something to do — see `reduction_ceiling`, which is also what the
+        // equivalence test reads, so that either mechanism moving is observable.
+        reduction.min(reduction_ceiling(depth))
     }
 
     fn negamax_inner(
@@ -2400,7 +2413,12 @@ mod tests {
         // genuinely discriminating instead of resting on the ceiling.
         for depth in 0..=MAX_DEPTH {
             let guard_allows = depth >= LMR_MIN_DEPTH;
-            let ceiling_allows = depth.saturating_sub(2) >= 1;
+            // Read from `reduction_ceiling`, never transcribed: a copy of the formula would
+            // compare the guard against this test's own idea of the ceiling, and stay silent
+            // when the real one moved. Verified — loosening the production ceiling to
+            // `depth - 1` revives the guard on all four natures, and the transcribing version
+            // of this test passed through it.
+            let ceiling_allows = reduction_ceiling(depth) >= 1;
             assert_eq!(
                 guard_allows, ceiling_allows,
                 "depth {depth}: the guard says {guard_allows} and the ceiling says \
