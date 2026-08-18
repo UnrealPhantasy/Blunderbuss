@@ -170,16 +170,30 @@ static ADJACENT_FILES: LazyLock<[u64; 8]> = LazyLock::new(|| {
 /// evaluation that a shuffling engine consults rather than in a search that would have to see
 /// the consequence.
 ///
-/// **Heavier in the endgame**: with pieces on the board a weak pawn can be compensated by
-/// activity, and the defending piece has something else to do anyway. In an endgame there is
-/// nothing else to do, and a pawn that cannot be defended by a pawn is simply lost eventually.
+/// **Heavier in the middlegame, and that is the opposite of the first attempt.** The first
+/// version charged more in the endgame, on the reasoning that a weak pawn cannot be compensated
+/// by activity once the pieces are gone. It measured **+2 ± 29** — nothing — and the reason is
+/// visible in how often an isolated pawn even is one. Measured over 19 555 positions from 150
+/// real games, the share of a side's pawns that are isolated, by how many it has left:
 ///
-/// Deliberately at the **bottom** of the 10-20 centipawn range the literature gives. #46
-/// measured the same term at two amplitudes: the full schedule returned −5 Elo and half of it
-/// +17, with identical draw figures — the signal paid, the amplitude only bought risk. Starting
-/// low and measuring is the lesson taken from that.
-const ISOLATED_MIDDLEGAME: i32 = 8;
-const ISOLATED_ENDGAME: i32 = 14;
+/// | pawns | isolated |
+/// |---|---|
+/// | 8 | **0.6 %** |
+/// | 6 | 19.0 % |
+/// | 4 | 34.8 % |
+/// | 2 | 57.1 % |
+/// | 1 | **100 %** |
+///
+/// An isolated pawn among eight is a genuine anomaly. One among two is the norm, and a lone pawn
+/// is isolated *by definition* — a tautology, not a weakness. So charging **more** in the endgame
+/// put the heaviest penalty exactly where the information is weakest, and the lightest where it
+/// is rarest and most telling. The gradation was backwards.
+///
+/// Both values stay at the bottom of the 10-20 centipawn range the literature gives, for the
+/// reason #46 established: the same term at two amplitudes returned −5 and +17 with identical
+/// draw figures, so the signal pays and the magnitude only buys risk.
+const ISOLATED_MIDDLEGAME: i32 = 14;
+const ISOLATED_ENDGAME: i32 = 6;
 
 // Both invariants checked at **compile time** rather than by a test, which is strictly
 // stronger: a schedule that breaks them cannot be built, let alone shipped and measured.
@@ -193,7 +207,16 @@ const ISOLATED_ENDGAME: i32 = 14;
 // mutation `ISOLATED_MIDDLEGAME = -8` fails the *build* with this message rather than a test.
 const _: () = {
     assert!(ISOLATED_MIDDLEGAME > 0, "the penalty is subtracted; a negative one is a bonus");
-    assert!(ISOLATED_ENDGAME > ISOLATED_MIDDLEGAME, "the term exists to weigh more in endgames");
+    assert!(ISOLATED_ENDGAME > 0, "the penalty is subtracted; a negative one is a bonus");
+    // The direction that the first version asserted the other way round. Worth noting what that
+    // cost: a `const` assertion is stronger than a test, but it does not make a hypothesis true —
+    // it only locks a belief in more firmly. The belief here was "a weak pawn matters more once
+    // the pieces are gone", and the measurement above says isolation stops carrying information
+    // exactly then.
+    assert!(
+        ISOLATED_MIDDLEGAME > ISOLATED_ENDGAME,
+        "isolation is near-inevitable with few pawns, so it informs least in the endgame",
+    );
 };
 
 /// Whether the pawn on `square` has no friendly pawn on either adjacent file.
