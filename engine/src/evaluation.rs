@@ -613,7 +613,10 @@ mod tests {
     fn a_pawn_is_passed_when_no_enemy_pawn_can_stop_it() {
         // Every way a pawn can be stopped, and the two ways it cannot. Swept as a table so
         // that adding a case is one line, and so a failure names which relationship broke.
-        let cases: [(&str, &str, Color, bool, &str); 8] = [
+        // Idiom: `[_; _]` lets the compiler infer both the element type and the length, so
+        // adding a row is one line rather than two — the count written in the type is exactly
+        // the kind of thing that goes stale and turns a compile error into a chore.
+        let cases: [(&str, &str, Color, bool, &str); _] = [
             ("8/8/8/3P4/8/8/8/K6k w - - 0 1", "d5", Color::White, true,
              "nothing in front at all"),
             ("8/3p4/8/3P4/8/8/8/K6k w - - 0 1", "d5", Color::White, false,
@@ -624,8 +627,19 @@ mod tests {
              "enemy pawn on the file to the right, ahead"),
             ("8/8/8/3P4/2p5/8/8/K6k w - - 0 1", "d5", Color::White, true,
              "enemy pawn adjacent but BEHIND — it can never come back"),
-            ("8/8/8/3P4/8/p7/8/K6k w - - 0 1", "d5", Color::White, true,
-             "enemy pawn two files away is irrelevant"),
+            // `f7` is exactly two files from `d5` and ahead of it — the first square
+            // *outside* the window. The row it replaces used `a3`, which is three files away
+            // *and* behind: excluded twice over, so it could not discriminate the file
+            // boundary, while its comment claimed it did. Raised in review, and it is the
+            // seventh comment in this repository describing a stronger check than the code
+            // performs.
+            ("8/5p2/8/3P4/8/8/8/K6k w - - 0 1", "d5", Color::White, true,
+             "two files away and ahead — just outside the window"),
+            // `c5` is on an adjacent file at the *same* rank. A pawn beside ours moves away
+            // from us and can never come back, so it must not count as a stopper. This is the
+            // rank boundary, and nothing tested it either.
+            ("8/8/8/2pP4/8/8/8/K6k w - - 0 1", "d5", Color::White, true,
+             "adjacent file, same rank — it moves away, it cannot stop us"),
             // Black pawns run the other way: the same geometry must flip.
             ("8/8/8/3p4/8/8/8/K6k w - - 0 1", "d5", Color::Black, true,
              "black pawn with nothing in front of it"),
