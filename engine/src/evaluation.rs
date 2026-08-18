@@ -127,7 +127,7 @@ static PASSED_MASK: LazyLock<[[u64; 64]; 2]> = LazyLock::new(|| {
 /// Ranks 0 and 7 are zero on purpose: a pawn cannot stand on its own home rank, and one that
 /// reaches the eighth is no longer a pawn.
 const PASSED_MIDDLEGAME: [i32; 8] = [0, 5, 10, 18, 32, 55, 85, 0];
-const PASSED_ENDGAME: [i32; 8] = [0, 15, 25, 42, 72, 120, 180, 0];
+const PASSED_ENDGAME: [i32; 8] = [0, 8, 13, 21, 36, 60, 90, 0];
 
 /// Whether the pawn on `square` (given as an index, `a1` = 0) has no enemy pawn able to stop
 /// it — nothing on its file or the two beside it, anywhere ahead.
