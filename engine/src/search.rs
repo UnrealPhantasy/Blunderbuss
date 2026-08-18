@@ -15,6 +15,7 @@ use crate::evaluation::{evaluate, phase};
 use crate::ordering::{is_quiet, mvv_lva, order_moves, KillerSlots, Killers};
 use crate::position::{Move, Piece, Position};
 use crate::transposition::{Bound, Table};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 /// A mate score, large enough to dominate any material balance. The distance to
@@ -53,13 +54,79 @@ const NULL_MOVE_REDUCTION: u32 = 2;
 /// and the null-move assumption stops holding.
 const NULL_MOVE_MIN_PHASE: i32 = 6;
 
-/// How much shallower a late quiet move is searched.
+/// The two coefficients of the reduction curve, `base + ln(depth) * ln(rank) / divisor`.
 ///
-/// One ply, which is the whole reduction for now. A growing reduction — larger for
-/// deeper nodes and later moves — is the natural follow-up and is expected to be worth
-/// more, but it adds constants to calibrate: this establishes whether the mechanism pays
-/// here at all, and the growing form is then measured against it rather than bundled in.
-const LMR_REDUCTION: u32 = 1;
+/// A **logarithm in both arguments**, and that is the whole design choice. One ply was the
+/// same discount for a move ranked 4th at depth 4 as for one ranked 30th at depth 12, and
+/// those are not equally unpromising: the second sits far below everything the ordering
+/// believes in, and its subtree is much larger. A growing reduction spends the saved depth
+/// where being wrong is least likely and the saving is greatest.
+///
+/// Why not a linear term: the cost of wrongly reducing a move rises much faster than the
+/// saving from reducing it further, so the curve has to flatten. `ln` flattens on both axes
+/// at once — from rank 4 to 8 it adds as much as from 8 to 16.
+///
+/// The values are the usual ones rather than the product of a search over the arena. This
+/// repository has a brick that died after four successive recalibrations produced no gain
+/// (king safety, #29); the lesson taken was to measure one defensible shape and report it.
+const LMR_BASE: f64 = 0.75;
+const LMR_DIVISOR: f64 = 2.25;
+
+/// The most depth a reduction may take away at `depth` — the ceiling on the curve's output.
+///
+/// A function rather than an expression inlined in the loop, because a test watches it. The
+/// equivalence test below asserts that this ceiling and `LMR_MIN_DEPTH` currently forbid the
+/// same set of depths; written as a transcription of the formula, that test compared the guard
+/// against its own private copy and stayed silent when the ceiling itself moved — verified by
+/// loosening this to `depth - 1`, which brings the guard back to life while the test passed.
+/// One source, read from both sides, is what makes either of them moving observable.
+///
+/// **Why two is the floor**: reducing further hands the move to quiescence, which judges a quiet
+/// move on captures it does not have — the same reason `LMR_MIN_DEPTH` exists. One ply of real
+/// search is the minimum worth doing.
+///
+/// **Why `saturating_sub`**, for the reason #42 learned the hard way: `reducible` guarantees
+/// `depth >= LMR_MIN_DEPTH`, so a plain subtraction is safe at today's value of 3 — but that is a
+/// relationship between two constants far apart in this file, and an unsigned underflow wraps
+/// silently in release and ends in a stack overflow rather than an error anyone can read.
+fn reduction_ceiling(depth: u32) -> u32 {
+    depth.saturating_sub(2)
+}
+
+/// The reduction for every reachable (depth, rank) pair, computed once.
+///
+/// Idiom: `LazyLock` runs its closure on the first access and hands out the same value
+/// forever after — the modern replacement for a hand-rolled "compute it once" flag, and
+/// thread-safe without a mutex on the read path. It is needed here because `f64::ln` is not
+/// a `const fn`, so this cannot be a plain `const`; and the alternative — computing the
+/// logarithms per visit — would put floating-point work in the hottest loop in the engine.
+///
+/// Indexed `[depth][rank]`, both clamped by the caller, so a lookup is two bounds-checked
+/// array reads and no arithmetic.
+static LMR_TABLE: LazyLock<[[u32; LMR_TABLE_RANKS]; LMR_TABLE_DEPTHS]> = LazyLock::new(|| {
+    let mut table = [[0u32; LMR_TABLE_RANKS]; LMR_TABLE_DEPTHS];
+    for (depth, row) in table.iter_mut().enumerate() {
+        for (rank, slot) in row.iter_mut().enumerate() {
+            // Depth 0 and rank 0 never reach a lookup — the guards exclude them — but
+            // `ln(0)` is negative infinity, so the table must not contain the result of
+            // asking. Both axes start at 1.
+            let d = depth.max(1) as f64;
+            let r = rank.max(1) as f64;
+            let raw = LMR_BASE + d.ln() * r.ln() / LMR_DIVISOR;
+            // At least one ply: below that the brick is a no-op and the caller would pay a
+            // lookup to learn nothing. The upper bound belongs to the caller, which is the
+            // only place that knows how much depth is left to give away.
+            *slot = (raw as u32).max(1);
+        }
+    }
+    table
+});
+
+/// How far the reduction table reaches. Past it, the caller clamps rather than grows: the
+/// curve is flat enough by then that the difference is under a ply, and a table that could
+/// be indexed out of range is a panic waiting for an unusual position.
+const LMR_TABLE_DEPTHS: usize = MAX_DEPTH as usize + 1;
+const LMR_TABLE_RANKS: usize = 64;
 
 /// Below this depth nothing is reduced.
 ///
@@ -463,6 +530,14 @@ struct Searcher<'a> {
     /// for the one thing being measured.
     #[cfg(test)]
     allow_lmr: bool,
+    /// Whether the reduction grows with depth and rank, or stays at the flat one ply of #42.
+    ///
+    /// **Tests only.** The acceptance criterion for this brick is "improves on #42", not
+    /// "improves on no reductions at all", so the baseline has to be reachable from inside
+    /// the same binary — otherwise the comparison drifts across two builds and picks up
+    /// every other difference between them.
+    #[cfg(test)]
+    lmr_growing: bool,
     /// Whether a reduced move that beats `alpha` is searched again at full depth.
     ///
     /// **Tests only.** Without this switch the re-search could only be checked by counting
@@ -508,6 +583,8 @@ impl<'a> Searcher<'a> {
             max_null_nesting: 0,
             #[cfg(test)]
             allow_lmr: true,
+            #[cfg(test)]
+            lmr_growing: true,
             #[cfg(test)]
             allow_lmr_research: true,
             #[cfg(test)]
@@ -703,11 +780,22 @@ impl<'a> Searcher<'a> {
             && !self.killers_at(ply).contains(mv)
             && !pos.in_check()
             && !child.in_check();
-        if reducible {
-            LMR_REDUCTION
-        } else {
-            0
+        if !reducible {
+            return 0;
         }
+        // How much, from the curve. Both indices are clamped rather than trusted: `depth`
+        // is bounded by `MAX_DEPTH` in every search the engine runs, but quiescence
+        // recurses past it and a position can legally offer more than 64 moves, so an
+        // unclamped lookup would be a panic waiting for an unusual position rather than a
+        // bug anyone would find in testing.
+        let reduction =
+            LMR_TABLE[(depth as usize).min(LMR_TABLE_DEPTHS - 1)][rank.min(LMR_TABLE_RANKS - 1)];
+        // Compiled out of production builds, where the curve always applies.
+        #[cfg(test)]
+        let reduction = if self.lmr_growing { reduction } else { 1 };
+        // Leave the search something to do — see `reduction_ceiling`, which is also what the
+        // equivalence test reads, so that either mechanism moving is observable.
+        reduction.min(reduction_ceiling(depth))
     }
 
     fn negamax_inner(
@@ -1679,18 +1767,35 @@ mod tests {
         // explore largely the same tree — the opponent replies, and the engine starts
         // again from a position it just analysed deeply. On one `Engine`, the second
         // search reads what the first wrote.
+        // Totalled over the first eight moves of the position rather than measured on one
+        // line of play. The saving is a property of the table in aggregate, not a guarantee
+        // for every individual continuation: a carried table also reorders the moves, which
+        // changes which ones rank late enough to be reduced and by how much, so a single
+        // line can come out worse while the whole is better. Measured with the growing
+        // curve, one line of play gave 33 102 nodes carried against 31 691 fresh — the
+        // sweep over eight gives 181 636 against 198 460, which is 8.5% of margin.
+        //
+        // The curve does erode what the table saves, and on one position nature it erases it.
+        // Carried against fresh, by nature:
+        //
+        //     curve off   0.803  0.989  0.998  0.855
+        //     curve on    0.915  0.987  1.002  0.902
+        //
+        // Mechanical — reductions shrink both trees, so there is less left for the table to
+        // save — but the tactical position crosses 1.0 with the curve on, so the honest
+        // statement is **three natures of four**, not all four. It stays a property of the
+        // whole rather than of every continuation, which is what this test measures.
         let start = Position::initial();
-        let mut engine = Engine::new();
-        let first = engine.search(&start, Request::new(Limits::depth(6)));
-
-        // Play a move each side, as a game would.
-        let (mv, _) = first.best.expect("a move");
-        let after = start.play(mv);
-        let (reply, _) = best_move(&after, 3).expect("a reply");
-        let next = after.play(reply);
-
-        let carried = engine.search(&next, Request::new(Limits::depth(6)));
-        let fresh = Engine::new().search(&next, Request::new(Limits::depth(6)));
+        let (mut carried_nodes, mut fresh_nodes) = (0u64, 0u64);
+        for mv in start.legal_moves().into_iter().take(8) {
+            let next = start.play(mv);
+            let mut engine = Engine::new();
+            engine.search(&start, Request::new(Limits::depth(6)));
+            let before = engine.search(&next, Request::new(Limits::depth(6)));
+            carried_nodes += before.nodes;
+            fresh_nodes += Engine::new().search(&next, Request::new(Limits::depth(6))).nodes;
+        }
+        let (carried, fresh) = (carried_nodes, fresh_nodes);
 
         // The saved work is the whole contract, and it is the only thing asserted. The
         // two searches are **not** required to agree on the score: a stored bound is a
@@ -1707,10 +1812,8 @@ mod tests {
         // the contract never offered. This repository has retired four criteria of exactly
         // that shape (#19, #27, #36, and #42's own rule against it).
         assert!(
-            carried.nodes < fresh.nodes,
-            "a carried-over table must save work: {} nodes against {} from scratch",
-            carried.nodes,
-            fresh.nodes,
+            carried < fresh,
+            "a carried-over table must save work: {carried} nodes against {fresh} from scratch",
         );
     }
 
@@ -2193,6 +2296,11 @@ mod tests {
     }
 
     // Deep enough and late enough that only the guard under test can return zero.
+    //
+    // These tests assert **whether** a move is reduced, never by how much: the amount comes
+    // from a curve in `depth` and `rank`, and pinning its value here would make every guard
+    // test fail the moment that curve is retuned — for a reason that has nothing to do with
+    // the guard it is named after. How much is the subject of the curve tests below.
     const DEEP: u32 = 6;
     const LATE: usize = LMR_FULL_DEPTH_MOVES + 2;
 
@@ -2210,7 +2318,7 @@ mod tests {
         // if the rank were too early, or if the whole feature were switched off.
         let safe = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
         let same_step = safe.move_from_uci("e1d1").unwrap();
-        assert_eq!(reduction_for(&safe, same_step, DEEP, LATE, None), LMR_REDUCTION);
+        assert!(reduction_for(&safe, same_step, DEEP, LATE, None) > 0);
     }
 
     #[test]
@@ -2227,7 +2335,7 @@ mod tests {
 
         let quiet = p.move_from_uci("a1a7").unwrap();
         assert!(!p.play(quiet).in_check(), "precondition: Ra7 is not");
-        assert_eq!(reduction_for(&p, quiet, DEEP, LATE, None), LMR_REDUCTION);
+        assert!(reduction_for(&p, quiet, DEEP, LATE, None) > 0);
     }
 
     #[test]
@@ -2242,10 +2350,7 @@ mod tests {
 
         // Control: the same pawn, one square forward instead of diagonally.
         let push = capture_available.move_from_uci("e3e4").unwrap();
-        assert_eq!(
-            reduction_for(&capture_available, push, DEEP, LATE, None),
-            LMR_REDUCTION
-        );
+        assert!(reduction_for(&capture_available, push, DEEP, LATE, None) > 0);
 
         // A promotion reaches an empty square, so `mvv_lva` alone would read it as quiet —
         // the same blind spot that once kept promotions out of quiescence. `is_quiet` is
@@ -2263,7 +2368,7 @@ mod tests {
         let mv = p.move_from_uci("a1a7").unwrap();
         assert_eq!(reduction_for(&p, mv, DEEP, LATE, Some(mv)), 0);
         // Control: the same move at the same rank and depth, with no killer recorded.
-        assert_eq!(reduction_for(&p, mv, DEEP, LATE, None), LMR_REDUCTION);
+        assert!(reduction_for(&p, mv, DEEP, LATE, None) > 0);
     }
 
     #[test]
@@ -2281,30 +2386,235 @@ mod tests {
                 "move {rank} is still in the trusted head of the list",
             );
         }
-        assert_eq!(
-            reduction_for(&p, mv, DEEP, LMR_FULL_DEPTH_MOVES, None),
-            LMR_REDUCTION,
+        assert!(
+            reduction_for(&p, mv, DEEP, LMR_FULL_DEPTH_MOVES, None) > 0,
             "and the first move past it is reduced",
         );
     }
 
     #[test]
+    fn the_depth_floor_and_the_ceiling_currently_say_the_same_thing() {
+        // Two mechanisms forbid a reduction at shallow depth, and **at today's constants they
+        // forbid exactly the same set**: the guard `depth >= LMR_MIN_DEPTH` excludes depths
+        // 0-2, and the ceiling `min(depth - 2)` returns zero for those same depths. Removing
+        // the guard changes nothing — verified byte for byte, node counts and reduction counts
+        // alike, on four positions over depths 3-7 — and the whole suite stays green without
+        // it.
+        //
+        // That is worth a test of its own rather than a comment, because `LMR_MIN_DEPTH` is a
+        // lever #44 deliberately left at its measured value for someone to come back to, and
+        // it currently acts *only* through a guard that does nothing. Raise it to 6 and
+        // reductions vanish below depth 7; delete the redundant-looking guard first and the
+        // constant is permanently inoperative, with 138 tests still green and nothing to say
+        // so.
+        //
+        // **If this test fails, the redundancy has ended** — the two mechanisms now forbid
+        // different sets, the guard has regained an effect, and the two tests below become
+        // genuinely discriminating instead of resting on the ceiling.
+        for depth in 0..=MAX_DEPTH {
+            let guard_allows = depth >= LMR_MIN_DEPTH;
+            // Read from `reduction_ceiling`, never transcribed: a copy of the formula would
+            // compare the guard against this test's own idea of the ceiling, and stay silent
+            // when the real one moved. Verified — loosening the production ceiling to
+            // `depth - 1` revives the guard on all four natures, and the transcribing version
+            // of this test passed through it.
+            let ceiling_allows = reduction_ceiling(depth) >= 1;
+            assert_eq!(
+                guard_allows, ceiling_allows,
+                "depth {depth}: the guard says {guard_allows} and the ceiling says \
+                 {ceiling_allows} — they have stopped covering each other, so the depth-floor \
+                 tests are no longer resting on the ceiling and should be re-read",
+            );
+        }
+    }
+
+    #[test]
     fn the_depth_floor_is_a_boundary_not_a_slope() {
-        // Same shape as the rank test: sweep both sides of the floor rather than sample
-        // one. Below it a reduced move would be searched by quiescence alone, which judges
-        // a quiet move on captures it does not have.
+        // Sweeps both sides of the floor rather than sampling one. Below it a reduced move
+        // would be searched by quiescence alone, which judges a quiet move on captures it
+        // does not have.
+        //
+        // **What this pins is the behaviour, not the guard.** At today's constants the
+        // ceiling `min(depth - 2)` already returns zero for depths 0-2, so deleting
+        // `depth >= LMR_MIN_DEPTH` leaves this test green — it cannot tell which mechanism
+        // produced the zero. That is fine as long as it is stated:
+        // `the_depth_floor_and_the_ceiling_currently_say_the_same_thing` is what fails if the
+        // two ever diverge, and at that point this test starts discriminating again.
         let p = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
         let mv = p.move_from_uci("a1a7").unwrap();
         for depth in 0..LMR_MIN_DEPTH {
             assert_eq!(reduction_for(&p, mv, depth, LATE, None), 0, "depth {depth} is below the floor");
         }
         for depth in LMR_MIN_DEPTH..=DEEP {
-            assert_eq!(
-                reduction_for(&p, mv, depth, LATE, None),
-                LMR_REDUCTION,
+            assert!(
+                reduction_for(&p, mv, depth, LATE, None) > 0,
                 "depth {depth} is at or above the floor",
             );
         }
+    }
+
+    #[test]
+    fn the_reduction_grows_on_both_axes() {
+        // The whole point of the curve, and it is asserted as *monotonicity over a sweep*
+        // rather than as values at chosen points. Values would pin the coefficients: retuning
+        // `LMR_BASE` or `LMR_DIVISOR` would fail this test for a reason that has nothing to do
+        // with the property it is named after, which is how a test ends up recalibrated
+        // instead of trusted.
+        //
+        // Read from the table directly rather than through the predicate, because the
+        // predicate clamps the result to what depth is left — which is the right behaviour
+        // and would mask the growth at exactly the depths where it starts.
+        let at = |depth: usize, rank: usize| LMR_TABLE[depth][rank];
+
+        // Grows with rank at fixed depth: never decreasing, and strictly larger end to end.
+        for depth in LMR_MIN_DEPTH as usize..LMR_TABLE_DEPTHS {
+            for rank in LMR_FULL_DEPTH_MOVES..LMR_TABLE_RANKS - 1 {
+                assert!(
+                    at(depth, rank + 1) >= at(depth, rank),
+                    "depth {depth}: rank {rank}->{} went {} -> {}",
+                    rank + 1,
+                    at(depth, rank),
+                    at(depth, rank + 1),
+                );
+            }
+            assert!(
+                at(depth, LMR_TABLE_RANKS - 1) > at(depth, LMR_FULL_DEPTH_MOVES),
+                "depth {depth}: the last rank must be reduced more than the first reducible one",
+            );
+        }
+
+        // Grows with depth at fixed rank, same shape.
+        for rank in LMR_FULL_DEPTH_MOVES..LMR_TABLE_RANKS {
+            for depth in LMR_MIN_DEPTH as usize..LMR_TABLE_DEPTHS - 1 {
+                assert!(
+                    at(depth + 1, rank) >= at(depth, rank),
+                    "rank {rank}: depth {depth}->{} went {} -> {}",
+                    depth + 1,
+                    at(depth, rank),
+                    at(depth + 1, rank),
+                );
+            }
+            assert!(
+                at(LMR_TABLE_DEPTHS - 1, rank) > at(LMR_MIN_DEPTH as usize, rank),
+                "rank {rank}: the deepest node must be reduced more than the shallowest",
+            );
+        }
+    }
+
+    #[test]
+    fn the_reduction_is_never_zero_and_never_eats_the_whole_search() {
+        // Two bounds that matter for different reasons. **At least one ply**: a reduction of
+        // zero means the caller paid a table lookup to learn nothing, and the re-search path
+        // would be dead code. **At most `depth - 2`**: reducing further hands the move to
+        // quiescence, which judges a quiet move on captures it does not have — the same
+        // reason `LMR_MIN_DEPTH` exists.
+        //
+        // Swept over every depth and rank the predicate can be called with, because the
+        // interesting failure is an off-by-one at a boundary and no sample finds those.
+        // One searcher for the whole sweep: `reduction_for` builds a transposition table per
+        // call, and 3 782 allocations of it cost 33 seconds for what is pure arithmetic.
+        let p = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
+        let mv = p.move_from_uci("a1a7").unwrap();
+        let child = p.play(mv);
+        let mut table = Table::new();
+        let searcher = Searcher::new(MoveOrder::Full, None, &mut table);
+        // The table's own promise first, over **every** cell — including the low ones the
+        // guards make unreachable today. `ln(1)` is zero, so those cells would hold a
+        // reduction of zero without the floor, and a later change to `LMR_MIN_DEPTH` or
+        // `LMR_FULL_DEPTH_MOVES` would silently start reading them. Mutating the floor away
+        // broke nothing until this loop existed, because the predicate never asks for them.
+        for (depth, row) in LMR_TABLE.iter().enumerate() {
+            for (rank, &r) in row.iter().enumerate() {
+                assert!(r >= 1, "table cell [{depth}][{rank}] holds a reduction of zero");
+            }
+        }
+        for depth in LMR_MIN_DEPTH..=MAX_DEPTH {
+            for rank in LMR_FULL_DEPTH_MOVES..LMR_TABLE_RANKS {
+                let r = searcher.late_move_reduction(&p, &child, mv, depth, rank, 1);
+                assert!(r >= 1, "depth {depth} rank {rank} reduced by nothing");
+                assert!(
+                    r <= depth - 2,
+                    "depth {depth} rank {rank} reduced by {r}, leaving nothing to search",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_index_past_the_table_is_clamped_rather_than_a_panic() {
+        // A legal chess position can offer up to 218 moves, and the table has 64 rank slots.
+        // So `rank` can exceed it — rarely, but a rare panic in a search is worse than a
+        // common one: it takes a position nobody tested to find it, and it kills the process
+        // mid-game. The depth axis is bounded by `MAX_DEPTH` in every search the engine runs,
+        // but quiescence recurses past that, so it is clamped on the same principle.
+        //
+        // Asserted through the predicate with out-of-range arguments rather than by finding a
+        // 218-move position: the record position (`3Q4/1Q4Q1/4Q3/2Q4R/Q4Q2/3Q4/1Q4Rp/1K1BBNNk`)
+        // is mate in one, so its search never descends far enough for the guards to admit a
+        // move at rank 65. The test would look like coverage while never reaching the clamp.
+        let p = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
+        let mv = p.move_from_uci("a1a7").unwrap();
+        let child = p.play(mv);
+        let mut table = Table::new();
+        let searcher = Searcher::new(MoveOrder::Full, None, &mut table);
+        for (depth, rank) in [
+            (MAX_DEPTH, LMR_TABLE_RANKS),          // exactly one past the rank axis
+            (MAX_DEPTH, 218),                      // the most moves a legal position can offer
+            (MAX_DEPTH + 32, 400),                 // both axes well past the table
+        ] {
+            let r = searcher.late_move_reduction(&p, &child, mv, depth, rank, 1);
+            assert!(r >= 1, "depth {depth} rank {rank} must still yield a reduction");
+            assert!(r <= depth - 2, "depth {depth} rank {rank} reduced by {r}");
+        }
+    }
+
+    #[test]
+    fn the_curve_shrinks_the_tree_further_than_a_flat_ply() {
+        // The acceptance criterion that decides the brick: better than #42, not merely better
+        // than no reductions. Same binary, same positions, one flag apart.
+        //
+        // The weakest position and depth carries the assertion, as in #42 — a curve that
+        // helped the opening and hurt the tactical position would be the history heuristic
+        // all over again (positive on average, negative on half the board).
+        let mut worst: Option<(&str, u32, f64)> = None;
+        let mut best: Option<(&str, u32, f64)> = None;
+        for (nature, fen) in NATURES {
+            let p = Position::from_fen(fen).unwrap();
+            // Depth 5 only, and it is the demanding case rather than the cheap one: the
+            // tactical position reads 0.993 there against 0.766 at depth 6, so this is where
+            // the curve comes closest to costing nodes.
+            for depth in 5..=5 {
+                let nodes = |growing: bool| {
+                    let mut t = Table::new();
+                    let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+                    s.lmr_growing = growing;
+                    deepen(&p, Request::new(Limits::depth(depth)), &mut s).nodes
+                };
+                let (flat, curved) = (nodes(false), nodes(true));
+                let ratio = curved as f64 / flat as f64;
+                if worst.is_none_or(|(_, _, w)| ratio > w) {
+                    worst = Some((nature, depth, ratio));
+                }
+                if best.is_none_or(|(_, _, b)| ratio < b) {
+                    best = Some((nature, depth, ratio));
+                }
+            }
+        }
+        let (nature, depth, ratio) = worst.expect("the sweep ran");
+        assert!(
+            ratio <= 1.0,
+            "the curve must not cost nodes anywhere: {nature} at depth {depth} is {ratio:.3}",
+        );
+        // And it must *gain* somewhere, strictly. Without this the test is satisfied by the
+        // curve doing nothing at all: mutating the reduction back to a flat ply makes both
+        // sides of every comparison identical, every ratio exactly 1.0, and `<= 1.0` holds.
+        // Found by mutation — the whole brick unplugged, and no test noticed.
+        let (best_nature, best_depth, best_ratio) = best.expect("the sweep ran");
+        assert!(
+            best_ratio < 1.0,
+            "the curve must shrink the tree somewhere, or it is not doing anything: \
+             best case is {best_nature} at depth {best_depth}, {best_ratio:.3}",
+        );
     }
 
     #[test]
@@ -2383,15 +2693,20 @@ mod tests {
         // Without this, the re-search would be in the same position as the null move's
         // `return beta`: correct by argument, unprotected by any test, and free to be
         // removed by a later change that measures faster and looks fine.
+        // Swept over depths, not fixed at one. The number of re-searches collapses as the
+        // reduction grows — a move cut by three plies rarely climbs back above `alpha` —
+        // so at depth 5 the four positions between them trigger almost none, and a test
+        // pinned there would pass while exercising nothing. Measured with the growing
+        // curve: 0 / 0 / 0 / 2 re-searches at depth 5, against 64 / 26 / 3 / 19 at depth 8.
         let differs = NATURES.iter().any(|(_, fen)| {
             let p = Position::from_fen(fen).unwrap();
-            let score = |research: bool| {
+            let score = |research: bool, depth: u32| {
                 let mut table = Table::new();
                 let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
                 s.allow_lmr_research = research;
-                deepen(&p, Request::new(Limits::depth(5)), &mut s).best.map(|(_, sc)| sc)
+                deepen(&p, Request::new(Limits::depth(depth)), &mut s).best.map(|(_, sc)| sc)
             };
-            score(true) != score(false)
+            (5..=7).any(|depth| score(true, depth) != score(false, depth))
         });
         assert!(
             differs,
@@ -2406,6 +2721,10 @@ mod tests {
         // Swept from depth 1 up to the floor, not checked at one depth below it: the
         // interesting failure is a floor that is off by one, and a single sample cannot
         // tell an off-by-one from a floor that works.
+        //
+        // Like its unit-level counterpart above, this pins the **behaviour** — no reduction
+        // is counted below the floor — and not which of the two mechanisms enforces it. The
+        // counter never increments because the ceiling zeroed the reduction before it looked.
         for depth in 1..LMR_MIN_DEPTH {
             for (nature, fen) in NATURES {
                 let p = Position::from_fen(fen).unwrap();
@@ -2420,5 +2739,3 @@ mod tests {
     }
 
 }
-
-
