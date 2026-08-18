@@ -129,6 +129,21 @@ static PASSED_MASK: LazyLock<[[u64; 64]; 2]> = LazyLock::new(|| {
 const PASSED_MIDDLEGAME: [i32; 8] = [0, 5, 10, 18, 32, 55, 85, 0];
 const PASSED_ENDGAME: [i32; 8] = [0, 8, 13, 21, 36, 60, 90, 0];
 
+/// The square immediately in front of a pawn of `color` standing on `square`, or `None` if
+/// there is none — which for a pawn can only mean the promotion rank, since a pawn never
+/// stands on its own first rank.
+///
+/// "In front" is the direction of travel, so it flips with the colour: one rank up the board
+/// for White, one down for Black. The board is laid out `a1` = 0 with eight squares per rank,
+/// so that is ±8.
+fn square_ahead(square: usize, color: Color) -> Option<usize> {
+    match color {
+        Color::White if square < 56 => Some(square + 8),
+        Color::Black if square >= 8 => Some(square - 8),
+        _ => None,
+    }
+}
+
 /// Whether the pawn on `square` (given as an index, `a1` = 0) has no enemy pawn able to stop
 /// it — nothing on its file or the two beside it, anywhere ahead.
 fn is_passed(square: usize, color: Color, enemy_pawns: u64) -> bool {
@@ -171,8 +186,23 @@ pub fn evaluate(pos: &Position) -> i32 {
                 let enemy = pawns[!color as usize];
                 if is_passed(sq as usize, color, enemy) {
                     let rank = square / 8;
-                    mg += PASSED_MIDDLEGAME[rank];
-                    eg += PASSED_ENDGAME[rank];
+                    let (mut bonus_mg, mut bonus_eg) =
+                        (PASSED_MIDDLEGAME[rank], PASSED_ENDGAME[rank]);
+                    // A passed pawn with something standing on the square in front of it is
+                    // not running anywhere. The schedule above prices a pawn by how far it
+                    // has come; this asks whether it can still go further, which is the one
+                    // piece of context that costs a single lookup.
+                    //
+                    // Halved rather than removed: a blockaded passer still ties down the
+                    // piece blockading it, and the blockade can be broken.
+                    if square_ahead(sq as usize, color)
+                        .is_some_and(|front| pos.piece_on(Square::index(front)).is_some())
+                    {
+                        bonus_mg /= 2;
+                        bonus_eg /= 2;
+                    }
+                    mg += bonus_mg;
+                    eg += bonus_eg;
                 }
             }
             phase += phase_weight(piece);
@@ -609,6 +639,82 @@ mod tests {
                 "{why} — `{fen}` square {square} for {color:?}",
             );
         }
+    }
+
+    #[test]
+    fn a_blockaded_passer_is_worth_less_than_a_running_one() {
+        // The context the bare schedule ignores: a passed pawn with something standing in
+        // front of it is not going anywhere, yet a rank-6 passer blocked by a king was priced
+        // exactly like one with an open road.
+        //
+        // Compared against its own baseline rather than against the free pawn directly: the
+        // blocking piece carries its own material and square value, which would swamp the
+        // difference being measured.
+        let free = Position::from_fen("4k3/8/8/3P4/8/8/8/4K3 w - - 0 1").unwrap();
+        let blocked = Position::from_fen("4k3/8/3n4/3P4/8/8/8/4K3 w - - 0 1").unwrap();
+        let bare = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let knight_only = Position::from_fen("4k3/8/3n4/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let running = evaluate(&free) - evaluate(&bare);
+        let stopped = evaluate(&blocked) - evaluate(&knight_only);
+        assert!(
+            stopped < running,
+            "a blockaded passer must be worth less: {stopped} against {running}",
+        );
+        // And still worth *more than a pawn that is not passed at all*, because halving rather
+        // than removing is the design choice.
+        //
+        // Comparing `stopped > 0` would not test that: a pawn is worth 100 centipawns before
+        // any bonus, so that assertion stays true with the bonus zeroed. Found by mutation —
+        // "zero the bonus instead of halving it" broke nothing. The residual has to be
+        // isolated against a pawn on the *same square* that is blocked *and* not passed.
+        let blocked_not_passed =
+            Position::from_fen("4k3/8/3p4/3P4/8/8/8/4K3 w - - 0 1").unwrap();
+        let pawn_only = Position::from_fen("4k3/8/3p4/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let no_bonus_at_all = evaluate(&blocked_not_passed) - evaluate(&pawn_only);
+        assert!(
+            stopped > no_bonus_at_all,
+            "a blockaded passer must keep part of its bonus: {stopped} against \
+             {no_bonus_at_all} for a pawn that is blocked and not passed",
+        );
+    }
+
+    #[test]
+    fn the_square_ahead_follows_the_direction_of_travel() {
+        // "In front" flips with the colour, and getting it backwards would halve the bonus of
+        // every pawn with a piece *behind* it while leaving genuinely blockaded ones at full
+        // value — a mistake that changes no test above and no compile.
+        assert_eq!(square_ahead(Square::D5 as usize, Color::White), Some(Square::D6 as usize));
+        assert_eq!(square_ahead(Square::D5 as usize, Color::Black), Some(Square::D4 as usize));
+        // The promotion rank has nothing ahead of it. A pawn never stands there, but the
+        // lookup must not wrap around the board into a square on the other side.
+        assert_eq!(square_ahead(Square::D8 as usize, Color::White), None);
+        assert_eq!(square_ahead(Square::D1 as usize, Color::Black), None);
+        // Every other square yields a real neighbour on the same file.
+        for sq in 8..56usize {
+            for color in [Color::White, Color::Black] {
+                let ahead = square_ahead(sq, color).expect("a square in the middle has one");
+                assert_eq!(ahead % 8, sq % 8, "the file must not change");
+                assert_eq!(ahead.abs_diff(sq), 8, "exactly one rank");
+            }
+        }
+    }
+
+    #[test]
+    fn a_friendly_piece_blocks_just_as_an_enemy_one_does() {
+        // A deliberate choice, recorded because the usual engines only count enemy blockers:
+        // this one counts any piece. A pawn cannot advance through its own knight either, and
+        // the simpler rule is the one being measured. If a later brick distinguishes the two,
+        // this test is what will have to change, and on purpose.
+        // The black king sits on a8, not e8: a white knight on d6 attacks e8, and a position
+        // where the side *not* to move is in check is illegal — `from_fen` rejects it.
+        let own = Position::from_fen("k7/8/3N4/3P4/8/8/8/4K3 w - - 0 1").unwrap();
+        let own_baseline = Position::from_fen("k7/8/3N4/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let free = Position::from_fen("k7/8/8/3P4/8/8/8/4K3 w - - 0 1").unwrap();
+        let bare = Position::from_fen("k7/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        assert!(
+            evaluate(&own) - evaluate(&own_baseline) < evaluate(&free) - evaluate(&bare),
+            "a pawn cannot advance through its own piece either",
+        );
     }
 
     #[test]
