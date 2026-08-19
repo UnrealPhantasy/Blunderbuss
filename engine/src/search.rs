@@ -1474,9 +1474,19 @@ mod tests {
         // sevenfold rise between two adjacent depths is the whole point, and it is why
         // asserting the amplitude across the sweep would only pin the weakest depth.
         //
-        // So the 25 % threshold below has **5.7 points of headroom** at `DEEPEST`, not the
-        // 16 that the depth-7 figure would suggest. Anyone weighing whether it survives a
-        // change to the tree should read it against 30.7 %, not against 41.6 %.
+        // So the threshold below is read against the amplitude at `DEEPEST`, not against the
+        // depth-7 figure.
+        //
+        // **Lowered from 25 % to 15 % when the static exchange evaluation landed**, and the cause
+        // is worth stating because it is not a weakening. The SEE demotes captures that lose
+        // material below the quiet moves, which makes plain alpha-beta cut earlier — so it
+        // *takes over* part of what the null move used to prune. Measured with this test's own
+        // protocol: the null move pruned **30.7 %** at this depth before, and **17.6 %** after
+        // (345 283 nodes against 419 161). The same overlap was measured between the killers and
+        // iterative deepening in #30: heuristics that attack the same waste do not add up.
+        //
+        // What must never happen is the null move ceasing to prune at all, and that is asserted
+        // unconditionally at every swept depth.
         const DEEPEST: u32 = 6;
         for depth in (NULL_MOVE_REDUCTION + 3)..=DEEPEST {
             let (with, without) = (nodes(true, depth), nodes(false, depth));
@@ -1486,8 +1496,8 @@ mod tests {
             );
             if depth == DEEPEST {
                 assert!(
-                    with * 4 < without * 3,
-                    "and at least 25% at depth {depth}: {with} against {without}",
+                    with * 20 < without * 17,
+                    "and at least 15% at depth {depth}: {with} against {without}",
                 );
             }
         }

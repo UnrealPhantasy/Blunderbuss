@@ -17,7 +17,7 @@
 //! positions at one ply usually share the same threat, so the refutation that
 //! worked next door tends to work here too.
 
-use crate::position::{Move, Piece, Position};
+use crate::position::{BitBoard, Color, Move, Piece, Position, Square};
 use crate::search::MAX_DEPTH;
 
 // Piece values used *for ordering only* (not for evaluation): only their relative
@@ -33,6 +33,103 @@ fn value(piece: Piece) -> i32 {
         // only here to make the match exhaustive.
         Piece::King => 20_000,
     }
+}
+
+
+/// The material a capture wins or loses once **both sides have taken turns recapturing** on the
+/// destination square — a static exchange evaluation.
+///
+/// # Why MVV-LVA is not enough
+///
+/// MVV-LVA ranks `pawn takes queen` above `queen takes pawn`, which is right, but it cannot see
+/// what happens *next*. `Nxd5` when d5 is defended by a pawn is scored as winning a knight's
+/// worth of material when it loses one. The search finds out — two plies later, having built the
+/// whole subtree first. This function answers the same question before the move is searched, for
+/// the cost of a few bitboard lookups.
+///
+/// # The algorithm, and the one thing that makes it non-trivial
+///
+/// Pieces capture on the square in turn, cheapest first, each side free to stop when continuing
+/// would lose material. The gains are accumulated on a stack and then folded back with a
+/// **negamax minimum**: a side only continues if doing so is better than standing pat.
+///
+/// What makes it more than a two-step calculation is **uncovering**. Removing the piece that just
+/// captured can reveal a sliding attacker behind it — a rook behind a rook, a queen behind a
+/// bishop. So the attacker set is recomputed at every step against the *current* hypothetical
+/// occupation, which is exactly what [`Position::attackers`] takes an `occupied` argument for.
+/// A version that computed the attackers once would misjudge every battery, and batteries are
+/// what exchange sequences are made of.
+///
+/// # What it deliberately does not handle
+///
+/// **En passant and promotions return 0** — "no information" — rather than a wrong number. The
+/// captured pawn of an en passant is not on the destination square, and a promotion changes the
+/// value of the capturing piece mid-sequence; both need special cases that would earn their
+/// complexity only if this function were also used for pruning. It is used for *ordering*, where
+/// a missing verdict costs a few nodes and a wrong verdict costs a bad move order.
+pub fn see(pos: &Position, mv: Move) -> i32 {
+    let Some(victim) = pos.piece_on(mv.to) else {
+        return 0; // quiet move, or en passant — nothing to weigh on this square
+    };
+    let Some(attacker) = pos.piece_on(mv.from) else {
+        return 0;
+    };
+    if mv.promotion.is_some() {
+        return 0; // the capturing piece changes value mid-sequence — out of scope
+    }
+
+    // `gain[d]` is the material balance for the side to move at depth `d`, assuming the exchange
+    // stops there. Thirty-two is more than any legal sequence: every step removes a piece.
+    let mut gain = [0i32; 32];
+    gain[0] = value(victim);
+    let mut on_square = value(attacker);
+    let mut occupied = pos.occupied() ^ mv.from.bitboard();
+    let mut side = !pos.side_to_move();
+    let mut d = 0usize;
+
+    loop {
+        d += 1;
+        gain[d] = on_square - gain[d - 1];
+        let Some((square, piece)) = cheapest_attacker(pos, mv.to, side, occupied) else {
+            break;
+        };
+        on_square = value(piece);
+        occupied ^= square.bitboard();
+        side = !side;
+        if d + 1 >= gain.len() {
+            break;
+        }
+    }
+    // Fold back: at each step the side to move takes the exchange only if it beats stopping.
+    while d > 1 {
+        d -= 1;
+        gain[d - 1] = -std::cmp::max(-gain[d - 1], gain[d]);
+    }
+    gain[0]
+}
+
+/// The least valuable piece of `color` attacking `square` under `occupied`, if any.
+///
+/// Cheapest first is not a heuristic here but the rule of the exchange: recapturing with the
+/// queen when a pawn would do loses material the sequence would otherwise keep.
+fn cheapest_attacker(
+    pos: &Position,
+    square: Square,
+    color: Color,
+    occupied: BitBoard,
+) -> Option<(Square, Piece)> {
+    let attackers = pos.attackers(square, color, occupied);
+    if attackers.is_empty() {
+        return None;
+    }
+    for piece in [Piece::Pawn, Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen, Piece::King]
+    {
+        let of_type = attackers & pos.pieces_of(color, piece);
+        if let Some(sq) = of_type.next_square() {
+            return Some((sq, piece));
+        }
+    }
+    None
 }
 
 /// The MVV-LVA score of a move.
@@ -180,6 +277,17 @@ impl Default for Killers {
 // capture 990 000 against best killer 900 002. A test pins the property, rather
 // than trusting an eyeball on the constants.
 const CAPTURE_BASE: i32 = 1_000_000;
+
+/// Where a capture goes once the exchange evaluation says it loses material.
+///
+/// **Below the quiet moves**, which is the whole point. `Nxd5` into a defended square is not a
+/// slightly worse capture to try fifth — it is a move that loses a knight, and it belongs after
+/// every ordinary developing move. MVV-LVA cannot know that: it sees the victim and stops.
+///
+/// Far enough below zero that the worst losing capture (a queen for nothing, about -900) still
+/// lands above nothing else's score, and losing captures stay ordered among themselves —
+/// least catastrophic first.
+const LOSING_CAPTURE_BASE: i32 = -1_000_000;
 const KILLER_BASE: i32 = 900_000;
 
 /// The ordering score of a move: captures, then killers, then the rest.
@@ -189,6 +297,17 @@ fn score(pos: &Position, mv: Move, killers: KillerSlots) -> i32 {
     // scores negative (see above) and en passant scores 0, so both would land among
     // the quiet moves and be tried *after* a killer. One predicate decides.
     if !is_quiet(pos, mv) {
+        // The exchange evaluation is consulted before MVV-LVA gets to speak. A capture that
+        // loses material is demoted below the quiet moves; everything else keeps the MVV-LVA
+        // ordering, which is a good ranking among captures that are worth making.
+        //
+        // `see` answers 0 for en passant and for capturing promotions — "no information" rather
+        // than a wrong number — so those keep their MVV-LVA place instead of being demoted on a
+        // verdict that was never given.
+        let exchange = see(pos, mv);
+        if exchange < 0 {
+            return LOSING_CAPTURE_BASE + exchange;
+        }
         return CAPTURE_BASE + mvv_lva(pos, mv);
     }
     match killers.slot_of(mv) {
@@ -201,9 +320,14 @@ fn score(pos: &Position, mv: Move, killers: KillerSlots) -> i32 {
 /// Sorts `moves` in place: best captures first, then the killers of this node,
 /// then the remaining quiet moves.
 pub fn order_moves(pos: &Position, moves: &mut [Move], killers: KillerSlots) {
-    // Idiom: `sort_by_key` with `Reverse` sorts by the key in *descending* order,
-    // so the highest score comes first.
-    moves.sort_by_key(|&mv| std::cmp::Reverse(score(pos, mv, killers)));
+    // Idiom: `sort_by_cached_key` computes each key **once** and sorts the keys, where
+    // `sort_by_key` is free to recompute a key on every comparison. That distinction did not
+    // matter while the key was a table lookup; it matters now that scoring a capture runs a
+    // static exchange evaluation, which walks a sequence of bitboard lookups. Sorting 40 moves
+    // could otherwise pay for the same exchange a dozen times.
+    //
+    // `Reverse` sorts by the key in *descending* order, so the highest score comes first.
+    moves.sort_by_cached_key(|&mv| std::cmp::Reverse(score(pos, mv, killers)));
 }
 
 #[cfg(test)]
@@ -263,29 +387,38 @@ mod tests {
     }
 
     #[test]
-    fn order_moves_sorts_all_captures_first_by_mvv_lva() {
-        // White has several captures of different victims (queen e5, knight c5,
-        // pawn a6) plus quiet moves.
+    fn winning_captures_lead_and_stay_sorted_by_mvv_lva() {
+        // White has captures of three different victims (queen e5, knight c5, pawn a6) plus
+        // quiet moves. Of the three, **Rxa6 loses 400 centipawns** — the pawn is defended by
+        // the knight — so it is no longer among the captures that lead.
+        //
+        // This test asserted "every capture comes before every quiet move" until the exchange
+        // evaluation landed. That sentence was the contract of MVV-LVA alone; it is not the
+        // contract any more, and the test says what replaced it instead of being weakened.
         let p = Position::from_fen("7k/8/p7/2n1q3/3P4/8/8/R5K1 w - - 0 1").unwrap();
         let mut moves = p.legal_moves();
         order_moves(&p, &mut moves, KillerSlots::none());
 
         let is_capture = |mv: Move| p.piece_on(mv.to).is_some();
-        let captures = moves.iter().copied().filter(|&mv| is_capture(mv)).count();
-        assert!(captures >= 3, "expected several captures, got {captures}");
+        let winning = |mv: Move| is_capture(mv) && see(&p, mv) >= 0;
+        let lead = moves.iter().copied().filter(|&mv| winning(mv)).count();
+        assert_eq!(lead, 2, "expected exactly the two captures worth making");
 
-        // Every capture comes before every quiet move.
-        assert!(moves[..captures].iter().all(|&mv| is_capture(mv)), "captures must lead");
-        assert!(moves[captures..].iter().all(|&mv| !is_capture(mv)), "quiet moves must follow");
+        assert!(moves[..lead].iter().all(|&mv| winning(mv)), "winning captures must lead");
+        assert!(
+            moves[lead..].iter().all(|&mv| !winning(mv)),
+            "and nothing worth making may follow the quiet moves",
+        );
 
-        // Captures are sorted by non-increasing MVV-LVA score.
-        let scores: Vec<i32> = moves[..captures].iter().map(|&mv| mvv_lva(&p, mv)).collect();
+        // Among themselves, they keep the MVV-LVA order: the exchange evaluation decides
+        // *whether* a capture is worth trying, MVV-LVA decides in *which order*.
+        let scores: Vec<i32> = moves[..lead].iter().map(|&mv| mvv_lva(&p, mv)).collect();
         assert!(scores.windows(2).all(|w| w[0] >= w[1]), "captures not sorted: {scores:?}");
     }
 
     // Three captures of different value (dxe5 a queen, dxc5 a knight, Rxa6 a pawn)
     // and fourteen quiet moves: enough of both to tell the bands apart.
-    const CAPTURES_AND_QUIETS: &str = "7k/8/p7/2n1q3/3P4/8/8/R5K1 w - - 0 1";
+    pub(super) const CAPTURES_AND_QUIETS: &str = "7k/8/p7/2n1q3/3P4/8/8/R5K1 w - - 0 1";
     // Two quiet moves of that position, the last ones the generator emits — so a
     // killer promoting them has to cross the whole quiet band to reach the front.
     const QUIET_A: &str = "g1g2";
@@ -316,9 +449,16 @@ mod tests {
     }
 
     #[test]
-    fn captures_still_come_before_killers() {
-        // Including Rxa6, a pawn taken by a rook — the least valuable capture there
-        // is, and the one a killer would overtake if the bands were too close.
+    fn winning_captures_come_before_killers_and_losing_ones_after() {
+        // The rule as the exchange evaluation leaves it, and this position states it perfectly.
+        // Its three captures are dxc5 (SEE +220), dxe5 (+900) and **Rxa6 (SEE -400)** — the
+        // rook takes a pawn defended by the knight on c5.
+        //
+        // Before the SEE this test asserted that *every* capture precedes the killer, and named
+        // Rxa6 as "the least valuable capture there is, the one a killer would overtake if the
+        // bands were too close". That was the intent then; the measurement says Rxa6 loses 400
+        // centipawns and belongs after every ordinary quiet move, not fifth. The test is updated
+        // rather than relaxed: it now pins **both** sides of the new rule.
         let p = Position::from_fen(CAPTURES_AND_QUIETS).unwrap();
         let killer = uci_move(&p, QUIET_A);
         let mut killers = Killers::new();
@@ -328,10 +468,28 @@ mod tests {
         order_moves(&p, &mut moves, killers.at(0));
 
         let killer_at = moves.iter().position(|&mv| mv == killer).unwrap();
-        let captures_after =
-            moves[killer_at..].iter().filter(|&&mv| !is_quiet(&p, mv)).count();
-        assert_eq!(captures_after, 0, "every capture must be tried before the killer");
-        assert_eq!(killer_at, 3, "the three captures, then the killer");
+        let winning_after = moves[killer_at..]
+            .iter()
+            .filter(|&&mv| !is_quiet(&p, mv) && see(&p, mv) >= 0)
+            .count();
+        assert_eq!(winning_after, 0, "no capture worth making may be tried after the killer");
+        assert_eq!(killer_at, 2, "the two winning captures, then the killer");
+
+        let losing = uci_move(&p, "a1a6");
+        let losing_at = moves.iter().position(|&mv| mv == losing).unwrap();
+        assert!(
+            losing_at > killer_at,
+            "a capture that loses material must be tried after the killer, not before",
+        );
+        let quiet_after_losing = moves[losing_at..]
+            .iter()
+            .filter(|&&mv| is_quiet(&p, mv) && Some(mv) != Some(killer))
+            .count();
+        assert_eq!(
+            quiet_after_losing, 0,
+            "and after *every* quiet move: {losing_at} of {}",
+            moves.len(),
+        );
     }
 
     #[test]
@@ -362,8 +520,31 @@ mod tests {
         let best_killer = *killer_scores.iter().max().unwrap();
         let worst_killer = *killer_scores.iter().min().unwrap();
         let best_quiet = *quiet.iter().max().expect("quiet moves exist");
-        assert!(worst_capture > best_killer, "{worst_capture} vs {best_killer}");
+        // Four bands now, not three. The captures split: those the exchange evaluation
+        // endorses stay on top, those it condemns fall below everything.
+        let winning: Vec<i32> = moves
+            .iter()
+            .copied()
+            .filter(|&mv| !is_quiet(&p, mv) && see(&p, mv) >= 0)
+            .map(band)
+            .collect();
+        let losing: Vec<i32> = moves
+            .iter()
+            .copied()
+            .filter(|&mv| !is_quiet(&p, mv) && see(&p, mv) < 0)
+            .map(band)
+            .collect();
+        assert!(!losing.is_empty(), "precondition: this position has a losing capture (Rxa6)");
+        let worst_winning = *winning.iter().min().expect("winning captures exist");
+        let best_losing = *losing.iter().max().unwrap();
+        assert!(worst_winning > best_killer, "{worst_winning} vs {best_killer}");
         assert!(worst_killer > best_quiet, "{worst_killer} vs {best_quiet}");
+        let worst_quiet = *quiet.iter().min().expect("quiet moves exist");
+        assert!(
+            worst_quiet > best_losing,
+            "a losing capture must rank below the worst quiet move: {worst_quiet} vs {best_losing}",
+        );
+        let _ = worst_capture;
 
         // The extreme the bases were sized for, and the one this position does not
         // contain: a king taking a pawn is the lowest `mvv_lva` reachable (−10 000),
@@ -518,4 +699,77 @@ mod tests {
         assert!(!is_quiet(&ep, uci_move(&ep, "e5d6")), "en passant is a capture");
         assert!(is_quiet(&ep, uci_move(&ep, "e5e6")), "the pawn push is quiet");
     }
+
+    // ------------------------------------------------------- static exchange evaluation
+
+    fn see_of(fen: &str, uci: &str) -> i32 {
+        let p = Position::from_fen(fen).unwrap();
+        let mv = p.move_from_uci(uci).unwrap();
+        see(&p, mv)
+    }
+
+    // Every expected value below is computed **by hand from the rules**, not read off the
+    // implementation. That direction matters: asserting what the code returns would pin a bug as
+    // firmly as a feature, and an exchange evaluation is precisely the kind of code whose bugs
+    // are invisible — a wrong sign costs nodes and a bad move order, never a crash.
+
+    #[test]
+    fn an_undefended_capture_is_worth_the_piece() {
+        // Rd1xd5 takes a knight nobody defends: the black king on e8 is far away.
+        // By hand: +320, the sequence ends immediately.
+        assert_eq!(see_of("4k3/8/8/3n4/8/8/8/K2R4 w - - 0 1", "d1d5"), 320);
+    }
+
+    #[test]
+    fn a_defended_capture_costs_the_difference() {
+        // Same, but a pawn on c6 defends d5. Rxd5 wins a knight (320) and loses a rook (500)
+        // to cxd5. By hand: 320 - 500 = **-180**. MVV-LVA scores this move *positively* — it
+        // sees the knight and not the recapture, which is the whole reason this function exists.
+        assert_eq!(see_of("4k3/8/2p5/3n4/8/8/8/K2R4 w - - 0 1", "d1d5"), -180);
+    }
+
+    #[test]
+    fn an_even_trade_is_worth_nothing() {
+        // dxc5 takes a pawn, bxc5 takes it back. By hand: 100 - 100 = 0. A zero here must not be
+        // confused with "no information": the caller distinguishes them, and this is the value
+        // that separates a losing capture from an acceptable one.
+        assert_eq!(see_of("4k3/8/1p6/2p5/3P4/8/8/4K3 w - - 0 1", "d4c5"), 0);
+    }
+
+    #[test]
+    fn a_battery_behind_the_capturing_piece_is_counted() {
+        // **The case that makes this more than arithmetic.** White rooks on d1 and d2, black rook
+        // on d5 defended by a knight on c6.
+        //
+        // Rd2xd5 (+500), Nxd5 (-500), and now the rook on d1 — which was *behind* the one that
+        // captured and attacked nothing at the start — recaptures the knight (+320).
+        // By hand: 500 - 500 + 320 = **+320**.
+        //
+        // An implementation that computed the attacker set once, before the sequence, would stop
+        // after two steps and answer 0. That is why `Position::attackers` takes a hypothetical
+        // occupation rather than reading the board.
+        assert_eq!(see_of("4k3/8/1n6/3r4/8/8/3R4/3RK3 w - - 0 1", "d2d5"), 320);
+    }
+
+    #[test]
+    fn what_the_evaluation_declines_to_judge_returns_zero() {
+        // En passant (the captured pawn is not on the destination square) and promotions (the
+        // capturing piece changes value mid-sequence) return 0 — "no information" — rather than a
+        // number that would be wrong. Both are documented as out of scope, and a test says so, so
+        // that a future reader does not mistake the zero for "this capture is even".
+        let ep = Position::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1").unwrap();
+        let mv = ep.move_from_uci("e5d6").unwrap();
+        assert_eq!(see(&ep, mv), 0, "en passant is out of scope");
+
+        let promo = Position::from_fen("3r3k/4P3/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let mv = promo.move_from_uci("e7d8q").unwrap();
+        assert_eq!(see(&promo, mv), 0, "a capturing promotion is out of scope");
+    }
+
+    #[test]
+    fn a_quiet_move_has_no_exchange_to_evaluate() {
+        assert_eq!(see_of("4k3/8/8/8/8/8/8/K2R4 w - - 0 1", "d1d5"), 0);
+    }
+
+
 }

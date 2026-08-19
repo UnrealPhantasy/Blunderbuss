@@ -35,6 +35,14 @@ pub use cozy_chess::Piece;
 /// A board square (a1 … h8), used to read what sits on a move's endpoints.
 pub use cozy_chess::Square;
 
+/// A set of squares, one bit per square.
+///
+/// Exposed because the static exchange evaluation in [`crate::ordering`] needs to reason about
+/// *hypothetical* occupations: "who would attack this square once these two pieces have left it".
+/// That is a question about the rules, so the primitive belongs here; what to do with the answer
+/// is move ordering, and stays in maison.
+pub use cozy_chess::BitBoard;
+
 /// The status of a position, purely from the rules' point of view.
 ///
 /// Deliberately coarse for this first brick: it mirrors what `cozy-chess` can
@@ -173,6 +181,43 @@ impl Position {
     /// First version: we fill a `Vec`. Move ordering and staged generation (not
     /// producing everything at once) belong to the engine and will come later —
     /// they are out of scope here.
+    /// Every square currently holding a piece.
+    pub fn occupied(&self) -> BitBoard {
+        self.0.occupied()
+    }
+
+    /// The squares holding `piece` of `color`.
+    pub fn pieces_of(&self, color: Color, piece: Piece) -> BitBoard {
+        self.0.pieces(piece) & self.0.colors(color)
+    }
+
+    /// Which pieces of `color` attack `square`, under a **hypothetical** occupation.
+    ///
+    /// `occupied` is passed rather than read from the board because that is the whole point: a
+    /// static exchange evaluation removes pieces one by one as they capture, and each removal can
+    /// **uncover** a sliding attacker behind the one that left. Asking the real board would miss
+    /// every battery — a rook behind a rook, a queen behind a bishop — and those are exactly the
+    /// exchanges an exchange evaluation exists to get right.
+    ///
+    /// Pawn attacks are looked up *from the target square with the opposite colour*: the squares
+    /// a white pawn attacks from are the squares a black pawn attacks, mirrored. That inversion
+    /// is the one place this function is easy to get backwards, so it is stated rather than
+    /// implied.
+    pub fn attackers(&self, square: Square, color: Color, occupied: BitBoard) -> BitBoard {
+        use cozy_chess::{get_bishop_moves, get_king_moves, get_knight_moves, get_pawn_attacks,
+                         get_rook_moves};
+        let mine = self.0.colors(color);
+        let bishops = self.0.pieces(Piece::Bishop) | self.0.pieces(Piece::Queen);
+        let rooks = self.0.pieces(Piece::Rook) | self.0.pieces(Piece::Queen);
+        ((get_pawn_attacks(square, !color) & self.0.pieces(Piece::Pawn))
+            | (get_knight_moves(square) & self.0.pieces(Piece::Knight))
+            | (get_king_moves(square) & self.0.pieces(Piece::King))
+            | (get_bishop_moves(square, occupied) & bishops)
+            | (get_rook_moves(square, occupied) & rooks))
+            & mine
+            & occupied
+    }
+
     pub fn legal_moves(&self) -> Vec<Move> {
         let mut moves = Vec::new();
         // cozy-chess idiom: generation is a *visitor*. We pass it an `FnMut`
