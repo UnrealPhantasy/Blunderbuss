@@ -2941,15 +2941,28 @@ mod tests {
     }
 
     #[test]
-    fn aspiration_returns_the_same_score_as_the_full_window() {
-        // **The property the whole brick rests on**: a narrow window is an optimisation, so it
-        // must not change the answer. It may not change it *approximately* either — the score is
-        // what the engine plays on.
+    fn aspiration_returns_a_valid_score_never_a_bound() {
+        // **The property the whole brick rests on**, stated as strongly as the search actually
+        // guarantees it — which is not "the same number".
         //
-        // The score, never the move: a narrower window changes the order in which values are
-        // established, and the piege already paid in this repository is that any reordering can
-        // pick a different move among moves of *equal* score. Requiring the same move would be
-        // asserting an invariant the search does not offer.
+        // A first version asserted strict equality with a full-window search. It passes on this
+        // branch alone and **fails as soon as SEE pruning is merged alongside** (#56): 20 against
+        // 25 on the opening at depth 7. That is not a bug in either brick. Alpha-beta with a
+        // transposition table returns *a* valid value, not *the* value: a stored `Lower`/`Upper`
+        // bound is a fact about a position under one window, and reused under a different window
+        // it cuts elsewhere and yields another number, equally correct. #36 measured the same
+        // effect between a fresh engine and one that had been playing — 1 to 2% of plies, worst
+        // gap 29 cp.
+        //
+        // This is the **fourth** time this repository has written a criterion demanding
+        // reproducibility where the contract is a bound (#19, #27, #36). The question to ask of
+        // such an assertion: *am I requiring the search to be reproducible, or to be right?*
+        //
+        // So: the verdict must agree (same side of zero, same mate-or-not) and the gap must stay
+        // within what a reused bound explains. A genuine failure — accepting a bound as a score —
+        // moves the value by hundreds of centipawns, and mutating the `Window::Exact` check away
+        // still breaks this test.
+        const TOLERANCE: i32 = 30;
         for (nature, fen) in NATURES {
             let p = Position::from_fen(fen).unwrap();
             for depth in 4..=7u32 {
@@ -2958,8 +2971,20 @@ mod tests {
                 let a = with.stats.best.expect("a move at the root").1;
                 let b = without.stats.best.expect("a move at the root").1;
                 assert_eq!(
-                    a, b,
-                    "{nature} at depth {depth}: aspiration changed the score, {a} against {b}",
+                    a.abs() > MATE_THRESHOLD,
+                    b.abs() > MATE_THRESHOLD,
+                    "{nature} at depth {depth}: one search found a mate and the other did not, \
+                     {a} against {b}",
+                );
+                assert_eq!(
+                    a.signum(),
+                    b.signum(),
+                    "{nature} at depth {depth}: the verdict flipped sides, {a} against {b}",
+                );
+                assert!(
+                    (a - b).abs() <= TOLERANCE,
+                    "{nature} at depth {depth}: {a} against {b} — beyond what a reused bound \
+                     explains",
                 );
             }
         }
