@@ -3033,13 +3033,20 @@ mod tests {
         // that here rather than writing a search-level test that would pass while exercising
         // nothing: an inert test is worse than an absent one, because it counts as coverage.
         //
-        // What this test does and does not hold, established by mutation. Removing the guard
-        // entirely breaks this test and `a_searcher_without_an_iteration_extends_nothing`, so
-        // the guard is wired to something. But changing the budget from 2 to 1 breaks
-        // **nothing at all**, here or anywhere: the sweep below is written against the
-        // constant, so it follows the value rather than pinning it, and no real search comes
-        // near the boundary. The budget's *shape* is tested; its *value* rests on the argument
-        // in the constant's own documentation, which is that it must never bind in practice.
+        // What this test holds, and what holds the rest, established by mutation. Removing the
+        // guard breaks this test and `a_searcher_without_an_iteration_extends_nothing`, so the
+        // guard is wired to something. The sweep below is written against the constant, so it
+        // follows the value rather than pinning it — it tests the budget's *shape*, never its
+        // *value*.
+        //
+        // The value is pinned elsewhere, and it took a second pass to get there. Lowering the
+        // budget from 2 to 1 initially broke **nothing at all**, because the only counter that
+        // could have noticed — `extensions_refused` — was written and never read. It is now
+        // asserted to stay at zero in
+        // `only_an_extension_lets_a_branch_pass_its_nominal_depth`, which that mutation does
+        // break. The budget is meant to be a belt that is never pulled tight, so "no real
+        // search reaches it" is the property worth asserting, and asserting it is also what
+        // keeps the counter from being dead weight.
         let p = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
         let check = p.move_from_uci("a1a8").unwrap();
         for root_depth in 1..=16u32 {
@@ -3073,13 +3080,27 @@ mod tests {
         assert_eq!(extension_for(&p, check, 1, 0, 0), 0);
     }
 
-    fn extended(pos: &Position, depth: u32, scope: Option<u32>) -> (SearchStats, i32, u64, u64) {
+    struct Extended {
+        stats: SearchStats,
+        max_ply: i32,
+        granted: u64,
+        refused: u64,
+        also_reduced: u64,
+    }
+
+    fn extended(pos: &Position, depth: u32, scope: Option<u32>) -> Extended {
         let mut table = Table::new();
         let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
         s.allow_extensions = scope.is_some();
         s.ext_max_depth = scope.unwrap_or(0);
         let stats = deepen(pos, Request::new(Limits::depth(depth)), &mut s);
-        (stats, s.max_ply, s.extensions, s.extended_and_reduced)
+        Extended {
+            stats,
+            max_ply: s.max_ply,
+            granted: s.extensions,
+            refused: s.extensions_refused,
+            also_reduced: s.extended_and_reduced,
+        }
     }
 
     #[test]
@@ -3094,28 +3115,47 @@ mod tests {
         for (nature, fen) in NATURES {
             let p = Position::from_fen(fen).unwrap();
             for depth in 3..=6u32 {
-                let (_, plain, ext_count, _) = extended(&p, depth, None);
+                let plain = extended(&p, depth, None);
                 assert_eq!(
-                    plain, depth as i32,
+                    plain.max_ply, depth as i32,
                     "{nature} at depth {depth}: without extensions the deepest ply must be \
                      the nominal depth, and nothing else may push past it",
                 );
-                assert_eq!(ext_count, 0, "precondition: the control must extend nothing");
+                assert_eq!(plain.granted, 0, "precondition: the control must extend nothing");
 
-                let (_, deeper, granted, _) = extended(&p, depth, Some(CHECK_EXTENSION_MAX_DEPTH));
-                assert!(granted > 0, "precondition: {nature} at depth {depth} must extend something");
+                let with = extended(&p, depth, Some(CHECK_EXTENSION_MAX_DEPTH));
                 assert!(
-                    deeper > depth as i32,
+                    with.granted > 0,
+                    "precondition: {nature} at depth {depth} must extend something",
+                );
+                assert!(
+                    with.max_ply > depth as i32,
                     "{nature} at depth {depth}: an extension must actually deepen the branch, \
-                     reached {deeper}",
+                     reached {}",
+                    with.max_ply,
                 );
                 // The measured excess is +3 at worst over 42 position/depth pairs, a perpetual
                 // included, where the ply budget allows `+depth`. Asserted at +4 so that a
                 // scope change shows up here loudly rather than only in the node counts.
                 assert!(
-                    deeper <= depth as i32 + 4,
-                    "{nature} at depth {depth}: reached ply {deeper}, far past what the scope \
+                    with.max_ply <= depth as i32 + 4,
+                    "{nature} at depth {depth}: reached ply {}, far past what the scope \
                      should allow",
+                    with.max_ply,
+                );
+                // The ply budget must stay a belt that is never pulled tight. It is asserted
+                // here rather than left as a remark because the alternative was a dead
+                // counter: nothing read `extensions_refused`, and #42 established that a
+                // counter no test reads is deleted, not kept for later. Read this way it
+                // earns its place — the day a scope change makes the budget bind, this fails
+                // and says so, and the predicate-level test of the budget stops being enough
+                // on its own.
+                assert_eq!(
+                    with.refused, 0,
+                    "{nature} at depth {depth}: the ply budget refused {} extensions — it is \
+                     meant to be unreachable in a real search, so either the scope grew or the \
+                     budget shrank",
+                    with.refused,
                 );
             }
         }
@@ -3135,11 +3175,15 @@ mod tests {
         for (nature, fen) in NATURES {
             let p = Position::from_fen(fen).unwrap();
             for depth in 3..=6u32 {
-                let (_, _, granted, both) = extended(&p, depth, Some(CHECK_EXTENSION_MAX_DEPTH));
-                assert!(granted > 0, "precondition: {nature} at depth {depth} must extend something");
+                let e = extended(&p, depth, Some(CHECK_EXTENSION_MAX_DEPTH));
+                assert!(
+                    e.granted > 0,
+                    "precondition: {nature} at depth {depth} must extend something",
+                );
                 assert_eq!(
-                    both, 0,
-                    "{nature} at depth {depth}: {both} moves were both extended and reduced",
+                    e.also_reduced, 0,
+                    "{nature} at depth {depth}: {} moves were both extended and reduced",
+                    e.also_reduced,
                 );
             }
         }
@@ -3166,10 +3210,10 @@ mod tests {
         ];
         for (fen, depth) in HIDDEN_MATES {
             let p = Position::from_fen(fen).unwrap();
-            let (plain, ..) = extended(&p, depth, None);
-            let (with, ..) = extended(&p, depth, Some(CHECK_EXTENSION_MAX_DEPTH));
-            let plain_score = plain.best.expect("a move at the root").1;
-            let with_score = with.best.expect("a move at the root").1;
+            let plain = extended(&p, depth, None);
+            let with = extended(&p, depth, Some(CHECK_EXTENSION_MAX_DEPTH));
+            let plain_score = plain.stats.best.expect("a move at the root").1;
+            let with_score = with.stats.best.expect("a move at the root").1;
             assert!(
                 plain_score < MATE_THRESHOLD,
                 "precondition: without the extension, {fen} at depth {depth} must NOT see a \
@@ -3197,23 +3241,16 @@ mod tests {
         const DEPTH: u32 = 6;
         for (nature, fen) in NATURES {
             let p = Position::from_fen(fen).unwrap();
-            let (chosen, ..) = extended(&p, DEPTH, Some(CHECK_EXTENSION_MAX_DEPTH));
-            let (everywhere, ..) = extended(&p, DEPTH, Some(MAX_DEPTH));
+            let chosen = extended(&p, DEPTH, Some(CHECK_EXTENSION_MAX_DEPTH)).stats.nodes;
+            let everywhere = extended(&p, DEPTH, Some(MAX_DEPTH)).stats.nodes;
             if nature == "endgame" {
                 assert!(
-                    chosen.nodes < everywhere.nodes,
+                    chosen < everywhere,
                     "{nature}: the chosen scope must cost strictly less than extending every \
-                     check, {} against {}",
-                    chosen.nodes,
-                    everywhere.nodes,
+                     check, {chosen} against {everywhere}",
                 );
             } else {
-                assert!(
-                    chosen.nodes <= everywhere.nodes,
-                    "{nature}: {} against {}",
-                    chosen.nodes,
-                    everywhere.nodes,
-                );
+                assert!(chosen <= everywhere, "{nature}: {chosen} against {everywhere}");
             }
         }
     }
@@ -3231,9 +3268,9 @@ mod tests {
         let mut worst: Option<(&str, f64)> = None;
         for (nature, fen) in NATURES {
             let p = Position::from_fen(fen).unwrap();
-            let (plain, ..) = extended(&p, DEPTH, None);
-            let (with, ..) = extended(&p, DEPTH, Some(CHECK_EXTENSION_MAX_DEPTH));
-            let ratio = with.nodes as f64 / plain.nodes as f64;
+            let plain = extended(&p, DEPTH, None).stats.nodes;
+            let with = extended(&p, DEPTH, Some(CHECK_EXTENSION_MAX_DEPTH)).stats.nodes;
+            let ratio = with as f64 / plain as f64;
             if worst.is_none_or(|(_, w)| ratio > w) {
                 worst = Some((nature, ratio));
             }
