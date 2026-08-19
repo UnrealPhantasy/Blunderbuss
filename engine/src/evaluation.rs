@@ -192,6 +192,30 @@ static ADJACENT_FILES: LazyLock<[u64; 8]> = LazyLock::new(|| {
 /// Both values stay at the bottom of the 10-20 centipawn range the literature gives, for the
 /// reason #46 established: the same term at two amplitudes returned −5 and +17 with identical
 /// draw figures, so the signal pays and the magnitude only buys risk.
+/// # Measured worth: nothing, and that is the finding
+///
+/// **11 600 anchored games** against a strength-limited Stockfish, accumulated over twelve runs:
+///
+/// | version | games | strength | vs baseline |
+/// |---|---|---|---|
+/// | without this term | 3 600 | 1846 ± 11 | — |
+/// | with it | 4 800 | 1845 ± 10 | **−1 ± 15** |
+/// | with it, passers exempt | 3 200 | 1843 ± 12 | −3 ± 16 |
+///
+/// A direct duel against our own previous build measured **+35 ± 30** for the same code. That
+/// figure was real and meant nothing: it measured the punishment of a blind spot only *our*
+/// clone had. Stockfish has known about pawn structure for thirty years, so there was nothing
+/// left to punish and the gain vanished at the anchor.
+///
+/// **The rule that follows, and it applies before writing any evaluation term**: ask whether the
+/// anchor opponent already knows this. If it does, the duel against our own clone is structurally
+/// flattering and only the anchored measurement counts. Pawn structure — yes, hence a factor of
+/// zero. Search reductions — no, hence null-move's factor of 1.05.
+///
+/// Kept rather than deleted because one hypothesis remains untested: this is the *only* structural
+/// pawn term in the evaluation, and one weakness among none may be below whatever threshold
+/// changes a move choice. Doubled and backward pawns share these masks and this insertion point;
+/// if either measures positive alone, the three together are worth one more measurement.
 const ISOLATED_MIDDLEGAME: i32 = 14;
 const ISOLATED_ENDGAME: i32 = 6;
 
