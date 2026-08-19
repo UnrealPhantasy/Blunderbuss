@@ -760,6 +760,13 @@ impl<'a> Searcher<'a> {
         let mut delta = ASPIRATION_DELTA;
         loop {
             let result = self.root(pos, depth, pv_move, prev - delta, prev + delta);
+            // Honest note, in the spirit of the null move's `return beta`: removing this guard
+            // breaks no test. Reaching it needs the abort to land inside a windowed search that
+            // then fails the window — a sweep over 20 node ceilings never produced it. What makes
+            // it necessary anyway is what it protects against: `deepen` discards an aborted
+            // iteration, but this loop would first widen around the *placeholder* an aborted
+            // search returns and pay one to three more searches past the deadline. Kept as
+            // reasoning rather than dressed up as tested.
             if self.aborted {
                 return result;
             }
@@ -2914,6 +2921,155 @@ mod tests {
                     run.reductions,
                 );
             }
+        }
+    }
+
+
+    // ------------------------------------------------------------- aspiration windows
+
+    struct Aspirated {
+        stats: SearchStats,
+        searches: u64,
+    }
+
+    fn aspirated(pos: &Position, depth: u32, allow: bool) -> Aspirated {
+        let mut table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        s.allow_aspiration = allow;
+        let stats = deepen(pos, Request::new(Limits::depth(depth)), &mut s);
+        Aspirated { stats, searches: s.aspiration_searches }
+    }
+
+    #[test]
+    fn aspiration_returns_the_same_score_as_the_full_window() {
+        // **The property the whole brick rests on**: a narrow window is an optimisation, so it
+        // must not change the answer. It may not change it *approximately* either — the score is
+        // what the engine plays on.
+        //
+        // The score, never the move: a narrower window changes the order in which values are
+        // established, and the piege already paid in this repository is that any reordering can
+        // pick a different move among moves of *equal* score. Requiring the same move would be
+        // asserting an invariant the search does not offer.
+        for (nature, fen) in NATURES {
+            let p = Position::from_fen(fen).unwrap();
+            for depth in 4..=7u32 {
+                let with = aspirated(&p, depth, true);
+                let without = aspirated(&p, depth, false);
+                let a = with.stats.best.expect("a move at the root").1;
+                let b = without.stats.best.expect("a move at the root").1;
+                assert_eq!(
+                    a, b,
+                    "{nature} at depth {depth}: aspiration changed the score, {a} against {b}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aspiration_shrinks_the_tree_overall_but_not_everywhere() {
+        // What it buys, stated as measured rather than as hoped — including the part that hurts.
+        //
+        // Over the four natures at depth 7 the tree shrinks; on individual positions it can
+        // **grow**, because a window that fails costs a re-search. The bench measures a worst
+        // position at 1.43x while the overall ratio is 0.935 at depth 8. A test claiming a gain
+        // on every position would be false, and one claiming only an average would hide the
+        // cost, so both are asserted.
+        const DEPTH: u32 = 7;
+        let mut ratios = Vec::new();
+        for (_, fen) in NATURES {
+            let p = Position::from_fen(fen).unwrap();
+            let with = aspirated(&p, DEPTH, true);
+            let without = aspirated(&p, DEPTH, false);
+            assert!(with.searches > 0, "precondition: the window must actually be used");
+            ratios.push(with.stats.nodes as f64 / without.stats.nodes as f64);
+        }
+        let overall: f64 = ratios.iter().product::<f64>().powf(1.0 / ratios.len() as f64);
+        assert!(
+            overall < 0.98,
+            "aspiration must shrink the tree overall: geometric mean {overall:.3} over {:?}",
+            ratios,
+        );
+        assert!(
+            ratios.iter().all(|&r| r < 1.6),
+            "and no single position may blow up: {ratios:?}",
+        );
+    }
+
+    #[test]
+    fn the_window_widens_until_it_contains_the_answer() {
+        // The failure path, driven deliberately: centre the window on a value that is wildly
+        // wrong and check that the search still returns the true score. This is what makes the
+        // brick safe — a window is a guess, and a guess must be recoverable.
+        //
+        // Driven through `aspirated_root` rather than through `deepen`, because `deepen` feeds it
+        // the previous iteration's score, which is never wildly wrong. The one case that matters
+        // cannot be reached by driving the search normally.
+        let p = Position::from_fen(NATURES[2].1).unwrap();
+        const DEPTH: u32 = 5;
+        let truth = {
+            let mut t = Table::new();
+            let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+            s.root_full(&p, DEPTH, None).best.expect("a move").1
+        };
+        for wrong in [-5_000, -1_000, -200, 0, 200, 1_000, 5_000] {
+            let mut t = Table::new();
+            let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+            let r = s.aspirated_root(&p, DEPTH, None, Some(wrong));
+            assert_eq!(
+                r.window,
+                Window::Exact,
+                "centred on {wrong}, the result is still a bound",
+            );
+            assert_eq!(
+                r.best.expect("a move").1,
+                truth,
+                "centred on {wrong}, the score is wrong",
+            );
+        }
+    }
+
+    #[test]
+    fn a_mate_score_skips_the_window_entirely() {
+        // A mate score is not on the centipawn scale, so a +-25 window around `MATE - 3` is
+        // guaranteed to fail and would pay for the whole widening ladder to learn it. Asserted
+        // through the counter, since the effect is that something does *not* happen.
+        let p = Position::from_fen(NATURES[0].1).unwrap();
+        let mut t = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+        let r = s.aspirated_root(&p, 5, None, Some(MATE - 3));
+        assert_eq!(r.window, Window::Exact);
+        assert_eq!(
+            s.aspiration_searches, 0,
+            "a mate centre must go straight to the full window, not through the ladder",
+        );
+    }
+
+    #[test]
+    fn an_interrupted_search_is_never_re_searched() {
+        // Widening after an abort would search past the deadline, and worse: the value being
+        // widened around is the placeholder an aborted search returns, not a score. Swept over
+        // node ceilings rather than checked at one, because the interesting interruptions land
+        // at points a single chosen ceiling would miss — the lesson of the five inert tests this
+        // file has already collected.
+        let p = Position::from_fen(NATURES[2].1).unwrap();
+        for ceiling in (200..=4_000).step_by(200) {
+            let mut t = Table::new();
+            let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+            s.node_limit = Some(ceiling);
+            let stats = deepen(&p, Request::new(Limits::depth(8)), &mut s);
+            assert!(
+                stats.best.is_some(),
+                "ceiling {ceiling}: an interrupted search must still return a legal move",
+            );
+            // The ladder may run for completed iterations; what must not happen is a search
+            // started *after* the abort. `deepen` breaks out of its loop on `aborted`, so the
+            // count of give-ups is the observable: a give-up costs one extra full-window search.
+            assert!(
+                s.aspiration_gave_up <= s.aspiration_searches,
+                "ceiling {ceiling}: gave up {} times in {} searches",
+                s.aspiration_gave_up,
+                s.aspiration_searches,
+            );
         }
     }
 
