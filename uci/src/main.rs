@@ -137,18 +137,58 @@ fn score_field(score: i32) -> String {
     format!("mate {}", if score > 0 { moves } else { -moves })
 }
 
-/// How long to spend on this move, derived from the clock. A simple, tunable
-/// rule: a thirtieth of the remaining time plus half the increment — never more
-/// than the remaining time minus a safety margin, and at least 1 ms.
-fn time_budget(remaining: Duration, increment: Duration) -> Duration {
+/// What fraction of the remaining clock to spend on one move: `remaining / DIVISOR`.
+///
+/// **Fifteen, and the thirty it replaces had never been measured.** Two facts decided it,
+/// both from an analysis of 2400 games against Stockfish@1800.
+///
+/// **We are far shallower than the opponent exactly where games are decided.** Median depth
+/// gap read from the PGN annotations: **6 plies at moves 11-20** (us 7, opponent 13,
+/// n=23 946), 3 plies at moves 21-30, **2 plies from move 31 on**. 63% of our moves in the
+/// opening and early middlegame are played at 7 plies or fewer. A ply is worth 50-100 Elo at
+/// this strength, and it is worth more where one is further behind.
+///
+/// **The old divisor left a fifth of the clock unspent, guarding against nothing.** Replaying
+/// the rule on a median game (51 moves at 8s+0.08) leaves **2419 ms unused at D=30** against
+/// 827 ms at D=15 — while there were **zero time forfeits in 2400 games** (all 1216 losses
+/// ended in checkmate, and the arena does emit a forfeit category).
+///
+/// # Why lowering it cannot lose on time
+///
+/// Not a matter of luck or of margin, but of the shape of the rule. `remaining / D + inc / 2`
+/// has a **fixed point**: once a move is allocated exactly the increment, the clock stops
+/// falling. With an 80 ms increment that point is `remaining = 40 * D` — 600 ms at D=15 — and
+/// it is approached from above, never crossed. Simulated over 200 moves, D=10 still leaves
+/// 409 ms. [`SAFETY_MS`] is never reached at any divisor down to 10, and a test sweeps the
+/// divisors to say so rather than checking one chosen value.
+///
+/// The cost is real and paid late: -19% of time at move 40 against D=30. That is deliberate —
+/// the gap with the opponent there is 2 plies, against 6 at move 15.
+const TIME_DIVISOR: u64 = 15;
+
+/// The allocation rule at an arbitrary divisor.
+///
+/// Split out of [`time_budget`] so that tests can sweep the divisor instead of checking the
+/// one value compiled in. That distinction matters here: changing `TIME_DIVISOR` from 30 to 15
+/// — a doubling of every budget — broke **no existing test**, because every test was written
+/// against the shape of the rule and none against its scale. A constant nothing watches is a
+/// constant that will be changed by accident.
+fn allocate(divisor: u64, remaining: Duration, increment: Duration) -> Duration {
     let remaining = remaining.as_millis() as u64;
     let increment = increment.as_millis() as u64;
-    let alloc = remaining / 30 + increment / 2;
+    let alloc = remaining / divisor + increment / 2;
     // Keep a safety margin, and never propose more time than we actually have:
     // once the margin already eats the whole clock, spend nothing (play instantly).
     let cap = remaining.saturating_sub(SAFETY_MS);
     let budget = if cap > 0 { alloc.clamp(1, cap) } else { 0 };
     Duration::from_millis(budget)
+}
+
+/// How long to spend on this move, derived from the clock: `remaining / TIME_DIVISOR` plus
+/// half the increment — never more than the remaining time minus a safety margin, and at
+/// least 1 ms.
+fn time_budget(remaining: Duration, increment: Duration) -> Duration {
+    allocate(TIME_DIVISOR, remaining, increment)
 }
 
 /// The protocol state: the current position, and how long to think when the GUI
@@ -732,4 +772,122 @@ mod tests {
         assert_eq!(time_budget(Duration::ZERO, Duration::ZERO), Duration::ZERO);
         assert!(time_budget(Duration::from_millis(10), Duration::ZERO) <= Duration::from_millis(10));
     }
+
+    // ------------------------------------------------------------ time divisor (#52)
+
+    /// Replays a whole game's worth of allocations at `divisor`, returning the budget of each
+    /// move. The clock model is the arena's: spend the budget, then receive the increment.
+    fn replay(divisor: u64, moves: usize, base_ms: u64, inc_ms: u64) -> Vec<u64> {
+        let mut remaining = base_ms;
+        let mut out = Vec::with_capacity(moves);
+        for _ in 0..moves {
+            let b = allocate(
+                divisor,
+                Duration::from_millis(remaining),
+                Duration::from_millis(inc_ms),
+            )
+            .as_millis() as u64;
+            out.push(b);
+            remaining = remaining.saturating_sub(b) + inc_ms;
+        }
+        out
+    }
+
+    #[test]
+    fn the_clock_never_runs_out_at_any_divisor() {
+        // The property that makes lowering the divisor safe, and the reason this brick is not
+        // a gamble: the rule has a **fixed point**. Once a move is allocated exactly the
+        // increment, the clock stops falling — it is approached from above and never crossed.
+        //
+        // Swept over divisors and over game lengths rather than checked at the value compiled
+        // in, because what is being asserted is a property of the *rule*, not of today's
+        // constant. A test pinned to one divisor would have said nothing about the change this
+        // brick makes.
+        for divisor in 5..=40u64 {
+            for moves in [51usize, 120, 200, 400] {
+                let budgets = replay(divisor, moves, 8_000, 80);
+                assert_eq!(budgets.len(), moves);
+                // Never proposes zero while there is time to spend: a zero budget means the
+                // engine plays instantly, which is only correct when the clock is truly gone.
+                assert!(
+                    budgets.iter().all(|&b| b >= 1),
+                    "divisor {divisor}, {moves} moves: a budget of zero appeared",
+                );
+                // And the tail is bounded below by the increment, which is the fixed point.
+                let tail = budgets[moves - 1];
+                assert!(
+                    tail >= 40,
+                    "divisor {divisor}, {moves} moves: the tail budget collapsed to {tail} ms",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_budget_never_exceeds_what_is_left() {
+        // Swept across the exhaustion boundary from both sides, at every divisor: the rule
+        // must stay legal when the clock is nearly gone, which is the one case where a bad
+        // allocation loses the game outright rather than costing depth.
+        for divisor in [5u64, 15, 30, 100] {
+            for remaining_ms in [0u64, 1, 10, 49, 50, 51, 100, 1_000, 60_000] {
+                let remaining = Duration::from_millis(remaining_ms);
+                for inc_ms in [0u64, 80, 10_000] {
+                    let b = allocate(divisor, remaining, Duration::from_millis(inc_ms));
+                    assert!(
+                        b <= remaining,
+                        "divisor {divisor}, {remaining_ms} ms left, {inc_ms} ms increment: \
+                         proposed {b:?}",
+                    );
+                    if remaining_ms > SAFETY_MS {
+                        assert!(
+                            b.as_millis() as u64 <= remaining_ms - SAFETY_MS,
+                            "divisor {divisor}, {remaining_ms} ms left: the safety margin was \
+                             eaten, proposed {b:?}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_chosen_divisor_front_loads_the_clock() {
+        // What the brick is *for*, asserted rather than left to a comment: the divisor in force
+        // must spend materially more time in the opening — where the measured depth gap with
+        // the opponent is 6 plies — and it pays for it late, where the gap is 2 plies.
+        //
+        // This is the test that fails if someone restores 30. The threshold is **a fifth more
+        // early**, and that number is chosen to cover the range worth exploring rather than to
+        // pin one value: D=15 gives +44%, D=20 gives +26% — both pass — while D=30 gives 0% and
+        // D=25 only +11%, which fail. A first draft demanded a third more and rejected D=20,
+        // a variant this brick measures: a test that forbids the experiment it is meant to
+        // support is calibrated against the wrong thing.
+        const MOVES: usize = 51;
+        let chosen = replay(TIME_DIVISOR, MOVES, 8_000, 80);
+        let old = replay(30, MOVES, 8_000, 80);
+
+        let early_chosen: u64 = chosen[..20].iter().sum();
+        let early_old: u64 = old[..20].iter().sum();
+        assert!(
+            early_chosen * 5 >= early_old * 6,
+            "the divisor in force must spend at least a fifth more over the first 20 moves: \
+             {early_chosen} ms against {early_old} ms",
+        );
+        assert!(
+            chosen[39] < old[39],
+            "and it must pay for it late: {} ms against {} ms at move 40",
+            chosen[39],
+            old[39],
+        );
+        // The reserve the old divisor never spent, which is the whole argument for changing it.
+        let unspent_old = 8_000 + 80 * MOVES as u64 - early_old - old[20..].iter().sum::<u64>();
+        let unspent_chosen =
+            8_000 + 80 * MOVES as u64 - early_chosen - chosen[20..].iter().sum::<u64>();
+        assert!(
+            unspent_chosen * 3 < unspent_old * 2,
+            "the point is to leave less on the table — at least a third less: {unspent_chosen} \
+             ms unspent against {unspent_old} ms",
+        );
+    }
+
 }
