@@ -2995,9 +2995,8 @@ mod tests {
         let p = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
         let quiet = p.move_from_uci("a1a7").unwrap();
         let check = p.move_from_uci("a1a8").unwrap();
-        assert_eq!(
+        assert!(
             p.play(check).in_check(),
-            true,
             "precondition: a1a8 must give check for this test to test anything",
         );
         assert_eq!(extension_for(&p, check, 1, 0, 8), 1, "a check must be extended");
