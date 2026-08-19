@@ -759,10 +759,14 @@ impl<'a> Searcher<'a> {
     /// are irrelevant" does not hold. Reducing a check is also how a reduction turns into
     /// a missed mate, since a forcing line is exactly what a shallower search stops
     /// seeing.
+    ///
+    /// `gives_check` arrives already computed rather than being asked here: the caller needs
+    /// the same fact to decide whether to *extend* the move, and detecting check means
+    /// generating attacks on the king, which is not free in the hottest loop of the engine.
     fn late_move_reduction(
         &self,
         pos: &Position,
-        child: &Position,
+        gives_check: bool,
         mv: Move,
         depth: u32,
         rank: usize,
@@ -779,7 +783,7 @@ impl<'a> Searcher<'a> {
             && is_quiet(pos, mv)
             && !self.killers_at(ply).contains(mv)
             && !pos.in_check()
-            && !child.in_check();
+            && !gives_check;
         if !reducible {
             return 0;
         }
@@ -933,11 +937,12 @@ impl<'a> Searcher<'a> {
         // Idiom: `enumerate` pairs each move with its index, which is what "late" means
         // here — how far down the ordered list the move sits.
         for (rank, &mv) in moves.iter().enumerate() {
-            // Bound to a local rather than left as a temporary inside the call: the
-            // gives-check guard needs to look at the resulting position, and the move was
-            // going to be played anyway, so asking costs nothing extra.
+            // Bound to locals rather than left as temporaries inside the calls: the move was
+            // going to be played anyway, and both the reduction guard and the extension read
+            // the same fact about the resulting position, so asking once serves both.
             let child = pos.play(mv);
-            let reduction = self.late_move_reduction(pos, &child, mv, depth, rank, ply);
+            let gives_check = child.in_check();
+            let reduction = self.late_move_reduction(pos, gives_check, mv, depth, rank, ply);
             #[cfg(test)]
             if reduction > 0 {
                 self.lmr_reductions += 1;
@@ -2307,7 +2312,7 @@ mod tests {
         if let Some(k) = killer {
             s.killers.record(pos, PLY as usize, k);
         }
-        s.late_move_reduction(pos, &pos.play(mv), mv, depth, rank, PLY)
+        s.late_move_reduction(pos, pos.play(mv).in_check(), mv, depth, rank, PLY)
     }
 
     // Deep enough and late enough that only the guard under test can return zero.
@@ -2545,7 +2550,7 @@ mod tests {
         }
         for depth in LMR_MIN_DEPTH..=MAX_DEPTH {
             for rank in LMR_FULL_DEPTH_MOVES..LMR_TABLE_RANKS {
-                let r = searcher.late_move_reduction(&p, &child, mv, depth, rank, 1);
+                let r = searcher.late_move_reduction(&p, child.in_check(), mv, depth, rank, 1);
                 assert!(r >= 1, "depth {depth} rank {rank} reduced by nothing");
                 assert!(
                     r <= depth - 2,
@@ -2577,7 +2582,7 @@ mod tests {
             (MAX_DEPTH, 218),                      // the most moves a legal position can offer
             (MAX_DEPTH + 32, 400),                 // both axes well past the table
         ] {
-            let r = searcher.late_move_reduction(&p, &child, mv, depth, rank, 1);
+            let r = searcher.late_move_reduction(&p, child.in_check(), mv, depth, rank, 1);
             assert!(r >= 1, "depth {depth} rank {rank} must still yield a reduction");
             assert!(r <= depth - 2, "depth {depth} rank {rank} reduced by {r}");
         }
