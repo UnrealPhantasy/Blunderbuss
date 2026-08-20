@@ -2887,6 +2887,94 @@ mod tests {
         (score, s.nodes)
     }
 
+    /// A deterministic pseudo-random walk, so the sweep below is reproducible.
+    ///
+    /// Rust idiom: a plain `struct` with one field and a method that mutates through
+    /// `&mut self`. Written by hand rather than pulled from a crate because a dependency for
+    /// sixteen bits of arithmetic is not worth a line in `Cargo.toml`, and because a fixed seed
+    /// is a *feature* here: a sweep whose positions change between runs cannot be compared
+    /// with its own previous result.
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    #[test]
+    #[ignore = "sweep: thousands of searches, run explicitly with --ignored"]
+    fn see_pruning_sweep_over_pseudo_random_play() {
+        // **What AC#3 was reaching for, measured instead of assumed.** The criterion asked for a
+        // score *identical* to an unpruned search. That is the wrong shape of claim — the fifth
+        // of its kind in this repository (#19, #27, #36, #42) — because a heuristic that drops
+        // captures may return a different, equally valid bound, exactly as alpha-beta always
+        // could. What matters is that no mate is lost and that the divergence stays bounded.
+        //
+        // Positions come from pseudo-random play rather than a hand-picked list: a list chosen
+        // by the author of the pruning is the one place its blind spots are least likely to be.
+        let mut rng = Xorshift(0x5EED_5EED);
+        let (mut comparisons, mut score_differs, mut move_differs) = (0u32, 0u32, 0u32);
+        let (mut worst_gap, mut mates_lost, mut mates_gained) = (0i32, 0u32, 0u32);
+
+        for game in 0..1_000 {
+            let mut pos = Position::from_fen(
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            )
+            .unwrap();
+            // Walk a random number of plies into the game, then compare at two depths. The walk
+            // length varies so the sweep sees openings, middlegames and thin endgames alike.
+            let plies = 4 + (game % 24);
+            for _ in 0..plies {
+                let moves = pos.legal_moves();
+                if moves.is_empty() {
+                    break;
+                }
+                pos = pos.play(moves[(rng.next() % moves.len() as u64) as usize]);
+            }
+            if pos.legal_moves().is_empty() {
+                continue;
+            }
+            for depth in [5u32, 6] {
+                let (pruned, _) = quiescence_pruned(&pos, depth, true);
+                let (full, _) = quiescence_pruned(&pos, depth, false);
+                let (Some((pm, ps)), Some((fm, fs))) = (pruned, full) else { continue };
+                comparisons += 1;
+                if ps != fs {
+                    score_differs += 1;
+                    worst_gap = worst_gap.max((ps - fs).abs());
+                }
+                if pm != fm {
+                    move_differs += 1;
+                }
+                let (pruned_mate, full_mate) =
+                    (ps.abs() > MATE_THRESHOLD, fs.abs() > MATE_THRESHOLD);
+                if full_mate && !pruned_mate {
+                    mates_lost += 1;
+                }
+                if pruned_mate && !full_mate {
+                    mates_gained += 1;
+                }
+            }
+        }
+
+        println!(
+            "sweep: {comparisons} comparisons | score differs {score_differs} \
+             ({:.1}%) | move differs {move_differs} | worst gap {worst_gap} cp | \
+             mates lost {mates_lost} | mates gained {mates_gained}",
+            100.0 * score_differs as f64 / comparisons as f64,
+        );
+
+        // **The claim that survives measurement**, and the only one asserted. A lost mate is the
+        // failure that would make the brick worthless; a differing bound is not.
+        assert!(comparisons > 100, "the sweep must actually compare something: {comparisons}");
+        assert_eq!(mates_lost, 0, "pruning must never lose a mate the full search found");
+        assert_eq!(mates_gained, 0, "nor invent one");
+    }
+
     #[test]
     fn pruning_never_filters_the_replies_of_a_side_in_check() {
         // White king on h1 is in check from the pawn on g2, which the pawn on h3 defends. The
