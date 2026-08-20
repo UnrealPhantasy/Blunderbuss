@@ -2864,22 +2864,62 @@ mod tests {
         }
     }
 
+    /// Runs **one** quiescence node on `pos`, returning its score and the nodes it spent.
+    ///
+    /// Going through `quiescence` rather than `deepen` is what makes the node count readable:
+    /// a full search spends nodes everywhere, and the effect under test is local to a single
+    /// in-check position.
+    fn quiescence_only(pos: &Position, prune: bool) -> (i32, u64) {
+        let mut table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        s.allow_see_pruning = prune;
+        let score = s.quiescence(pos, -INF, INF, 0);
+        (score, s.nodes)
+    }
+
     #[test]
-    fn a_side_in_check_keeps_every_reply() {
-        // The guard, and it protects against losing a mate: a side in check has no choice of
-        // exchange, so filtering its replies by material could drop the only legal escape.
-        //
-        // Black is in check from the rook on h8. (A first draft placed the king on g7, which the
-        // rook does not attack — the precondition caught it, which is what preconditions are for.)
-        let p = Position::from_fen("7R/7k/5N2/8/8/8/8/K7 b - - 0 1").unwrap();
-        assert!(p.in_check(), "precondition: black must be in check");
-        let legal = p.legal_moves();
-        assert!(!legal.is_empty(), "precondition: the position is not mate");
-        let (best, _) = quiescence_pruned(&p, 4, true);
-        assert!(
-            best.is_some(),
-            "a side in check must still find its reply when losing captures are pruned",
+    fn pruning_never_filters_the_replies_of_a_side_in_check() {
+        // White king on h1 is in check from the pawn on g2, which the pawn on h3 defends. The
+        // rook on g1 can take it, and that capture loses material: +100 (pawn), -500 (rook to
+        // hxg2), +100 (the king takes the pawn back) folds back to **-300**. It is therefore
+        // exactly what the pruning drops — except that the side to move is in check, where it
+        // has no choice of exchange.
+        let checked = Position::from_fen("k7/8/8/8/8/7p/6p1/6RK w - - 0 1").unwrap();
+        assert!(checked.in_check(), "precondition: white must be in check");
+        let cap: Vec<Move> = checked
+            .legal_moves()
+            .into_iter()
+            .filter(|&mv| !crate::ordering::is_quiet(&checked, mv))
+            .collect();
+        assert_eq!(cap.len(), 1, "precondition: exactly one capture is available");
+        assert!(crate::ordering::see(&checked, cap[0]) < 0, "precondition: it loses material");
+
+        // With the guard, pruning is inert on this position: same score, same nodes.
+        assert_eq!(
+            quiescence_only(&checked, true),
+            quiescence_only(&checked, false),
+            "a side in check must search every reply, pruning enabled or not",
         );
+
+        // **The witness, without which the equality above proves nothing.** Same losing capture,
+        // same evaluation, but the side to move is *not* in check — so pruning must bite, and the
+        // two searches must differ. If this ever stops differing, the comparison above has gone
+        // blind rather than the guard having held.
+        let quiet = Position::from_fen("4k3/8/2p5/3n4/8/8/8/K2R4 w - - 0 1").unwrap();
+        assert!(!quiet.in_check(), "precondition: white is not in check here");
+        let (_, pruned_nodes) = quiescence_only(&quiet, true);
+        let (_, full_nodes) = quiescence_only(&quiet, false);
+        assert!(
+            pruned_nodes < full_nodes,
+            "the witness must show pruning acting: {pruned_nodes} vs {full_nodes} nodes",
+        );
+
+        // What this test does **not** claim, because it was measured and is not true: the guard
+        // does not change any score. Removing it leaves every score here identical, and leaves
+        // all six positions of `pruning_losing_captures_keeps_every_forced_mate` identical at
+        // depths 4 and 6 too. The reason is structural — `best` starts at the stand-pat and only
+        // ever rises, so a reply that was never searched cannot pull the answer down. What the
+        // guard protects is which replies get searched, which is why the assertion counts nodes.
     }
 
 }
