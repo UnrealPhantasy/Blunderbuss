@@ -35,7 +35,6 @@ fn value(piece: Piece) -> i32 {
     }
 }
 
-
 /// The material a capture wins or loses once **both sides have taken turns recapturing** on the
 /// destination square — a static exchange evaluation.
 ///
@@ -277,17 +276,6 @@ impl Default for Killers {
 // capture 990 000 against best killer 900 002. A test pins the property, rather
 // than trusting an eyeball on the constants.
 const CAPTURE_BASE: i32 = 1_000_000;
-
-/// Where a capture goes once the exchange evaluation says it loses material.
-///
-/// **Below the quiet moves**, which is the whole point. `Nxd5` into a defended square is not a
-/// slightly worse capture to try fifth — it is a move that loses a knight, and it belongs after
-/// every ordinary developing move. MVV-LVA cannot know that: it sees the victim and stops.
-///
-/// Far enough below zero that the worst losing capture (a queen for nothing, about -900) still
-/// lands above nothing else's score, and losing captures stay ordered among themselves —
-/// least catastrophic first.
-const LOSING_CAPTURE_BASE: i32 = -1_000_000;
 const KILLER_BASE: i32 = 900_000;
 
 /// The ordering score of a move: captures, then killers, then the rest.
@@ -297,17 +285,6 @@ fn score(pos: &Position, mv: Move, killers: KillerSlots) -> i32 {
     // scores negative (see above) and en passant scores 0, so both would land among
     // the quiet moves and be tried *after* a killer. One predicate decides.
     if !is_quiet(pos, mv) {
-        // The exchange evaluation is consulted before MVV-LVA gets to speak. A capture that
-        // loses material is demoted below the quiet moves; everything else keeps the MVV-LVA
-        // ordering, which is a good ranking among captures that are worth making.
-        //
-        // `see` answers 0 for en passant and for capturing promotions — "no information" rather
-        // than a wrong number — so those keep their MVV-LVA place instead of being demoted on a
-        // verdict that was never given.
-        let exchange = see(pos, mv);
-        if exchange < 0 {
-            return LOSING_CAPTURE_BASE + exchange;
-        }
         return CAPTURE_BASE + mvv_lva(pos, mv);
     }
     match killers.slot_of(mv) {
@@ -320,14 +297,9 @@ fn score(pos: &Position, mv: Move, killers: KillerSlots) -> i32 {
 /// Sorts `moves` in place: best captures first, then the killers of this node,
 /// then the remaining quiet moves.
 pub fn order_moves(pos: &Position, moves: &mut [Move], killers: KillerSlots) {
-    // Idiom: `sort_by_cached_key` computes each key **once** and sorts the keys, where
-    // `sort_by_key` is free to recompute a key on every comparison. That distinction did not
-    // matter while the key was a table lookup; it matters now that scoring a capture runs a
-    // static exchange evaluation, which walks a sequence of bitboard lookups. Sorting 40 moves
-    // could otherwise pay for the same exchange a dozen times.
-    //
-    // `Reverse` sorts by the key in *descending* order, so the highest score comes first.
-    moves.sort_by_cached_key(|&mv| std::cmp::Reverse(score(pos, mv, killers)));
+    // Idiom: `sort_by_key` with `Reverse` sorts by the key in *descending* order,
+    // so the highest score comes first.
+    moves.sort_by_key(|&mv| std::cmp::Reverse(score(pos, mv, killers)));
 }
 
 #[cfg(test)]
@@ -387,38 +359,29 @@ mod tests {
     }
 
     #[test]
-    fn winning_captures_lead_and_stay_sorted_by_mvv_lva() {
-        // White has captures of three different victims (queen e5, knight c5, pawn a6) plus
-        // quiet moves. Of the three, **Rxa6 loses 400 centipawns** — the pawn is defended by
-        // the knight — so it is no longer among the captures that lead.
-        //
-        // This test asserted "every capture comes before every quiet move" until the exchange
-        // evaluation landed. That sentence was the contract of MVV-LVA alone; it is not the
-        // contract any more, and the test says what replaced it instead of being weakened.
+    fn order_moves_sorts_all_captures_first_by_mvv_lva() {
+        // White has several captures of different victims (queen e5, knight c5,
+        // pawn a6) plus quiet moves.
         let p = Position::from_fen("7k/8/p7/2n1q3/3P4/8/8/R5K1 w - - 0 1").unwrap();
         let mut moves = p.legal_moves();
         order_moves(&p, &mut moves, KillerSlots::none());
 
         let is_capture = |mv: Move| p.piece_on(mv.to).is_some();
-        let winning = |mv: Move| is_capture(mv) && see(&p, mv) >= 0;
-        let lead = moves.iter().copied().filter(|&mv| winning(mv)).count();
-        assert_eq!(lead, 2, "expected exactly the two captures worth making");
+        let captures = moves.iter().copied().filter(|&mv| is_capture(mv)).count();
+        assert!(captures >= 3, "expected several captures, got {captures}");
 
-        assert!(moves[..lead].iter().all(|&mv| winning(mv)), "winning captures must lead");
-        assert!(
-            moves[lead..].iter().all(|&mv| !winning(mv)),
-            "and nothing worth making may follow the quiet moves",
-        );
+        // Every capture comes before every quiet move.
+        assert!(moves[..captures].iter().all(|&mv| is_capture(mv)), "captures must lead");
+        assert!(moves[captures..].iter().all(|&mv| !is_capture(mv)), "quiet moves must follow");
 
-        // Among themselves, they keep the MVV-LVA order: the exchange evaluation decides
-        // *whether* a capture is worth trying, MVV-LVA decides in *which order*.
-        let scores: Vec<i32> = moves[..lead].iter().map(|&mv| mvv_lva(&p, mv)).collect();
+        // Captures are sorted by non-increasing MVV-LVA score.
+        let scores: Vec<i32> = moves[..captures].iter().map(|&mv| mvv_lva(&p, mv)).collect();
         assert!(scores.windows(2).all(|w| w[0] >= w[1]), "captures not sorted: {scores:?}");
     }
 
     // Three captures of different value (dxe5 a queen, dxc5 a knight, Rxa6 a pawn)
     // and fourteen quiet moves: enough of both to tell the bands apart.
-    pub(super) const CAPTURES_AND_QUIETS: &str = "7k/8/p7/2n1q3/3P4/8/8/R5K1 w - - 0 1";
+    const CAPTURES_AND_QUIETS: &str = "7k/8/p7/2n1q3/3P4/8/8/R5K1 w - - 0 1";
     // Two quiet moves of that position, the last ones the generator emits — so a
     // killer promoting them has to cross the whole quiet band to reach the front.
     const QUIET_A: &str = "g1g2";
@@ -449,16 +412,9 @@ mod tests {
     }
 
     #[test]
-    fn winning_captures_come_before_killers_and_losing_ones_after() {
-        // The rule as the exchange evaluation leaves it, and this position states it perfectly.
-        // Its three captures are dxc5 (SEE +220), dxe5 (+900) and **Rxa6 (SEE -400)** — the
-        // rook takes a pawn defended by the knight on c5.
-        //
-        // Before the SEE this test asserted that *every* capture precedes the killer, and named
-        // Rxa6 as "the least valuable capture there is, the one a killer would overtake if the
-        // bands were too close". That was the intent then; the measurement says Rxa6 loses 400
-        // centipawns and belongs after every ordinary quiet move, not fifth. The test is updated
-        // rather than relaxed: it now pins **both** sides of the new rule.
+    fn captures_still_come_before_killers() {
+        // Including Rxa6, a pawn taken by a rook — the least valuable capture there
+        // is, and the one a killer would overtake if the bands were too close.
         let p = Position::from_fen(CAPTURES_AND_QUIETS).unwrap();
         let killer = uci_move(&p, QUIET_A);
         let mut killers = Killers::new();
@@ -468,28 +424,10 @@ mod tests {
         order_moves(&p, &mut moves, killers.at(0));
 
         let killer_at = moves.iter().position(|&mv| mv == killer).unwrap();
-        let winning_after = moves[killer_at..]
-            .iter()
-            .filter(|&&mv| !is_quiet(&p, mv) && see(&p, mv) >= 0)
-            .count();
-        assert_eq!(winning_after, 0, "no capture worth making may be tried after the killer");
-        assert_eq!(killer_at, 2, "the two winning captures, then the killer");
-
-        let losing = uci_move(&p, "a1a6");
-        let losing_at = moves.iter().position(|&mv| mv == losing).unwrap();
-        assert!(
-            losing_at > killer_at,
-            "a capture that loses material must be tried after the killer, not before",
-        );
-        let quiet_after_losing = moves[losing_at..]
-            .iter()
-            .filter(|&&mv| is_quiet(&p, mv) && Some(mv) != Some(killer))
-            .count();
-        assert_eq!(
-            quiet_after_losing, 0,
-            "and after *every* quiet move: {losing_at} of {}",
-            moves.len(),
-        );
+        let captures_after =
+            moves[killer_at..].iter().filter(|&&mv| !is_quiet(&p, mv)).count();
+        assert_eq!(captures_after, 0, "every capture must be tried before the killer");
+        assert_eq!(killer_at, 3, "the three captures, then the killer");
     }
 
     #[test]
@@ -520,31 +458,8 @@ mod tests {
         let best_killer = *killer_scores.iter().max().unwrap();
         let worst_killer = *killer_scores.iter().min().unwrap();
         let best_quiet = *quiet.iter().max().expect("quiet moves exist");
-        // Four bands now, not three. The captures split: those the exchange evaluation
-        // endorses stay on top, those it condemns fall below everything.
-        let winning: Vec<i32> = moves
-            .iter()
-            .copied()
-            .filter(|&mv| !is_quiet(&p, mv) && see(&p, mv) >= 0)
-            .map(band)
-            .collect();
-        let losing: Vec<i32> = moves
-            .iter()
-            .copied()
-            .filter(|&mv| !is_quiet(&p, mv) && see(&p, mv) < 0)
-            .map(band)
-            .collect();
-        assert!(!losing.is_empty(), "precondition: this position has a losing capture (Rxa6)");
-        let worst_winning = *winning.iter().min().expect("winning captures exist");
-        let best_losing = *losing.iter().max().unwrap();
-        assert!(worst_winning > best_killer, "{worst_winning} vs {best_killer}");
+        assert!(worst_capture > best_killer, "{worst_capture} vs {best_killer}");
         assert!(worst_killer > best_quiet, "{worst_killer} vs {best_quiet}");
-        let worst_quiet = *quiet.iter().min().expect("quiet moves exist");
-        assert!(
-            worst_quiet > best_losing,
-            "a losing capture must rank below the worst quiet move: {worst_quiet} vs {best_losing}",
-        );
-        let _ = worst_capture;
 
         // The extreme the bases were sized for, and the one this position does not
         // contain: a king taking a pawn is the lowest `mvv_lva` reachable (−10 000),
