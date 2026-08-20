@@ -1506,13 +1506,23 @@ mod tests {
         // So the threshold below is read against the amplitude at `DEEPEST`, not against the
         // depth-7 figure.
         //
-        // **Lowered from 25 % to 15 % when the static exchange evaluation landed**, and the cause
-        // is worth stating because it is not a weakening. The SEE demotes captures that lose
-        // material below the quiet moves, which makes plain alpha-beta cut earlier — so it
-        // *takes over* part of what the null move used to prune. Measured with this test's own
-        // protocol: the null move pruned **30.7 %** at this depth before, and **17.6 %** after
-        // (345 283 nodes against 419 161). The same overlap was measured between the killers and
-        // iterative deepening in #30: heuristics that attack the same waste do not add up.
+        // **25 % on `main`, then 15 %, now 20 %**, and the round trip is worth recording because
+        // the middle step was wrong about its own cause. It was lowered when the SEE arrived, on
+        // the grounds that demoting losing captures makes plain alpha-beta cut earlier and so
+        // *takes over* part of what the null move used to prune — the overlap measured between
+        // the killers and iterative deepening in #30.
+        //
+        // The overlap was real; the mechanism was not. The demotion did not cut earlier, it
+        // **doubled this tree**: with the null move disabled, 419 161 nodes with the ordering
+        // against 217 250 without it, this test's own protocol either way. The null move then
+        // pruned a smaller *share* of a tree twice the size. Dropping the ordering (515d136)
+        // brings the share back to **25.1 %** (162 676 against 217 250), against 30.7 % on
+        // `main` and 17.6 % with the ordering — the rest of the gap being the quiescence
+        // pruning, which stays and shrinks the tree the null move would otherwise have cut.
+        //
+        // 20 % rather than 25 %: the measurement is 25.1 %, and a floor 0.1 point under its
+        // measurement is the calibrated coincidence this test's own comment warns against. The
+        // 5-point margin matches the one 25 % had on `main`.
         //
         // What must never happen is the null move ceasing to prune at all, and that is asserted
         // unconditionally at every swept depth.
@@ -1525,8 +1535,8 @@ mod tests {
             );
             if depth == DEEPEST {
                 assert!(
-                    with * 20 < without * 17,
-                    "and at least 15% at depth {depth}: {with} against {without}",
+                    with * 5 < without * 4,
+                    "and at least 20% at depth {depth}: {with} against {without}",
                 );
             }
         }
