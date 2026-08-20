@@ -137,13 +137,31 @@ fn score_field(score: i32) -> String {
     format!("mate {}", if score > 0 { moves } else { -moves })
 }
 
+/// The share of the remaining clock spent on one move: a thirtieth.
+///
+/// Named rather than inlined because it is the number two abandoned experiments tried to change
+/// — a lower fixed value, then a value rising with the move number. Both measured at zero, so the
+/// constant stays; but a sweep in the tests asserts a property of the *rule* rather than of this
+/// value, which is what a test pinned to `30` could not do.
+const TIME_DIVISOR: u64 = 30;
+
 /// How long to spend on this move, derived from the clock. A simple, tunable
 /// rule: a thirtieth of the remaining time plus half the increment — never more
 /// than the remaining time minus a safety margin, and at least 1 ms.
 fn time_budget(remaining: Duration, increment: Duration) -> Duration {
+    allocate(TIME_DIVISOR, remaining, increment)
+}
+
+/// The rule itself, with the divisor made an argument.
+///
+/// Splitting it out changes no behaviour — `time_budget` passes [`TIME_DIVISOR`] — and exists so
+/// the tests can sweep the divisor. What must hold is that the clock survives *any* divisor: the
+/// rule has a fixed point (once a move is allocated exactly the increment, the clock stops
+/// falling), and that is a property of the arithmetic, not of the constant compiled in today.
+fn allocate(divisor: u64, remaining: Duration, increment: Duration) -> Duration {
     let remaining = remaining.as_millis() as u64;
     let increment = increment.as_millis() as u64;
-    let alloc = remaining / 30 + increment / 2;
+    let alloc = remaining / divisor + increment / 2;
     // Keep a safety margin, and never propose more time than we actually have:
     // once the margin already eats the whole clock, spend nothing (play instantly).
     let cap = remaining.saturating_sub(SAFETY_MS);
@@ -711,6 +729,135 @@ mod tests {
     }
 
     // --- time allocation --------------------------------------------------------
+
+    #[test]
+    fn the_budget_never_exceeds_what_is_left_at_any_divisor() {
+        // **The invariant a bad allocation loses the game on**, rather than merely costing depth.
+        // Swept across the exhaustion boundary from both sides — the safety margin is 50 ms, so
+        // 49 / 50 / 51 are the three cases where the rule changes behaviour.
+        //
+        // Swept over the divisor too, because what is asserted is a property of the rule and not
+        // of today's constant: this number has been the object of two abandoned experiments, and
+        // a test pinned to 30 would have said nothing about either.
+        for divisor in [5u64, 15, 30, 40, 100] {
+            for remaining_ms in [0u64, 1, 10, 49, 50, 51, 100, 1_000, 60_000] {
+                for inc_ms in [0u64, 80, 10_000] {
+                    let remaining = Duration::from_millis(remaining_ms);
+                    let b = allocate(divisor, remaining, Duration::from_millis(inc_ms));
+                    assert!(
+                        b <= remaining,
+                        "divisor {divisor}, {remaining_ms} ms left, {inc_ms} ms increment: \
+                         proposed {b:?}, which is more than the clock holds",
+                    );
+                    if remaining_ms > SAFETY_MS {
+                        assert!(
+                            b.as_millis() as u64 <= remaining_ms - SAFETY_MS,
+                            "divisor {divisor}, {remaining_ms} ms left: the safety margin was \
+                             eaten, proposed {b:?}",
+                        );
+                        // And the other side of the same boundary: while there is time beyond the
+                        // margin, the engine must be given some of it. A zero budget means "play
+                        // instantly", which is only correct once the clock is genuinely gone —
+                        // otherwise it is a move thrown away. The share rounds to zero whenever
+                        // `remaining < divisor`, so without the one-millisecond floor this returns
+                        // nothing at divisor 100 with 51 ms left, and the mutation that removes
+                        // that floor passed every test in this file before this assertion existed.
+                        assert!(
+                            b >= Duration::from_millis(1),
+                            "divisor {divisor}, {remaining_ms} ms left, {inc_ms} ms increment: \
+                             proposed nothing while the clock still holds time",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_move_never_costs_more_than_its_share_plus_what_it_earns() {
+        // **The invariant that actually sees the allocation**, and the one this whole issue exists
+        // for: `remaining / divisor + increment / 2` can be doubled without any other test in this
+        // file noticing, because the safety cap re-saturates the result at the increment and the
+        // clock settles anyway. A first attempt at a replay test failed to catch it for exactly
+        // that reason — the mutation was measured, not assumed.
+        //
+        // What a doubled rule violates is a budget: a move may spend its **share** of the clock
+        // (`remaining / divisor`) plus, at most, the **whole** of what the move earns back
+        // (`increment`). Beyond that, every move costs more than it brings in on top of its share,
+        // and the clock drains structurally however the cap papers over the endgame.
+        //
+        // Stated as an inequality rather than an equality on purpose: it holds for any divisor and
+        // does not pin the constant, so tuning the divisor stays possible while doubling the rule
+        // does not.
+        for divisor in [5u64, 15, 30, 40, 100] {
+            for remaining_ms in [51u64, 100, 1_000, 8_000, 60_000, 600_000] {
+                for inc_ms in [0u64, 80, 1_000, 10_000] {
+                    let b = allocate(
+                        divisor,
+                        Duration::from_millis(remaining_ms),
+                        Duration::from_millis(inc_ms),
+                    )
+                    .as_millis() as u64;
+                    // `.max(1)` because the rule guarantees a floor of one millisecond while any
+                    // time remains: at divisor 100 with 51 ms left and no increment the share
+                    // rounds to zero, and returning zero there would mean "play instantly" on a
+                    // clock that still holds time. Measured, not assumed — the first version of
+                    // this ceiling failed on exactly that case.
+                    let ceiling = (remaining_ms / divisor + inc_ms).max(1);
+                    assert!(
+                        b <= ceiling,
+                        "divisor {divisor}, {remaining_ms} ms left, {inc_ms} ms increment: \
+                         proposed {b} ms, more than its {} ms share plus the increment",
+                        remaining_ms / divisor,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Replays the rule over a whole game, returning the budget granted at each move.
+    ///
+    /// Kept for the one property a single allocation cannot express: what the clock does when
+    /// there is nothing coming back into it.
+    fn replay(divisor: u64, moves: usize, base_ms: u64, inc_ms: u64) -> Vec<u64> {
+        let mut remaining = base_ms;
+        let mut out = Vec::with_capacity(moves);
+        for _ in 0..moves {
+            let b = allocate(divisor, Duration::from_millis(remaining), Duration::from_millis(inc_ms))
+                .as_millis() as u64;
+            assert!(b <= remaining, "the replay itself must stay legal: {b} of {remaining} ms");
+            out.push(b);
+            remaining = remaining.saturating_sub(b) + inc_ms;
+        }
+        out
+    }
+
+
+    #[test]
+    fn without_an_increment_the_budget_reaches_zero_and_that_is_correct() {
+        // The counterpart, and the reason the test above names an increment. **With no increment
+        // there is no fixed point**: the clock is a finite resource and the rule spends a share of
+        // it each move, so the budget decays to 0 — measured at move 200 of an 8 s game, at every
+        // divisor. Zero means "play instantly", which is the only correct answer once the safety
+        // margin is all that remains.
+        //
+        // Asserted rather than merely noted, because it is the boundary between this and a bug: a
+        // budget of zero *while time remains* would be a defect, and a budget of zero when the
+        // clock is gone is the contract. Without this, a future reader tightening the test above
+        // into "no budget is ever zero" would be pinning a false claim.
+        for divisor in [15u64, 30] {
+            let budgets = replay(divisor, 200, 8_000, 0);
+            assert_eq!(
+                *budgets.last().expect("a budget per move"),
+                0,
+                "divisor {divisor}: with no increment the clock must run down to an instant move",
+            );
+            assert!(
+                budgets[0] > 0,
+                "divisor {divisor}: but the first move of a full clock must get real time",
+            );
+        }
+    }
 
     #[test]
     fn time_budget_grows_with_time_and_increment() {
