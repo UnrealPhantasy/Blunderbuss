@@ -35,13 +35,71 @@ pub use cozy_chess::Piece;
 /// A board square (a1 … h8), used to read what sits on a move's endpoints.
 pub use cozy_chess::Square;
 
-/// A set of squares, one bit per square.
+/// A set of squares — one bit per square, `a1` in bit 0.
 ///
-/// Exposed because the static exchange evaluation in [`crate::ordering`] needs to reason about
-/// *hypothetical* occupations: "who would attack this square once these two pieces have left it".
-/// That is a question about the rules, so the primitive belongs here; what to do with the answer
-/// is move ordering, and stays in maison.
-pub use cozy_chess::BitBoard;
+/// The static exchange evaluation in [`crate::ordering`] needs to reason about *hypothetical*
+/// occupations: "who would attack this square once these two pieces have left it". That is a
+/// question about the rules, so the primitive belongs here; what to do with the answer is move
+/// ordering, and stays in maison.
+///
+/// **Why a type of our own rather than re-exporting the dependency's.** Every other borrowed type
+/// this module re-exports — `Square`, `Piece`, `Color` — is a *chess concept*, and its shape is
+/// forced by the rules. A bitboard is a *representation*: sixty-four bits in some order, chosen
+/// by the library. Re-exporting it would put a dependency's representation in our public
+/// signatures, and [`Position::pawns`] had already declined to do exactly that, in a comment
+/// calling it "the rule the rest of this type follows". Following it here costs one wrapper.
+///
+/// Rust idiom: a **newtype** is a struct wrapping a single value in order to give it a distinct
+/// type. It costs nothing at run time — the wrapper has the same layout as what it holds, and the
+/// compiler erases it — so this is a boundary drawn in the type system and paid for at compile
+/// time only. The field is private, which is what actually closes the boundary: callers reach the
+/// contents only through the methods below.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SquareSet(cozy_chess::BitBoard);
+
+impl SquareSet {
+    /// The set containing `square` alone.
+    pub fn of(square: Square) -> SquareSet {
+        SquareSet(square.bitboard())
+    }
+
+    /// Whether the set holds no square at all.
+    pub fn is_empty(self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// One square of the set, or `None` if it is empty.
+    ///
+    /// *Which* square is unspecified on purpose: every caller here either loops until the set is
+    /// empty or has already narrowed it to a single piece type, so depending on the order would
+    /// be depending on the representation this type exists to hide.
+    pub fn next_square(self) -> Option<Square> {
+        self.0.next_square()
+    }
+}
+
+// Rust idiom: implementing `std::ops::BitAnd` is what makes `a & b` work on our own type. The
+// operators are traits like any other, so a newtype can offer exactly the ones that make sense
+// for it — intersection and toggling here, and deliberately not, say, arithmetic.
+impl std::ops::BitAnd for SquareSet {
+    type Output = SquareSet;
+    fn bitand(self, other: SquareSet) -> SquareSet {
+        SquareSet(self.0 & other.0)
+    }
+}
+
+impl std::ops::BitXor for SquareSet {
+    type Output = SquareSet;
+    fn bitxor(self, other: SquareSet) -> SquareSet {
+        SquareSet(self.0 ^ other.0)
+    }
+}
+
+impl std::ops::BitXorAssign for SquareSet {
+    fn bitxor_assign(&mut self, other: SquareSet) {
+        self.0 ^= other.0;
+    }
+}
 
 /// The status of a position, purely from the rules' point of view.
 ///
@@ -182,13 +240,13 @@ impl Position {
     /// producing everything at once) belong to the engine and will come later —
     /// they are out of scope here.
     /// Every square currently holding a piece.
-    pub fn occupied(&self) -> BitBoard {
-        self.0.occupied()
+    pub fn occupied(&self) -> SquareSet {
+        SquareSet(self.0.occupied())
     }
 
     /// The squares holding `piece` of `color`.
-    pub fn pieces_of(&self, color: Color, piece: Piece) -> BitBoard {
-        self.0.pieces(piece) & self.0.colors(color)
+    pub fn pieces_of(&self, color: Color, piece: Piece) -> SquareSet {
+        SquareSet(self.0.pieces(piece) & self.0.colors(color))
     }
 
     /// Which pieces of `color` attack `square`, under a **hypothetical** occupation.
@@ -203,19 +261,24 @@ impl Position {
     /// a white pawn attacks from are the squares a black pawn attacks, mirrored. That inversion
     /// is the one place this function is easy to get backwards, so it is stated rather than
     /// implied.
-    pub fn attackers(&self, square: Square, color: Color, occupied: BitBoard) -> BitBoard {
+    pub fn attackers(&self, square: Square, color: Color, occupied: SquareSet) -> SquareSet {
         use cozy_chess::{get_bishop_moves, get_king_moves, get_knight_moves, get_pawn_attacks,
                          get_rook_moves};
         let mine = self.0.colors(color);
         let bishops = self.0.pieces(Piece::Bishop) | self.0.pieces(Piece::Queen);
         let rooks = self.0.pieces(Piece::Rook) | self.0.pieces(Piece::Queen);
-        ((get_pawn_attacks(square, !color) & self.0.pieces(Piece::Pawn))
-            | (get_knight_moves(square) & self.0.pieces(Piece::Knight))
-            | (get_king_moves(square) & self.0.pieces(Piece::King))
-            | (get_bishop_moves(square, occupied) & bishops)
-            | (get_rook_moves(square, occupied) & rooks))
-            & mine
-            & occupied
+        // `occupied.0` is the one place the wrapper is opened, and it is inside the module that
+        // owns it — which is the point of a private field rather than a public one.
+        let hypothetical = occupied.0;
+        SquareSet(
+            ((get_pawn_attacks(square, !color) & self.0.pieces(Piece::Pawn))
+                | (get_knight_moves(square) & self.0.pieces(Piece::Knight))
+                | (get_king_moves(square) & self.0.pieces(Piece::King))
+                | (get_bishop_moves(square, hypothetical) & bishops)
+                | (get_rook_moves(square, hypothetical) & rooks))
+                & mine
+                & hypothetical,
+        )
     }
 
     pub fn legal_moves(&self) -> Vec<Move> {

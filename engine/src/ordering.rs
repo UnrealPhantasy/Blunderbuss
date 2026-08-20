@@ -17,7 +17,7 @@
 //! positions at one ply usually share the same threat, so the refutation that
 //! worked next door tends to work here too.
 
-use crate::position::{BitBoard, Color, Move, Piece, Position, Square};
+use crate::position::{Color, Move, Piece, Position, Square, SquareSet};
 use crate::search::MAX_DEPTH;
 
 // Piece values used *for ordering only* (not for evaluation): only their relative
@@ -82,7 +82,7 @@ pub fn see(pos: &Position, mv: Move) -> i32 {
     let mut gain = [0i32; 32];
     gain[0] = value(victim);
     let mut on_square = value(attacker);
-    let mut occupied = pos.occupied() ^ mv.from.bitboard();
+    let mut occupied = pos.occupied() ^ SquareSet::of(mv.from);
     let mut side = !pos.side_to_move();
     let mut d = 0usize;
 
@@ -93,7 +93,7 @@ pub fn see(pos: &Position, mv: Move) -> i32 {
             break;
         };
         on_square = value(piece);
-        occupied ^= square.bitboard();
+        occupied ^= SquareSet::of(square);
         side = !side;
         if d + 1 >= gain.len() {
             break;
@@ -115,7 +115,7 @@ fn cheapest_attacker(
     pos: &Position,
     square: Square,
     color: Color,
-    occupied: BitBoard,
+    occupied: SquareSet,
 ) -> Option<(Square, Piece)> {
     let attackers = pos.attackers(square, color, occupied);
     if attackers.is_empty() {
