@@ -752,6 +752,23 @@ mod tests {
     }
 
     #[test]
+    fn the_cheapest_defender_recaptures_and_not_the_strongest() {
+        // **The case that pins *which* defender recaptures**, where the battery above pins
+        // *whether* an uncovered slider joins. Both are hand-computable and they fail apart:
+        // reversing the piece order in `cheapest_attacker` leaves the battery test green.
+        //
+        // Black knight on d5, defended twice — a pawn on c6 and the queen on d8. White rook
+        // battery on d1+d2.
+        //
+        // Rd2xd5 (+320 knight), cxd5 (-500 rook), Rxd5 (+100 pawn), Qxd5 (-500 rook),
+        // and White is out of attackers. By hand, folding back: **-180**.
+        //
+        // Recapturing with the queen instead — the same sequence run cheapest-last — folds back
+        // to **+220**: "losing, prune it" becomes "winning, keep it" on one position.
+        assert_eq!(see_of("3q3k/8/2p5/3n4/8/8/3R4/3R3K w - - 0 1", "d2d5"), -180);
+    }
+
+    #[test]
     fn what_the_evaluation_declines_to_judge_returns_zero() {
         // En passant (the captured pawn is not on the destination square) and promotions (the
         // capturing piece changes value mid-sequence) return 0 — "no information" — rather than a
