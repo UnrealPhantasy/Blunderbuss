@@ -61,7 +61,12 @@ struct GoPlan {
 /// otherwise a clock (`wtime`/`btime`) does. A command with a depth but no time runs
 /// unbounded in time; one with neither — a bare `go`, or `go infinite`, which we
 /// cannot interrupt without `stop` — falls back to `default_budget`.
-fn parse_go(args: &[&str], side_to_move: Color, default_budget: Duration) -> GoPlan {
+fn parse_go(
+    args: &[&str],
+    side_to_move: Color,
+    move_number: u32,
+    default_budget: Duration,
+) -> GoPlan {
     // The protocol sends `key value` pairs; read the number following `key`.
     let value = |key: &str| -> Option<u64> {
         args.iter()
@@ -83,6 +88,7 @@ fn parse_go(args: &[&str], side_to_move: Color, default_budget: Duration) -> GoP
         Some(time_budget(
             Duration::from_millis(remaining),
             Duration::from_millis(inc),
+            move_number,
         ))
     } else if depth.is_some() {
         None // an explicit depth and no clock: run it to completion
@@ -137,18 +143,80 @@ fn score_field(score: i32) -> String {
     format!("mate {}", if score > 0 { moves } else { -moves })
 }
 
-/// How long to spend on this move, derived from the clock. A simple, tunable
-/// rule: a thirtieth of the remaining time plus half the increment — never more
-/// than the remaining time minus a safety margin, and at least 1 ms.
-fn time_budget(remaining: Duration, increment: Duration) -> Duration {
+/// The divisor at move 1, its floor, and how fast it falls, in `remaining / divisor`.
+///
+/// **The clock rises with the move number, and the reason is measured.** A first attempt (#52)
+/// went the other way — a fixed divisor lowered from 30 to 15, to spend more early where the depth
+/// gap with the anchor looks worst. It measured **-4 ± 20** over 800 games, and +9 ± 14 for a
+/// milder D=20 over 1600. The reason it failed is not that moving time around is futile; it is
+/// that **a ply is not worth the same at every stage of the game**.
+///
+/// Depth by move number, us against Stockfish@1800, over 4800 anchored games:
+///
+/// | moves | us | SF | gap |
+/// |-------|-------|-------|-------|
+/// | 1-10 | 7.67 | 13.12 | -5.45 |
+/// | 11-20 | 7.30 | 12.87 | -5.57 |
+/// | 21-30 | 7.95 | 11.15 | -3.19 |
+/// | 31-50 | 8.99 | 10.79 | **-1.81** |
+/// | 51+ | 10.97 | 13.15 | -2.18 |
+///
+/// Half a ply against an opponent five plies ahead changes nothing: the position is decided by
+/// those five plies, not by our last half one. Half a ply against an opponent 1.8 plies ahead is
+/// **28% of the gap**. The opening is therefore where time is cheapest to give up, and moves 31-50
+/// are where it buys the most.
+///
+/// Two other measurements agree. Endgame positions cost more nodes at equal depth — the check
+/// extension of #50 multiplies a pawn endgame's tree by 1.41 against 0.98 in the opening — so
+/// reaching a given depth there takes longer. And positions preceding a 300 cp collapse sit nearer
+/// the endgame (median phase 11.9 against 13.6, n=9912): the decisive mistakes happen late.
+///
+/// Simulated against the fixed divisor of 30 on a median game: **-41% over moves 1-10, +68% over
+/// moves 31-50**.
+///
+/// # Why it cannot lose on time
+///
+/// A property of the rule rather than of these numbers: with an increment, `remaining / D + inc/2`
+/// has a **fixed point** at `remaining = 40 * D`, approached from above and never crossed. A
+/// *smaller* divisor lowers that floor — 560 ms at D=14 — without ever reaching [`SAFETY_MS`]. A
+/// test sweeps game lengths to 400 moves at every divisor the curve produces.
+const CLOCK_DIVISOR_START: u64 = 70;
+const CLOCK_DIVISOR_FLOOR: u64 = 14;
+/// How fast the divisor falls per full move, counted in halves — 3 means 1.5 per move, so the floor
+/// is reached at move 38, just inside the stretch where the gap with the anchor is smallest.
+const CLOCK_DIVISOR_FALL_HALVES: u64 = 3;
+
+/// The divisor in force at `move_number`.
+///
+/// A single decreasing expression rather than a table of stages: this repository has a brick that
+/// died after four successive recalibrations produced nothing (king safety, #29), and the lesson
+/// taken was to measure one defensible shape and report it. The shape here is "linear from 70 down
+/// to a floor of 14".
+fn clock_divisor(move_number: u32) -> u64 {
+    let fall = CLOCK_DIVISOR_FALL_HALVES * move_number as u64 / 2;
+    CLOCK_DIVISOR_START.saturating_sub(fall).max(CLOCK_DIVISOR_FLOOR)
+}
+
+/// The allocation rule at an arbitrary divisor.
+///
+/// Split out so that tests can sweep the divisor instead of checking the one the curve happens to
+/// produce at a given move. That distinction is not cosmetic: on the first attempt at this brick
+/// (#52), changing the divisor from 30 to 15 — a doubling of every budget — broke **no existing
+/// test**, because every test was written against the shape of the rule and none against its scale.
+fn allocate(divisor: u64, remaining: Duration, increment: Duration) -> Duration {
     let remaining = remaining.as_millis() as u64;
     let increment = increment.as_millis() as u64;
-    let alloc = remaining / 30 + increment / 2;
+    let alloc = remaining / divisor + increment / 2;
     // Keep a safety margin, and never propose more time than we actually have:
     // once the margin already eats the whole clock, spend nothing (play instantly).
     let cap = remaining.saturating_sub(SAFETY_MS);
     let budget = if cap > 0 { alloc.clamp(1, cap) } else { 0 };
     Duration::from_millis(budget)
+}
+
+/// How long to spend on this move, derived from the clock and from how far the game has gone.
+fn time_budget(remaining: Duration, increment: Duration, move_number: u32) -> Duration {
+    allocate(clock_divisor(move_number), remaining, increment)
 }
 
 /// The protocol state: the current position, and how long to think when the GUI
@@ -288,7 +356,12 @@ impl Uci {
     /// Every form goes through the same two steps — plan, then search — so the engine
     /// has a single search path whatever the GUI sends.
     fn go(&mut self, args: &[&str]) -> String {
-        let plan = parse_go(args, self.position.side_to_move(), self.default_budget);
+        let plan = parse_go(
+            args,
+            self.position.side_to_move(),
+            self.position.move_number(),
+            self.default_budget,
+        );
         let deadline = plan.budget.map(|b| Instant::now() + b);
 
         // The position is cloned so the reporting closure can borrow it while
@@ -481,43 +554,43 @@ mod tests {
     #[test]
     fn go_depth_plans_a_depth_cap_and_no_clock() {
         assert_eq!(
-            parse_go(&["depth", "5"], Color::White, FALLBACK),
+            parse_go(&["depth", "5"], Color::White, 1, FALLBACK),
             GoPlan { max_depth: 5, budget: None }
         );
     }
 
     #[test]
     fn go_movetime_plans_a_budget_minus_the_safety_margin() {
-        let plan = parse_go(&["movetime", "1000"], Color::White, FALLBACK);
+        let plan = parse_go(&["movetime", "1000"], Color::White, 1, FALLBACK);
         assert_eq!(plan.max_depth, MAX_DEPTH, "no depth cap was asked for");
         assert_eq!(plan.budget, Some(Duration::from_millis(1000 - SAFETY_MS)));
         // A movetime smaller than the margin must still leave something to search
         // with, rather than underflowing to a huge budget or to zero.
-        let tiny = parse_go(&["movetime", "10"], Color::White, FALLBACK).budget.unwrap();
+        let tiny = parse_go(&["movetime", "10"], Color::White, 1, FALLBACK).budget.unwrap();
         assert_eq!(tiny, Duration::from_millis(1));
     }
 
     #[test]
     fn go_with_a_clock_reads_the_side_to_moves_own_clock() {
         let args = ["wtime", "60000", "btime", "6000", "winc", "0", "binc", "0"];
-        let white = parse_go(&args, Color::White, FALLBACK).budget.expect("a budget");
-        let black = parse_go(&args, Color::Black, FALLBACK).budget.expect("a budget");
+        let white = parse_go(&args, Color::White, 1, FALLBACK).budget.expect("a budget");
+        let black = parse_go(&args, Color::Black, 1, FALLBACK).budget.expect("a budget");
         // White has ten times Black's time, so White must plan to think longer —
         // proof that the side to move selects which clock is read.
         assert!(white > black, "white {white:?} should exceed black {black:?}");
-        assert_eq!(white, time_budget(Duration::from_secs(60), Duration::ZERO));
-        assert_eq!(black, time_budget(Duration::from_secs(6), Duration::ZERO));
+        assert_eq!(white, time_budget(Duration::from_secs(60), Duration::ZERO, 1));
+        assert_eq!(black, time_budget(Duration::from_secs(6), Duration::ZERO, 1));
 
         // The increment is read from the same side.
         let with_inc = ["wtime", "60000", "btime", "60000", "winc", "0", "binc", "4000"];
-        let black_inc = parse_go(&with_inc, Color::Black, FALLBACK).budget.expect("a budget");
-        assert!(black_inc > parse_go(&with_inc, Color::White, FALLBACK).budget.unwrap());
+        let black_inc = parse_go(&with_inc, Color::Black, 1, FALLBACK).budget.expect("a budget");
+        assert!(black_inc > parse_go(&with_inc, Color::White, 1, FALLBACK).budget.unwrap());
     }
 
     #[test]
     fn go_depth_and_movetime_honours_both_bounds() {
         // The protocol allows both; `Limits` can carry both, so neither is dropped.
-        let plan = parse_go(&["depth", "6", "movetime", "2000"], Color::White, FALLBACK);
+        let plan = parse_go(&["depth", "6", "movetime", "2000"], Color::White, 1, FALLBACK);
         assert_eq!(plan.max_depth, 6);
         assert_eq!(plan.budget, Some(Duration::from_millis(2000 - SAFETY_MS)));
     }
@@ -528,7 +601,7 @@ mod tests {
         // cannot be interrupted (`stop` is unimplemented), so we time-box ourselves.
         for args in [vec![], vec!["infinite"]] {
             assert_eq!(
-                parse_go(&args, Color::White, FALLBACK),
+                parse_go(&args, Color::White, 1, FALLBACK),
                 GoPlan { max_depth: MAX_DEPTH, budget: Some(FALLBACK) },
                 "args {args:?} should fall back to the default budget"
             );
@@ -538,7 +611,7 @@ mod tests {
     #[test]
     fn unknown_go_arguments_are_ignored() {
         // Arguments we do not implement must not disturb the ones we do.
-        let plan = parse_go(&["ponder", "searchmoves", "e2e4", "depth", "3"], Color::White, FALLBACK);
+        let plan = parse_go(&["ponder", "searchmoves", "e2e4", "depth", "3"], Color::White, 1, FALLBACK);
         assert_eq!(plan, GoPlan { max_depth: 3, budget: None });
     }
 
@@ -714,10 +787,10 @@ mod tests {
 
     #[test]
     fn time_budget_grows_with_time_and_increment() {
-        let more = time_budget(Duration::from_secs(60), Duration::from_secs(0));
-        let less = time_budget(Duration::from_secs(6), Duration::from_secs(0));
+        let more = time_budget(Duration::from_secs(60), Duration::from_secs(0), 1);
+        let less = time_budget(Duration::from_secs(6), Duration::from_secs(0), 1);
         assert!(more > less, "more time should mean a larger budget");
-        let with_inc = time_budget(Duration::from_secs(60), Duration::from_secs(2));
+        let with_inc = time_budget(Duration::from_secs(60), Duration::from_secs(2), 1);
         assert!(with_inc > more, "an increment should raise the budget");
     }
 
@@ -725,11 +798,148 @@ mod tests {
     fn time_budget_never_exceeds_remaining() {
         // A realistic clock: a positive budget, safely under the time left.
         let remaining = Duration::from_millis(300);
-        let b = time_budget(remaining, Duration::from_secs(10));
+        let b = time_budget(remaining, Duration::from_secs(10), 1);
         assert!(b >= Duration::from_millis(1) && b < remaining);
         // Edge cases: the budget is never more than the remaining time, and it is
         // exactly zero once the safety margin already eats the whole clock.
-        assert_eq!(time_budget(Duration::ZERO, Duration::ZERO), Duration::ZERO);
-        assert!(time_budget(Duration::from_millis(10), Duration::ZERO) <= Duration::from_millis(10));
+        assert_eq!(time_budget(Duration::ZERO, Duration::ZERO, 1), Duration::ZERO);
+        assert!(time_budget(Duration::from_millis(10), Duration::ZERO, 1) <= Duration::from_millis(10));
     }
+
+    // ------------------------------------------------------------ rising clock (#58)
+
+    /// Replays a whole game's allocations, returning each move's budget. The clock model is the
+    /// arena's: spend the budget, then receive the increment.
+    fn replay(moves: usize, base_ms: u64, inc_ms: u64, divisor: Option<u64>) -> Vec<u64> {
+        let mut remaining = base_ms;
+        let mut out = Vec::with_capacity(moves);
+        for m in 1..=moves {
+            let d = divisor.unwrap_or_else(|| clock_divisor(m as u32));
+            let b = allocate(d, Duration::from_millis(remaining), Duration::from_millis(inc_ms))
+                .as_millis() as u64;
+            out.push(b);
+            remaining = remaining.saturating_sub(b) + inc_ms;
+        }
+        out
+    }
+
+    #[test]
+    fn the_divisor_falls_and_reaches_its_floor() {
+        // The shape of the curve, swept rather than sampled: strictly decreasing until the floor,
+        // then flat. Written against the constants so that changing them changes what is asserted,
+        // instead of pinning today's numbers.
+        let mut previous = clock_divisor(0);
+        let mut floor_reached_at = None;
+        for m in 1..=200u32 {
+            let d = clock_divisor(m);
+            assert!(d <= previous, "the divisor rose at move {m}: {d} after {previous}");
+            assert!(d >= CLOCK_DIVISOR_FLOOR, "move {m} fell through the floor: {d}");
+            assert!(d <= CLOCK_DIVISOR_START, "move {m} rose above the start: {d}");
+            if d == CLOCK_DIVISOR_FLOOR && floor_reached_at.is_none() {
+                floor_reached_at = Some(m);
+            }
+            previous = d;
+        }
+        let at = floor_reached_at.expect("the curve must reach its floor within 200 moves");
+        // The floor must land inside the stretch the brick targets — moves 31-50, where the
+        // measured depth gap with the anchor is smallest (-1.81 plies against -5.57 early). A floor
+        // reached at move 90 would mean the curve never gets generous while it matters.
+        assert!(
+            (20..=50).contains(&at),
+            "the floor is reached at move {at}, outside the stretch this brick targets",
+        );
+    }
+
+    #[test]
+    fn the_clock_never_runs_out_at_any_point_of_the_curve() {
+        // The property that makes a *falling* divisor safe, and it is the same one that made #52's
+        // flat divisor safe: the rule has a fixed point at `remaining = 40 * D`, approached from
+        // above and never crossed. A smaller divisor lowers that floor without reaching SAFETY_MS.
+        //
+        // Swept over game lengths well past any real game, since the curve's floor is what a long
+        // game settles onto.
+        for moves in [51usize, 100, 200, 400] {
+            let budgets = replay(moves, 8_000, 80, None);
+            assert!(
+                budgets.iter().all(|&b| b >= 1),
+                "{moves} moves: a budget of zero appeared, the clock ran out",
+            );
+            assert!(
+                budgets[moves - 1] >= 40,
+                "{moves} moves: the tail collapsed to {} ms",
+                budgets[moves - 1],
+            );
+        }
+    }
+
+    #[test]
+    fn the_budget_never_exceeds_what_is_left_at_any_divisor_of_the_curve() {
+        // Across the exhaustion boundary from both sides, at every divisor the curve produces:
+        // staying legal when the clock is nearly gone is the one case where a bad allocation loses
+        // the game outright rather than costing depth.
+        for m in [1u32, 10, 25, 38, 100] {
+            let d = clock_divisor(m);
+            for remaining_ms in [0u64, 1, 10, 49, 50, 51, 100, 1_000, 60_000] {
+                for inc_ms in [0u64, 80, 10_000] {
+                    let b = allocate(
+                        d,
+                        Duration::from_millis(remaining_ms),
+                        Duration::from_millis(inc_ms),
+                    );
+                    assert!(
+                        b <= Duration::from_millis(remaining_ms),
+                        "move {m} (divisor {d}), {remaining_ms} ms left: proposed {b:?}",
+                    );
+                    if remaining_ms > SAFETY_MS {
+                        assert!(
+                            b.as_millis() as u64 <= remaining_ms - SAFETY_MS,
+                            "move {m}, {remaining_ms} ms left: the safety margin was eaten",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_curve_moves_time_from_the_opening_to_the_middlegame() {
+        // **What the brick is for**, and the test that fails if someone flattens the curve.
+        //
+        // The measured depth gap with the anchor is -5.57 plies at moves 11-20 and -1.81 at moves
+        // 31-50. Half a ply against an opponent five plies ahead changes nothing; against one 1.8
+        // plies ahead it is 28% of the gap. So time must leave the opening and arrive in the
+        // middlegame — the *opposite* of what #52 did, which measured -4 ± 20.
+        //
+        // Thresholds are loose on purpose: they pin the direction, not one arithmetic value.
+        // Measured at the constants in force: -41% over moves 1-10 and +68% over moves 31-50.
+        const MOVES: usize = 100;
+        let curve = replay(MOVES, 8_000, 80, None);
+        let flat = replay(MOVES, 8_000, 80, Some(30));
+
+        let early_curve: u64 = curve[..10].iter().sum();
+        let early_flat: u64 = flat[..10].iter().sum();
+        assert!(
+            early_curve * 4 < early_flat * 3,
+            "the opening must give up at least a quarter of its time: {early_curve} against \
+             {early_flat} ms",
+        );
+
+        let mid_curve: u64 = curve[30..50].iter().sum();
+        let mid_flat: u64 = flat[30..50].iter().sum();
+        assert!(
+            mid_curve * 4 > mid_flat * 5,
+            "moves 31-50 must gain at least a quarter: {mid_curve} against {mid_flat} ms",
+        );
+
+        // And the whole clock must still be spent — a curve that simply hoards time would satisfy
+        // the two assertions above while playing worse everywhere.
+        let total_curve: u64 = curve.iter().sum();
+        let total_flat: u64 = flat.iter().sum();
+        assert!(
+            total_curve >= total_flat,
+            "the curve must not leave more on the table than the flat divisor: {total_curve} \
+             against {total_flat} ms",
+        );
+    }
+
 }

@@ -105,6 +105,17 @@ impl Position {
         }
     }
 
+    /// The full-move number, as it appears in the FEN — 1 at the start of a game.
+    ///
+    /// Read from the position rather than counted from a move history, and that distinction
+    /// matters: a GUI is free to send `position fen …` with no move list, and an engine counting
+    /// history would then believe it is on move 1 for the whole game. For anything that scales with
+    /// how far the game has progressed — the clock, for one — that is the most conservative
+    /// possible answer, given at the worst possible moment.
+    pub fn move_number(&self) -> u32 {
+        self.0.fullmove_number() as u32
+    }
+
     /// The Zobrist hash key of the position (for a future transposition table).
     pub fn hash(&self) -> u64 {
         self.0.hash()
