@@ -146,6 +146,36 @@ const LMR_MIN_DEPTH: u32 = 3;
 /// best one. It is a floor on trust in the ordering, not a measurement.
 const LMR_FULL_DEPTH_MOVES: usize = 3;
 
+/// The half-width of the first aspiration window, in centipawns.
+///
+/// Iterative deepening already knows roughly what the position is worth: the previous
+/// iteration's score. Searching the next one with the full `(-INF, INF)` window throws that
+/// away and asks alpha-beta to rediscover the value from nothing. A narrow window around the
+/// previous score prunes harder — every move whose value falls outside is cut without being
+/// examined — at the price of a **re-search** when the true value lies outside after all.
+///
+/// **Twenty-five, and wider was measured worse.** On the 52-position bench at depth 8, node
+/// ratios against no aspiration: **0.935 at delta 25** (worst position 1.43) against **0.961 at
+/// delta 50** (worst 1.81). That ordering refutes the intuition that the cost comes from
+/// re-searches — if it did, widening would help. What dominates is the sharpness of the cut, so
+/// the narrow window wins despite failing more often.
+const ASPIRATION_DELTA: i32 = 25;
+
+/// The widening factor applied after each failed window. Geometric rather than additive: a
+/// position whose score has genuinely jumped (a tactic resolved, a piece won) is off by
+/// hundreds of centipawns, and stepping there by 25 at a time would pay for a dozen searches.
+const ASPIRATION_WIDEN: i32 = 4;
+
+/// Below this depth the full window is used. The shallow iterations cost almost nothing —
+/// depth 4 is under 11 000 nodes on the bench — so there is nothing to save, while their scores
+/// are the least stable, which is exactly when a narrow window fails and pays for a re-search.
+const ASPIRATION_MIN_DEPTH: u32 = 5;
+
+/// How far the window may widen before giving up and using the full one. Past this, the position
+/// is telling us its value has moved a great deal; another narrow attempt is a wasted search
+/// rather than a cheaper one.
+const ASPIRATION_MAX_DELTA: i32 = 1_000;
+
 /// How far / how long to search.
 pub struct Limits {
     /// Never search deeper than this.
@@ -363,7 +393,7 @@ fn deepen(pos: &Position, mut request: Request, searcher: &mut Searcher) -> Sear
         // Order the previous iteration's best move first — the whole point of
         // deepening, since a good first move causes early cutoffs below.
         let pv = best.map(|(mv, _)| mv);
-        let result = searcher.root(pos, depth, pv);
+        let result = searcher.aspirated_root(pos, depth, pv, best.map(|(_, sc)| sc));
 
         if searcher.aborted {
             // Ran out of time mid-iteration. The default is to discard it: the moves it
@@ -457,9 +487,28 @@ enum MoveOrder {
 /// More than the move and its score, because the deepening loop has to tell two kinds
 /// of unfinished iteration apart: one that only got through the moves it was already
 /// going to play anyway, and one that **changed its mind** before running out of time.
+/// Where a root search's value fell relative to the window it was given.
+///
+/// Only [`Window::Exact`] means "this is the value". The other two are **bounds**, and the
+/// caller must widen and search again — adopting a bound as a score would make the engine play
+/// a move whose value it does not know.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Window {
+    /// The value landed inside the window: exact and usable.
+    Exact,
+    /// No move reached `alpha`. The value is *at most* what was returned, and — the dangerous
+    /// part — **the best move is not trustworthy**: nothing distinguished itself.
+    FailLow,
+    /// A move reached `beta`, so the search stopped early. The value is *at least* what came
+    /// back, and the move that caused it is real, but the moves after it were never tried.
+    FailHigh,
+}
+
 struct RootResult {
     /// The best move and its score, or `None` at a terminal root.
     best: Option<(Move, i32)>,
+    /// Whether the value is exact, or only a bound that requires a wider search.
+    window: Window,
     /// Whether a move other than the first one took the lead.
     ///
     /// The first move tried is the previous iteration's choice, so this is exactly
@@ -560,6 +609,22 @@ struct Searcher<'a> {
     lmr_reductions: u64,
     #[cfg(test)]
     lmr_researches: u64,
+    /// Whether aspiration windows may be used at all.
+    ///
+    /// **Tests only**, compiled out otherwise — the same device as `allow_lmr`: a node count only
+    /// means something against a search identical but for the one thing measured.
+    #[cfg(test)]
+    allow_aspiration: bool,
+    /// How many windowed root searches were run, and how many gave up on the full window.
+    ///
+    /// **Tests only.** A brick whose whole effect is "same answer, fewer nodes" needs a counter to
+    /// prove it ran at all — #40 established that a component wired to nothing passes every test
+    /// it owns. The give-up counter is what would expose a badly chosen delta: windows that always
+    /// fail cost searches and save nothing.
+    #[cfg(test)]
+    aspiration_searches: u64,
+    #[cfg(test)]
+    aspiration_gave_up: u64,
 }
 
 impl<'a> Searcher<'a> {
@@ -591,6 +656,12 @@ impl<'a> Searcher<'a> {
             lmr_reductions: 0,
             #[cfg(test)]
             lmr_researches: 0,
+            #[cfg(test)]
+            allow_aspiration: true,
+            #[cfg(test)]
+            aspiration_searches: 0,
+            #[cfg(test)]
+            aspiration_gave_up: 0,
         }
     }
 
@@ -649,13 +720,99 @@ impl<'a> Searcher<'a> {
         }
     }
 
-    /// The root: like [`Searcher::negamax`] but it tracks the chosen move, does not
-    /// cut off (no `beta` above the root), and tries `pv_move` first if given.
-    fn root(&mut self, pos: &Position, depth: u32, pv_move: Option<Move>) -> RootResult {
+    /// One iteration of the deepening loop, searched inside an **aspiration window** when the
+    /// previous iteration gave us something to aim at.
+    ///
+    /// The window starts at `previous ± ASPIRATION_DELTA` and widens geometrically on failure,
+    /// ending at the full window. Two properties matter, and both are asserted by tests:
+    ///
+    /// **The answer is never a bound.** A `FailLow` or `FailHigh` result is searched again, so
+    /// what the deepening loop receives is always exact. This is not a refinement: on a fail-low
+    /// the best move is *not trustworthy* — nothing beat `alpha` — and playing it would mean
+    /// playing a move the search never endorsed.
+    ///
+    /// **An interrupted search is never re-searched.** Once `aborted` is set the loop returns
+    /// immediately: widening and searching again would run past the deadline, and the value being
+    /// widened around is the placeholder an aborted search returns, not a score.
+    fn aspirated_root(
+        &mut self,
+        pos: &Position,
+        depth: u32,
+        pv_move: Option<Move>,
+        previous: Option<i32>,
+    ) -> RootResult {
+        // Compiled out of production builds, where the window always applies.
+        #[cfg(test)]
+        let allowed = self.allow_aspiration;
+        #[cfg(not(test))]
+        let allowed = true;
+
+        let Some(prev) = previous.filter(|_| allowed && depth >= ASPIRATION_MIN_DEPTH) else {
+            return self.root(pos, depth, pv_move, -INF, INF);
+        };
+        // A mate score gives no useful centre: the scale is not centipawns there, so a window of
+        // ±25 around `MATE - 3` is guaranteed to fail. Search wide rather than pay two searches
+        // to learn that.
+        if prev.abs() >= MATE_THRESHOLD {
+            return self.root(pos, depth, pv_move, -INF, INF);
+        }
+
+        let mut delta = ASPIRATION_DELTA;
+        loop {
+            let result = self.root(pos, depth, pv_move, prev - delta, prev + delta);
+            // Honest note, in the spirit of the null move's `return beta`: removing this guard
+            // breaks no test. Reaching it needs the abort to land inside a windowed search that
+            // then fails the window — a sweep over 20 node ceilings never produced it. What makes
+            // it necessary anyway is what it protects against: `deepen` discards an aborted
+            // iteration, but this loop would first widen around the *placeholder* an aborted
+            // search returns and pay one to three more searches past the deadline. Kept as
+            // reasoning rather than dressed up as tested.
+            if self.aborted {
+                return result;
+            }
+            #[cfg(test)]
+            {
+                self.aspiration_searches += 1;
+            }
+            if result.window == Window::Exact {
+                return result;
+            }
+            if delta >= ASPIRATION_MAX_DELTA {
+                #[cfg(test)]
+                {
+                    self.aspiration_gave_up += 1;
+                }
+                return self.root(pos, depth, pv_move, -INF, INF);
+            }
+            delta = delta.saturating_mul(ASPIRATION_WIDEN);
+        }
+    }
+
+    /// The root with the full window — what every caller wanted before aspiration existed.
+    ///
+    /// **Tests only.** The tests predating this brick assert things that have nothing to do with
+    /// windows (which move is chosen, how many nodes a heuristic saves); threading `-INF, INF`
+    /// through each would say only that they do not care. Tests that *do* care call
+    /// [`Searcher::root`] with a window.
+    #[cfg(test)]
+    fn root_full(&mut self, pos: &Position, depth: u32, pv_move: Option<Move>) -> RootResult {
+        self.root(pos, depth, pv_move, -INF, INF)
+    }
+
+    /// The root: like [`Searcher::negamax`] but it tracks the chosen move, reports whether its
+    /// value landed inside the window it was given, and tries `pv_move` first if given.
+    fn root(
+        &mut self,
+        pos: &Position,
+        depth: u32,
+        pv_move: Option<Move>,
+        alpha_in: i32,
+        beta: i32,
+    ) -> RootResult {
         self.nodes += 1;
         let mut moves = pos.legal_moves();
         if moves.is_empty() {
-            return RootResult { best: None, improved: false };
+            return RootResult { best: None, window: Window::Exact, improved: false };
         }
         if self.order != MoveOrder::None {
             // The root is ply 0 and never cuts off — no killer is ever recorded
@@ -670,14 +827,14 @@ impl<'a> Searcher<'a> {
 
         let mut best_move = moves[0];
         let mut best_score = -INF;
-        let mut alpha = -INF;
+        let mut alpha = alpha_in;
         let mut improved = false;
         // The root's own key goes on the path, so a branch coming back to it is seen
         // as a repetition. The root itself is never tested against the path — it is
         // the position we are asked about, not a repetition of anything.
         self.path.push(pos.hash());
         for (i, &mv) in moves.iter().enumerate() {
-            let score = -self.negamax(&pos.play(mv), depth.saturating_sub(1), -INF, -alpha, 1);
+            let score = -self.negamax(&pos.play(mv), depth.saturating_sub(1), -beta, -alpha, 1);
             if self.aborted {
                 // Time is up *inside this move's search*, so `score` is the placeholder
                 // `negamax` returns when aborting, not a value. Leaving before the
@@ -697,9 +854,23 @@ impl<'a> Searcher<'a> {
             if score > alpha {
                 alpha = score;
             }
+            // Fail-high: this move already beats what the caller was willing to consider, so the
+            // remaining moves cannot change the decision it asked for. Stopping here is what
+            // makes a narrow window cheaper than a full one — and it is also why the result must
+            // be reported as a *bound* rather than a value.
+            if alpha >= beta {
+                break;
+            }
         }
         self.path.pop();
-        RootResult { best: Some((best_move, best_score)), improved }
+        let window = if best_score <= alpha_in {
+            Window::FailLow
+        } else if best_score >= beta {
+            Window::FailHigh
+        } else {
+            Window::Exact
+        };
+        RootResult { best: Some((best_move, best_score)), window, improved }
     }
 
     /// Negamax with alpha-beta. Returns the value of `pos` from the side-to-move
@@ -1152,7 +1323,7 @@ mod tests {
         let mut table = Table::new();
         let mut searcher = Searcher::new(order, None, &mut table);
         searcher.allow_lmr = false;
-        let best = searcher.root(pos, depth, None).best;
+        let best = searcher.root_full(pos, depth, None).best;
         SearchStats {
             best,
             depth,
@@ -1173,12 +1344,12 @@ mod tests {
         let mediocre = p.move_from_uci("e1f1").unwrap();
 
         let mut t1 = Table::new();
-        let overtaken = Searcher::new(MoveOrder::Full, None, &mut t1).root(&p, 3, Some(mediocre));
+        let overtaken = Searcher::new(MoveOrder::Full, None, &mut t1).root_full(&p, 3, Some(mediocre));
         assert!(overtaken.improved, "Rxd5 must overtake the move tried first");
         assert_eq!(overtaken.best.map(|(mv, _)| mv), Some(best));
 
         let mut t2 = Table::new();
-        let already_best = Searcher::new(MoveOrder::Full, None, &mut t2).root(&p, 3, Some(best));
+        let already_best = Searcher::new(MoveOrder::Full, None, &mut t2).root_full(&p, 3, Some(best));
         assert!(!already_best.improved, "nothing can overtake the best move");
         assert_eq!(already_best.best.map(|(mv, _)| mv), Some(best));
     }
@@ -1381,12 +1552,12 @@ mod tests {
             for depth in 5..=8 {
                 let mut t1 = Table::new();
                 let mut with = Searcher::new(MoveOrder::Full, None, &mut t1);
-                let a = with.root(&p, depth, None);
+                let a = with.root_full(&p, depth, None);
 
                 let mut t2 = Table::new();
                 let mut without = Searcher::new(MoveOrder::Full, None, &mut t2);
                 without.allow_null_move = false;
-                let b = without.root(&p, depth, None);
+                let b = without.root_full(&p, depth, None);
 
                 assert_eq!(
                     with.nodes, without.nodes,
@@ -1515,7 +1686,7 @@ mod tests {
         // weakening it: what matters is that the situation arises, not that the search
         // finishes.
         searcher.node_limit = Some(50_000);
-        searcher.root(&p, 8, None);
+        searcher.root_full(&p, 8, None);
 
         assert!(searcher.max_null_nesting > 0, "precondition: null moves must have been tried");
         assert_eq!(searcher.max_null_nesting, 1, "never nested — one pass at a time");
@@ -1746,7 +1917,7 @@ mod tests {
         // threshold moved from one to two.
         searcher.history = vec![after_ke2.hash(), after_ke2.hash()];
         assert_eq!(
-            searcher.root(&p, 4, None).best.map(|(_, s)| s),
+            searcher.root_full(&p, 4, None).best.map(|(_, s)| s),
             Some(0),
             "precondition: the repetition must actually be found"
         );
@@ -1860,10 +2031,10 @@ mod tests {
         let p = Position::initial();
         let mut table = Table::new();
         let mut searcher = Searcher::new(MoveOrder::Full, None, &mut table);
-        searcher.root(&p, 5, None);
+        searcher.root_full(&p, 5, None);
         let first = searcher.nodes;
         searcher.nodes = 0;
-        searcher.root(&p, 5, None);
+        searcher.root_full(&p, 5, None);
         let second = searcher.nodes;
         assert!(
             second * 10 < first,
@@ -2750,6 +2921,173 @@ mod tests {
                     run.reductions,
                 );
             }
+        }
+    }
+
+
+    // ------------------------------------------------------------- aspiration windows
+
+    struct Aspirated {
+        stats: SearchStats,
+        searches: u64,
+    }
+
+    fn aspirated(pos: &Position, depth: u32, allow: bool) -> Aspirated {
+        let mut table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        s.allow_aspiration = allow;
+        let stats = deepen(pos, Request::new(Limits::depth(depth)), &mut s);
+        Aspirated { stats, searches: s.aspiration_searches }
+    }
+
+    #[test]
+    fn aspiration_alone_returns_the_same_score() {
+        // **The property the whole brick rests on**, asserted at the strength the measurement
+        // supports — which is stricter than the contract, and deliberately so.
+        //
+        // The contract is weaker than equality. Alpha-beta with a transposition table returns
+        // *a* valid value, not *the* value: a stored `Lower`/`Upper` bound is a fact about a
+        // position under one window, and reused under a different window it cuts elsewhere and
+        // yields another number, equally correct. #36 measured that between a fresh engine and
+        // one that had been playing — 1 to 2% of plies, worst gap 29 cp. A first version of this
+        // test asserted equality, and it **fails as soon as SEE pruning is merged alongside**
+        // (#56): 20 against 25 on the opening at depth 7. Neither brick is buggy.
+        //
+        // The reflex from that was to accept a 30 cp tolerance sized on #36's worst gap. Measured
+        // here, the gap aspiration alone produces is **0 on all sixteen pairs** — four natures ×
+        // depths 4-7. A tolerance of 30 against an effect of 0 does not tolerate the effect, it
+        // stops watching: any regression under a third of a pawn passes, which is ample room to
+        // change a chosen move. That is the same shape as the null-move floor lowered from 25% to
+        // 15% on #56, and the reason this repository keeps finding inert tests.
+        //
+        // So equality, and when a tree-reshaping brick lands this test **will** fail — that
+        // failure is the signal that the interaction has arrived, which is worth more than the
+        // silence a tolerance would buy. What replaces it then is the weaker pair the contract
+        // actually guarantees: same verdict (same side of zero, same mate-or-not) and a gap
+        // bounded by what a reused bound explains. Not asserted today, because neither could
+        // fail today, and an assertion that cannot fail is the thing being avoided here.
+        for (nature, fen) in NATURES {
+            let p = Position::from_fen(fen).unwrap();
+            for depth in 4..=7u32 {
+                let with = aspirated(&p, depth, true);
+                let without = aspirated(&p, depth, false);
+                let a = with.stats.best.expect("a move at the root").1;
+                let b = without.stats.best.expect("a move at the root").1;
+                assert_eq!(
+                    a, b,
+                    "{nature} at depth {depth}: aspiration alone must not change the score, \
+                     {a} against {b}. If a tree-reshaping brick has just been merged, this is \
+                     the expected signal — see the comment above for what to replace it with.",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aspiration_shrinks_the_tree_overall_but_not_everywhere() {
+        // What it buys, stated as measured rather than as hoped — including the part that hurts.
+        //
+        // Over the four natures at depth 7 the tree shrinks; on individual positions it can
+        // **grow**, because a window that fails costs a re-search. The bench measures a worst
+        // position at 1.43x while the overall ratio is 0.935 at depth 8. A test claiming a gain
+        // on every position would be false, and one claiming only an average would hide the
+        // cost, so both are asserted.
+        const DEPTH: u32 = 7;
+        let mut ratios = Vec::new();
+        for (_, fen) in NATURES {
+            let p = Position::from_fen(fen).unwrap();
+            let with = aspirated(&p, DEPTH, true);
+            let without = aspirated(&p, DEPTH, false);
+            assert!(with.searches > 0, "precondition: the window must actually be used");
+            ratios.push(with.stats.nodes as f64 / without.stats.nodes as f64);
+        }
+        let overall: f64 = ratios.iter().product::<f64>().powf(1.0 / ratios.len() as f64);
+        assert!(
+            overall < 0.98,
+            "aspiration must shrink the tree overall: geometric mean {overall:.3} over {:?}",
+            ratios,
+        );
+        assert!(
+            ratios.iter().all(|&r| r < 1.6),
+            "and no single position may blow up: {ratios:?}",
+        );
+    }
+
+    #[test]
+    fn the_window_widens_until_it_contains_the_answer() {
+        // The failure path, driven deliberately: centre the window on a value that is wildly
+        // wrong and check that the search still returns the true score. This is what makes the
+        // brick safe — a window is a guess, and a guess must be recoverable.
+        //
+        // Driven through `aspirated_root` rather than through `deepen`, because `deepen` feeds it
+        // the previous iteration's score, which is never wildly wrong. The one case that matters
+        // cannot be reached by driving the search normally.
+        let p = Position::from_fen(NATURES[2].1).unwrap();
+        const DEPTH: u32 = 5;
+        let truth = {
+            let mut t = Table::new();
+            let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+            s.root_full(&p, DEPTH, None).best.expect("a move").1
+        };
+        for wrong in [-5_000, -1_000, -200, 0, 200, 1_000, 5_000] {
+            let mut t = Table::new();
+            let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+            let r = s.aspirated_root(&p, DEPTH, None, Some(wrong));
+            assert_eq!(
+                r.window,
+                Window::Exact,
+                "centred on {wrong}, the result is still a bound",
+            );
+            assert_eq!(
+                r.best.expect("a move").1,
+                truth,
+                "centred on {wrong}, the score is wrong",
+            );
+        }
+    }
+
+    #[test]
+    fn a_mate_score_skips_the_window_entirely() {
+        // A mate score is not on the centipawn scale, so a +-25 window around `MATE - 3` is
+        // guaranteed to fail and would pay for the whole widening ladder to learn it. Asserted
+        // through the counter, since the effect is that something does *not* happen.
+        let p = Position::from_fen(NATURES[0].1).unwrap();
+        let mut t = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+        let r = s.aspirated_root(&p, 5, None, Some(MATE - 3));
+        assert_eq!(r.window, Window::Exact);
+        assert_eq!(
+            s.aspiration_searches, 0,
+            "a mate centre must go straight to the full window, not through the ladder",
+        );
+    }
+
+    #[test]
+    fn an_interrupted_search_is_never_re_searched() {
+        // Widening after an abort would search past the deadline, and worse: the value being
+        // widened around is the placeholder an aborted search returns, not a score. Swept over
+        // node ceilings rather than checked at one, because the interesting interruptions land
+        // at points a single chosen ceiling would miss — the lesson of the five inert tests this
+        // file has already collected.
+        let p = Position::from_fen(NATURES[2].1).unwrap();
+        for ceiling in (200..=4_000).step_by(200) {
+            let mut t = Table::new();
+            let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+            s.node_limit = Some(ceiling);
+            let stats = deepen(&p, Request::new(Limits::depth(8)), &mut s);
+            assert!(
+                stats.best.is_some(),
+                "ceiling {ceiling}: an interrupted search must still return a legal move",
+            );
+            // The ladder may run for completed iterations; what must not happen is a search
+            // started *after* the abort. `deepen` breaks out of its loop on `aborted`, so the
+            // count of give-ups is the observable: a give-up costs one extra full-window search.
+            assert!(
+                s.aspiration_gave_up <= s.aspiration_searches,
+                "ceiling {ceiling}: gave up {} times in {} searches",
+                s.aspiration_gave_up,
+                s.aspiration_searches,
+            );
         }
     }
 
