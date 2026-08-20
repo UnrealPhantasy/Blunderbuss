@@ -297,9 +297,12 @@ fn score(pos: &Position, mv: Move, killers: KillerSlots) -> i32 {
 /// Sorts `moves` in place: best captures first, then the killers of this node,
 /// then the remaining quiet moves.
 pub fn order_moves(pos: &Position, moves: &mut [Move], killers: KillerSlots) {
-    // Idiom: `sort_by_key` with `Reverse` sorts by the key in *descending* order,
-    // so the highest score comes first.
-    moves.sort_by_key(|&mv| std::cmp::Reverse(score(pos, mv, killers)));
+    // Idiom: `sort_by_cached_key` computes each key **once** and sorts the keys, where
+    // `sort_by_key` is free to recompute a key on every comparison — and `score` is not free:
+    // it reads the board through `is_quiet`, then `mvv_lva`, then the killer slots.
+    //
+    // `Reverse` sorts by the key in *descending* order, so the highest score comes first.
+    moves.sort_by_cached_key(|&mv| std::cmp::Reverse(score(pos, mv, killers)));
 }
 
 #[cfg(test)]
