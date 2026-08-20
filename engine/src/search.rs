@@ -2905,28 +2905,43 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore = "sweep: thousands of searches, run explicitly with --ignored"]
-    fn see_pruning_sweep_over_pseudo_random_play() {
-        // **What AC#3 was reaching for, measured instead of assumed.** The criterion asked for a
-        // score *identical* to an unpruned search. That is the wrong shape of claim — the fifth
-        // of its kind in this repository (#19, #27, #36, #42) — because a heuristic that drops
-        // captures may return a different, equally valid bound, exactly as alpha-beta always
-        // could. What matters is that no mate is lost and that the divergence stays bounded.
-        //
-        // Positions come from pseudo-random play rather than a hand-picked list: a list chosen
-        // by the author of the pruning is the one place its blind spots are least likely to be.
-        let mut rng = Xorshift(0x5EED_5EED);
-        let (mut comparisons, mut score_differs, mut move_differs) = (0u32, 0u32, 0u32);
-        let (mut worst_gap, mut mates_lost, mut mates_gained) = (0i32, 0u32, 0u32);
+    /// One sweep: walk `games` pseudo-random games, compare pruned against unpruned at each of
+    /// `depths`, and return what diverged.
+    ///
+    /// Factored out of the test so the sweep's parameters are visible at the call site: what a
+    /// reader needs in order to judge the figures is how many games and which depths produced
+    /// them, and a helper makes that one line instead of a loop to read.
+    struct Sweep {
+        comparisons: u32,
+        /// Comparisons where the *unpruned* search saw a mate. The sentinel asserts this is
+        /// non-zero: "no mate was lost" says nothing if no mate was there to lose.
+        mates_seen: u32,
+        score_differs: u32,
+        move_differs: u32,
+        worst_gap: i32,
+        mates_lost: u32,
+        mates_gained: u32,
+    }
 
-        for game in 0..1_000 {
+    fn see_pruning_sweep(games: u64, depths: &[u32]) -> Sweep {
+        let mut rng = Xorshift(0x5EED_5EED);
+        let mut out = Sweep {
+            comparisons: 0,
+            mates_seen: 0,
+            score_differs: 0,
+            move_differs: 0,
+            worst_gap: 0,
+            mates_lost: 0,
+            mates_gained: 0,
+        };
+
+        for game in 0..games {
             let mut pos = Position::from_fen(
                 "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
             )
             .unwrap();
-            // Walk a random number of plies into the game, then compare at two depths. The walk
-            // length varies so the sweep sees openings, middlegames and thin endgames alike.
+            // Walk a varying number of plies in, so the sweep sees openings, middlegames and thin
+            // endgames alike rather than one phase repeatedly.
             let plies = 4 + (game % 24);
             for _ in 0..plies {
                 let moves = pos.legal_moves();
@@ -2938,41 +2953,65 @@ mod tests {
             if pos.legal_moves().is_empty() {
                 continue;
             }
-            for depth in [5u32, 6] {
+            for &depth in depths {
                 let (pruned, _) = quiescence_pruned(&pos, depth, true);
                 let (full, _) = quiescence_pruned(&pos, depth, false);
                 let (Some((pm, ps)), Some((fm, fs))) = (pruned, full) else { continue };
-                comparisons += 1;
+                out.comparisons += 1;
                 if ps != fs {
-                    score_differs += 1;
-                    worst_gap = worst_gap.max((ps - fs).abs());
+                    out.score_differs += 1;
+                    out.worst_gap = out.worst_gap.max((ps - fs).abs());
                 }
                 if pm != fm {
-                    move_differs += 1;
+                    out.move_differs += 1;
                 }
                 let (pruned_mate, full_mate) =
                     (ps.abs() > MATE_THRESHOLD, fs.abs() > MATE_THRESHOLD);
+                if full_mate {
+                    out.mates_seen += 1;
+                }
                 if full_mate && !pruned_mate {
-                    mates_lost += 1;
+                    out.mates_lost += 1;
                 }
                 if pruned_mate && !full_mate {
-                    mates_gained += 1;
+                    out.mates_gained += 1;
                 }
             }
         }
+        out
+    }
+
+    #[test]
+    #[ignore = "sweep: thousands of searches, run explicitly with --ignored"]
+    fn see_pruning_sweep_over_pseudo_random_play() {
+        // **What AC#3 was reaching for, measured instead of assumed.** The criterion asked for a
+        // score *identical* to an unpruned search. That is the wrong shape of claim — the fifth
+        // of its kind in this repository (#19, #27, #36, #42) — because a heuristic that drops
+        // captures may return a different, equally valid bound, exactly as alpha-beta always
+        // could. What matters is that no mate is lost and that the divergence stays bounded.
+        //
+        // Positions come from pseudo-random play rather than a hand-picked list: a list chosen
+        // by the author of the pruning is the one place its blind spots are least likely to be.
+        let s = see_pruning_sweep(1_000, &[5, 6]);
 
         println!(
-            "sweep: {comparisons} comparisons | score differs {score_differs} \
-             ({:.1}%) | move differs {move_differs} | worst gap {worst_gap} cp | \
-             mates lost {mates_lost} | mates gained {mates_gained}",
-            100.0 * score_differs as f64 / comparisons as f64,
+            "sweep: {} comparisons | mates seen {} | score differs {} ({:.1}%) | \
+             move differs {} | worst gap {} cp | mates lost {} | mates gained {}",
+            s.comparisons,
+            s.mates_seen,
+            s.score_differs,
+            100.0 * s.score_differs as f64 / s.comparisons as f64,
+            s.move_differs,
+            s.worst_gap,
+            s.mates_lost,
+            s.mates_gained,
         );
 
         // **The claim that survives measurement**, and the only one asserted. A lost mate is the
         // failure that would make the brick worthless; a differing bound is not.
-        assert!(comparisons > 100, "the sweep must actually compare something: {comparisons}");
-        assert_eq!(mates_lost, 0, "pruning must never lose a mate the full search found");
-        assert_eq!(mates_gained, 0, "nor invent one");
+        assert!(s.mates_seen > 0, "precondition: the sweep must contain mates");
+        assert_eq!(s.mates_lost, 0, "pruning must never lose a mate the full search found");
+        assert_eq!(s.mates_gained, 0, "nor invent one");
     }
 
     #[test]
