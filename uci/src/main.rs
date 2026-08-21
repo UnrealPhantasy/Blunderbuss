@@ -232,6 +232,24 @@ impl Uci {
         }
     }
 
+    /// `setoption name <name> value <value>`, the only shape the protocol uses.
+    ///
+    /// Unknown options are ignored rather than refused: the protocol expects an engine to
+    /// tolerate whatever a GUI sends, and refusing would break a session over a setting we do
+    /// not have.
+    fn set_option(&mut self, tokens: &[&str]) {
+        let name = tokens.iter().position(|t| t.eq_ignore_ascii_case("name"));
+        let value = tokens.iter().position(|t| t.eq_ignore_ascii_case("value"));
+        let (Some(n), Some(v)) = (name, value) else { return };
+        let key = tokens[n + 1..v].join(" ");
+        let Some(raw) = tokens.get(v + 1) else { return };
+        if key.eq_ignore_ascii_case("threads") {
+            if let Ok(threads) = raw.parse::<usize>() {
+                self.engine.set_threads(threads);
+            }
+        }
+    }
+
     /// Handle one UCI command line and return what to print (and whether to quit).
     /// Unknown or empty commands are ignored, as the protocol requires.
     fn handle(&mut self, line: &str) -> Response {
@@ -240,9 +258,16 @@ impl Uci {
             Some("uci") => Response::lines(vec![
                 "id name Blunderbuss".to_string(),
                 "id author UnrealPhantasy".to_string(),
+                // Announced with `default 1` on purpose: a GUI that never touches the option
+                // gets the engine every published measurement was taken on.
+                "option name Threads type spin default 1 min 1 max 64".to_string(),
                 "uciok".to_string(),
             ]),
             Some("isready") => Response::lines(vec!["readyok".to_string()]),
+            Some("setoption") => {
+                self.set_option(&tokens[1..]);
+                Response::none()
+            }
             Some("ucinewgame") => {
                 self.position = Position::initial();
                 self.history.clear();
