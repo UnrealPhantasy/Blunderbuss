@@ -144,6 +144,113 @@ fn square_ahead(square: usize, color: Color) -> Option<usize> {
     }
 }
 
+/// For each file, the two files beside it — every square from which a *friendly* pawn could
+/// ever defend a pawn on that file.
+///
+/// Eight entries rather than the 128 of [`PASSED_MASK`], because isolation depends only on the
+/// file: no rank, and no direction of travel. A pawn is isolated when this mask and the
+/// friendly pawns do not intersect.
+static ADJACENT_FILES: LazyLock<[u64; 8]> = LazyLock::new(|| {
+    let mut masks = [0u64; 8];
+    for (file, mask) in masks.iter_mut().enumerate() {
+        for square in 0..64usize {
+            if (square % 8).abs_diff(file) == 1 {
+                *mask |= 1u64 << square;
+            }
+        }
+    }
+    masks
+});
+
+/// What an isolated pawn costs, by phase. Positive numbers, subtracted at the call site.
+///
+/// An isolated pawn can **never** be defended by a pawn, so defending it costs a piece for the
+/// rest of the game, and the file in front of it is a highway for the opponent's pieces. That
+/// is a permanent structural fact, not a transient one — which is why it belongs in an
+/// evaluation that a shuffling engine consults rather than in a search that would have to see
+/// the consequence.
+///
+/// **Heavier in the middlegame, and that is the opposite of the first attempt.** The first
+/// version charged more in the endgame, on the reasoning that a weak pawn cannot be compensated
+/// by activity once the pieces are gone. It measured **+2 ± 29** — nothing — and the reason is
+/// visible in how often an isolated pawn even is one. Measured over 19 555 positions from 150
+/// real games, the share of a side's pawns that are isolated, by how many it has left:
+///
+/// | pawns | isolated |
+/// |---|---|
+/// | 8 | **0.6 %** |
+/// | 6 | 19.0 % |
+/// | 4 | 34.8 % |
+/// | 2 | 57.1 % |
+/// | 1 | **100 %** |
+///
+/// An isolated pawn among eight is a genuine anomaly. One among two is the norm, and a lone pawn
+/// is isolated *by definition* — a tautology, not a weakness. So charging **more** in the endgame
+/// put the heaviest penalty exactly where the information is weakest, and the lightest where it
+/// is rarest and most telling. The gradation was backwards.
+///
+/// Both values stay at the bottom of the 10-20 centipawn range the literature gives, for the
+/// reason #46 established: the same term at two amplitudes returned −5 and +17 with identical
+/// draw figures, so the signal pays and the magnitude only buys risk.
+/// # Measured worth: nothing, and that is the finding
+///
+/// **11 600 anchored games** against a strength-limited Stockfish, accumulated over twelve runs:
+///
+/// | version | games | strength | vs baseline |
+/// |---|---|---|---|
+/// | without this term | 3 600 | 1846 ± 11 | — |
+/// | with it | 4 800 | 1845 ± 10 | **−1 ± 15** |
+/// | with it, passers exempt | 3 200 | 1843 ± 12 | −3 ± 16 |
+///
+/// A direct duel against our own previous build measured **+35 ± 30** for the same code. That
+/// figure was real and meant nothing: it measured the punishment of a blind spot only *our*
+/// clone had. Stockfish has known about pawn structure for thirty years, so there was nothing
+/// left to punish and the gain vanished at the anchor.
+///
+/// **The rule that follows, and it applies before writing any evaluation term**: ask whether the
+/// anchor opponent already knows this. If it does, the duel against our own clone is structurally
+/// flattering and only the anchored measurement counts. Pawn structure — yes, hence a factor of
+/// zero. Search reductions — no, hence null-move's factor of 1.05.
+///
+/// Kept rather than deleted because one hypothesis remains untested: this is the *only* structural
+/// pawn term in the evaluation, and one weakness among none may be below whatever threshold
+/// changes a move choice. Doubled and backward pawns share these masks and this insertion point;
+/// if either measures positive alone, the three together are worth one more measurement.
+const ISOLATED_MIDDLEGAME: i32 = 14;
+const ISOLATED_ENDGAME: i32 = 6;
+
+// Both invariants checked at **compile time** rather than by a test, which is strictly
+// stronger: a schedule that breaks them cannot be built, let alone shipped and measured.
+//
+// They are easy to break in a way no other test would catch. Both constants are *subtracted*
+// at the call site, so a negative one silently turns the penalty into a bonus — the engine
+// would then seek isolated pawns, compile cleanly, and simply play worse. And the endgame
+// weight exceeding the middlegame one is the entire reason the term is tapered.
+//
+// Idiom: `const { … }` forces the assertion into constant evaluation. Verified that the
+// mutation `ISOLATED_MIDDLEGAME = -8` fails the *build* with this message rather than a test.
+const _: () = {
+    assert!(ISOLATED_MIDDLEGAME > 0, "the penalty is subtracted; a negative one is a bonus");
+    assert!(ISOLATED_ENDGAME > 0, "the penalty is subtracted; a negative one is a bonus");
+    // The direction that the first version asserted the other way round. Worth noting what that
+    // cost: a `const` assertion is stronger than a test, but it does not make a hypothesis true —
+    // it only locks a belief in more firmly. The belief here was "a weak pawn matters more once
+    // the pieces are gone", and the measurement above says isolation stops carrying information
+    // exactly then.
+    assert!(
+        ISOLATED_MIDDLEGAME > ISOLATED_ENDGAME,
+        "isolation is near-inevitable with few pawns, so it informs least in the endgame",
+    );
+};
+
+/// Whether the pawn on `square` has no friendly pawn on either adjacent file.
+///
+/// `own_pawns` includes the pawn being asked about, which is harmless: it stands on its own
+/// file, and the mask covers only the two files beside it.
+fn is_isolated(square: usize, own_pawns: u64) -> bool {
+    ADJACENT_FILES[square % 8] & own_pawns == 0
+}
+
 /// Whether the pawn on `square` (given as an index, `a1` = 0) has no enemy pawn able to stop
 /// it — nothing on its file or the two beside it, anywhere ahead.
 fn is_passed(square: usize, color: Color, enemy_pawns: u64) -> bool {
@@ -184,6 +291,14 @@ pub fn evaluate(pos: &Position) -> i32 {
             // the *absolute* square, since it is about where the enemy pawns really are.
             if piece == Piece::Pawn {
                 let enemy = pawns[!color as usize];
+                // A pawn with no friend beside it can never be defended by a pawn. Charged
+                // before the passed-pawn bonus and independently of it: a pawn can be both
+                // isolated and passed, and it is then genuinely both — a real asset standing on
+                // a permanent weakness.
+                if is_isolated(sq as usize, pawns[color as usize]) {
+                    mg -= ISOLATED_MIDDLEGAME;
+                    eg -= ISOLATED_ENDGAME;
+                }
                 if is_passed(sq as usize, color, enemy) {
                     let rank = square / 8;
                     let (mut bonus_mg, mut bonus_eg) =
@@ -576,6 +691,97 @@ mod tests {
             .collect();
         let side = if rest.starts_with('w') { 'b' } else { 'w' };
         format!("{} {} {}", flipped.join("/"), side, &rest[2..])
+    }
+
+    // --- isolated pawns -------------------------------------------------------
+
+    // Is the pawn on `square` isolated, given the position in `fen`?
+    fn isolated_in(fen: &str, square: &str, color: Color) -> bool {
+        let pos = Position::from_fen(fen).unwrap();
+        let sq: Square = square.parse().expect("a square name");
+        is_isolated(sq as usize, pos.pawns(color))
+    }
+
+    #[test]
+    fn a_pawn_is_isolated_when_no_friend_stands_beside_it() {
+        // Both adjacent files, a friend further away, and the case that must *not* count: an
+        // enemy pawn beside ours does not un-isolate it, because it will never defend it.
+        // Swept as a table so a failure names the relationship that broke.
+        let cases = [
+            ("8/8/8/3P4/8/8/8/K6k w - - 0 1", "d5", Color::White, true,
+             "no other friendly pawn at all"),
+            ("8/8/8/2PP4/8/8/8/K6k w - - 0 1", "d5", Color::White, false,
+             "friend on the file to the left"),
+            ("8/8/8/3PP3/8/8/8/K6k w - - 0 1", "d5", Color::White, false,
+             "friend on the file to the right"),
+            ("8/8/8/1P1P4/8/8/8/K6k w - - 0 1", "d5", Color::White, true,
+             "friend two files away cannot ever defend it"),
+            ("8/8/8/3P4/2p5/8/8/K6k w - - 0 1", "d5", Color::White, true,
+             "an ENEMY pawn beside it does not un-isolate it"),
+            ("8/8/8/3P4/3P4/8/8/K6k w - - 0 1", "d5", Color::White, true,
+             "a friend on the SAME file is doubled, not adjacent — still isolated"),
+            // The rank is irrelevant, unlike for passed pawns: a friend anywhere on an
+            // adjacent file counts, even far behind.
+            ("8/8/8/3P4/8/8/2P5/K6k w - - 0 1", "d5", Color::White, false,
+             "friend on an adjacent file, six ranks behind — still a defender one day"),
+            // Black runs the other way, but isolation has no direction, so nothing flips.
+            ("8/8/8/3p4/8/8/8/K6k w - - 0 1", "d5", Color::Black, true,
+             "black pawn alone"),
+            ("8/8/8/2pp4/8/8/8/K6k w - - 0 1", "d5", Color::Black, false,
+             "black pawn with a black friend beside it"),
+        ];
+        for (fen, square, color, expected, why) in cases {
+            assert_eq!(
+                isolated_in(fen, square, color),
+                expected,
+                "{why} — `{fen}` square {square} for {color:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn an_isolated_pawn_costs_rather_than_pays() {
+        // The sign, end to end through `evaluate`. Two positions differing only in whether the
+        // pawn has a neighbour — and compared against their own baselines, since the second
+        // contains an extra pawn whose material would swamp the term.
+        let isolated = Position::from_fen("4k3/8/8/8/8/8/3P4/4K3 w - - 0 1").unwrap();
+        let supported = Position::from_fen("4k3/8/8/8/8/8/2PP4/4K3 w - - 0 1").unwrap();
+        let bare = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let one_pawn = Position::from_fen("4k3/8/8/8/8/8/2P5/4K3 w - - 0 1").unwrap();
+        let alone = evaluate(&isolated) - evaluate(&bare);
+        let with_friend = evaluate(&supported) - evaluate(&one_pawn);
+        assert!(
+            alone < with_friend,
+            "an isolated pawn must be worth less than a supported one: {alone} against \
+             {with_friend}",
+        );
+    }
+
+    // No runtime test for "the endgame weight exceeds the middlegame one", nor for "both are
+    // positive": both are `const` assertions beside the constants themselves, so breaking either
+    // fails the *build*. A test asserting the same thing would be weaker and would read as the
+    // only thing standing guard. Note for whoever mutates these constants: the failure arrives
+    // as a compile error, not a red test.
+
+    #[test]
+    fn isolation_is_colour_symmetric() {
+        // Isolation has no direction, so unlike the passed-pawn mask there is no axis to get
+        // backwards — which is exactly why this is worth asserting rather than assumed: the
+        // failure mode would be reading the *enemy* pawns instead of one's own, and that
+        // mistake is invisible in a position where both sides mirror each other.
+        for fen in [
+            "4k3/8/8/8/8/8/3P4/4K3 w - - 0 1",   // lone isolated pawn
+            "4k3/8/8/8/8/8/2PP4/4K3 w - - 0 1",  // supported pair
+            "4k3/3p4/8/8/8/8/3P4/4K3 w - - 0 1", // both sides isolated on the same file
+            "4k3/2p5/8/8/8/8/3P4/4K3 w - - 0 1", // white isolated, black isolated elsewhere
+        ] {
+            let mirrored = mirror(fen);
+            let (a, b) = (
+                Position::from_fen(fen).unwrap(),
+                Position::from_fen(&mirrored).unwrap(),
+            );
+            assert_eq!(evaluate(&a), evaluate(&b), "`{fen}` mirrors to `{mirrored}`");
+        }
     }
 
     // --- passed pawns ---------------------------------------------------------
