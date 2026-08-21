@@ -144,6 +144,13 @@ impl Position {
     /// caller *must* decide what to do with an invalid FEN, it cannot ignore it
     /// by accident. `?` propagates the error if parsing fails. The `false` in
     /// `from_fen` disables Chess960 mode (out of scope).
+    /// La position en FEN. **Tests seulement** : sert à identifier une position trouvée par un
+    /// balayage, pour qu'un défaut soit reproductible à partir d'une chaîne.
+    #[cfg(test)]
+    pub fn to_fen(&self) -> String {
+        format!("{}", self.0)
+    }
+
     pub fn from_fen(fen: &str) -> Result<Position, cozy_chess::FenParseError> {
         Ok(Position(Board::from_fen(fen, false)?))
     }
