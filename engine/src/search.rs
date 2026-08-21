@@ -424,12 +424,9 @@ impl Engine {
         let table = &self.table;
         let stop = AtomicBool::new(false);
         std::thread::scope(|scope| {
-            // The helpers, spawned first so the reporting search runs on *this* thread: its
-            // `progress` callback holds a `&mut` closure the caller owns, which cannot be sent
-            // anywhere, and having it stay put is simpler than making it shareable.
-            // Rust idiom: `move` closures move *everything* they name, so the flag is bound to
-            // a reference first. Copying a `&AtomicBool` into each closure is what shares it;
-            // naming `stop` directly would move the flag itself into the first helper.
+            // Rust idiom: `move` closures move *everything* they name, so the flag is bound to a
+            // reference first. Copying a `&AtomicBool` into each closure is what shares it;
+            // naming `stop` directly would move the flag into the first helper.
             let stop = &stop;
             let mut helpers = Vec::with_capacity(self.threads - 1);
             for id in 1..self.threads {
@@ -440,16 +437,17 @@ impl Engine {
                     // running the identical loop from depth 1, they explore the same tree at the
                     // same moment: they duplicate each other's work and fight over the same
                     // slots. Measured, that made eight threads *slower* than one. Starting each
-                    // helper deeper spreads them out in time, so a helper is usually working on
-                    // a region the reporting thread has not reached yet — which is the whole
-                    // point, since what it leaves behind is only useful if it got there first.
+                    // helper deeper spreads them out in time, so a helper is usually working on a
+                    // region the reporting thread has not reached yet — which is the whole point,
+                    // since what it leaves behind is only useful if it got there first.
                     s.start_depth = 1 + (id as u32 % 3);
-                    // A helper reports nothing. Its contribution is what it leaves in the table.
                     let helper = Request {
                         limits: Limits { max_depth, deadline },
                         history,
                         progress: None,
                     };
+                    // A helper reports nothing. Its whole contribution is what it leaves in
+                    // the table.
                     deepen(pos, helper, &mut s).nodes
                 }));
             }
@@ -457,11 +455,20 @@ impl Engine {
             searcher.stop = Some(stop);
             let mut stats = deepen(pos, request, &mut searcher);
             // The answer is in. Everything still running is now working on a question that has
-            // been answered, and `scope` will not return until they notice.
+            // been answered, and `scope` cannot return until they notice.
             stop.store(true, Atomicity::Relaxed);
-            // Joined rather than dropped, so the helpers' work is *visible*. `nodes` stays the
-            // reporting thread's — every published measurement is that number — and the total
-            // goes in its own field.
+
+            // **The answer is this thread's, and deliberately so.** Taking the deepest thread's
+            // result instead was tried and reverted: it makes the engine announce a `bestmove`
+            // at a depth no `info` line ever reported, which is not a cosmetic problem here —
+            // every depth measurement in this project reads those lines out of the PGN, so the
+            // instruments would under-read the engine's own depth. That trade would be worth
+            // making for a real speedup. There is none to pay for it (see the PR), so the
+            // consistent version is the one that ships.
+            //
+            // Joined rather than dropped, so the helpers' work is *visible*. `nodes` stays this
+            // thread's — every published measurement is that number — and the total of the
+            // others goes in its own field.
             stats.helper_nodes = helpers.into_iter().filter_map(|h| h.join().ok()).sum();
             stats
         })
