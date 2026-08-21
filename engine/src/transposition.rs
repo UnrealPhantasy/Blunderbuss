@@ -11,7 +11,7 @@
 //! most* something. Storing that distinction is what makes the table correct
 //! rather than merely fast — see [`Bound`].
 
-use crate::position::Move;
+use crate::position::{Move, Piece, Square};
 use crate::search::MATE_THRESHOLD;
 
 /// What a stored score tells us about the true value of a position.
@@ -30,18 +30,134 @@ pub enum Bound {
     Upper,
 }
 
-/// One cached position.
+/// One cached position, packed into a single 64-bit word.
 ///
-/// `key` is the full Zobrist key, not the table index. Two positions can share
-/// an index, so the key is what distinguishes "this entry is about the position
-/// I am asking about" from "this entry belongs to someone else".
-#[derive(Clone, Copy)]
-struct Entry {
-    key: u64,
-    depth: u32,
-    score: i32,
-    bound: Bound,
-    best: Option<Move>,
+/// Packed rather than kept as a struct because the table has to be readable and writable from
+/// several threads at once, and a struct of 24 bytes cannot be written in one instruction. Two
+/// atomic words can — see [`Slot`], which is where the lock-free part actually lives.
+///
+/// The layout puts the move in the low bits, so packing it is self-contained, and the
+/// `OCCUPIED` flag above the fields, so an all-zero word — what a freshly cleared table
+/// holds — decodes as *empty* rather than as a legal entry with score zero.
+///
+/// | bits | field |
+/// |---|---|
+/// | 0..16 | the best move, or zero for none |
+/// | 16..36 | the score, two's complement |
+/// | 36..44 | the depth searched |
+/// | 44..46 | the bound |
+/// | 46 | occupied |
+mod layout {
+    pub const SCORE_SHIFT: u32 = 16;
+    pub const SCORE_BITS: u32 = 20;
+    pub const DEPTH_SHIFT: u32 = 36;
+    pub const BOUND_SHIFT: u32 = 44;
+    pub const OCCUPIED: u64 = 1 << 46;
+}
+
+/// Rust idiom: `Ordering::Relaxed` on every access below, aliased here because `Ordering` is
+/// also the name of a chess concept in this crate. Relaxed orders nothing — it guarantees only
+/// that a single word is not read or written half-way. That is exactly the guarantee wanted:
+/// the table is a cache, no other data depends on having seen an entry, and a reader that
+/// misses a store simply searches the node. Anything stronger would buy a synchronisation
+/// nothing needs and pay for it on the hottest path in the engine.
+use std::sync::atomic::{AtomicU64, Ordering as Atomicity};
+
+/// One slot: two atomic words, no lock and no `unsafe`.
+///
+/// Rust idiom: a struct of two atomics rather than an atomic of a struct. There is no
+/// `AtomicU128` on stable, so a 16-byte entry cannot be written in one go — and that is the
+/// whole difficulty this type exists to solve.
+///
+/// **`check` is not the key.** It is `key ^ data`. Storing the key plainly would leave a torn
+/// slot undetectable: two threads writing at once can leave the key of one beside the data of
+/// the other, and the full-key comparison — the thing that makes an entry trustworthy — would
+/// accept it.
+///
+/// With the XOR, a reader recovers `check ^ data` and compares *that* to the key it wants. A
+/// torn read gives `check` from write A and `data` from write B, so the comparison sees
+/// `key_A ^ data_A ^ data_B`, which equals the wanted key only when `data_A == data_B` — and in
+/// that case the slot is coherent anyway. The scheme is therefore **exact rather than
+/// probabilistic**, which is why it needs neither `unsafe` nor a lock. It is Hyatt's lockless
+/// hashing, and it is the reason a shared table costs two relaxed loads instead of a mutex.
+///
+/// The residual risk is a false *accept*: `key_A ^ delta` coinciding with the wanted key. That
+/// needs a 64-bit coincidence between an unrelated Zobrist key and a difference of two plausible
+/// data words — negligible, though not zero, and worth stating rather than implying.
+struct Slot {
+    check: AtomicU64,
+    data: AtomicU64,
+}
+
+impl Slot {
+    fn empty() -> Slot {
+        Slot { check: AtomicU64::new(0), data: AtomicU64::new(0) }
+    }
+}
+
+/// A move as sixteen bits: one flag, two squares, a promotion.
+///
+/// Zero means "no move". The flag sits at the bottom rather than being implied by the squares
+/// both reading zero: `a1a1` is not a legal move, but relying on that would smuggle a rule of
+/// chess into a bit layout.
+fn pack_move(best: Option<Move>) -> u64 {
+    match best {
+        None => 0,
+        Some(mv) => {
+            let promotion = mv.promotion.map_or(0, |p| p as u64 + 1);
+            1 | ((mv.from as u64) << 1) | ((mv.to as u64) << 7) | (promotion << 13)
+        }
+    }
+}
+
+fn unpack_move(word: u64) -> Option<Move> {
+    if word & 1 == 0 {
+        return None;
+    }
+    let promotion = (word >> 13) & 0x7;
+    Some(Move {
+        from: Square::index(((word >> 1) & 0x3F) as usize),
+        to: Square::index(((word >> 7) & 0x3F) as usize),
+        promotion: (promotion > 0).then(|| Piece::index(promotion as usize - 1)),
+    })
+}
+
+fn pack(depth: u32, score: i32, bound: Bound, best: Option<Move>) -> u64 {
+    use layout::*;
+    // Twenty bits hold ±524 287. The largest value the search ever stores is a mate score
+    // adjusted by the ply, about 30 064 — four bits of headroom over what is reachable, and the
+    // assertion states it rather than leaving it to be trusted.
+    debug_assert!(score.unsigned_abs() < (1 << (SCORE_BITS - 1)), "score {score} does not fit");
+    debug_assert!(depth < 256, "depth {depth} does not fit");
+    let score_bits = (score as i64 as u64) & ((1 << SCORE_BITS) - 1);
+    let bound_bits = match bound {
+        Bound::Exact => 0u64,
+        Bound::Lower => 1,
+        Bound::Upper => 2,
+    };
+    OCCUPIED
+        | (bound_bits << BOUND_SHIFT)
+        | ((depth as u64) << DEPTH_SHIFT)
+        | (score_bits << SCORE_SHIFT)
+        | pack_move(best)
+}
+
+/// Rust idiom: sign extension by hand. Shifting a value up to the top of an `i64` and back down
+/// copies the sign bit, which is what makes a 20-bit two's-complement field read back as a
+/// negative `i32`. A plain mask would turn every negative score into a large positive one.
+fn unpack(word: u64) -> Option<(u32, i32, Bound, Option<Move>)> {
+    use layout::*;
+    if word & OCCUPIED == 0 {
+        return None;
+    }
+    let shift = 64 - SCORE_BITS;
+    let score = ((((word >> SCORE_SHIFT) << shift) as i64) >> shift) as i32;
+    let bound = match (word >> BOUND_SHIFT) & 0x3 {
+        0 => Bound::Exact,
+        1 => Bound::Lower,
+        _ => Bound::Upper,
+    };
+    Some((((word >> DEPTH_SHIFT) & 0xFF) as u32, score, bound, unpack_move(word)))
 }
 
 /// What a probe found: enough to cut off, or just a move worth trying first.
@@ -64,10 +180,10 @@ const ENTRIES: usize = 1 << 20;
 pub struct Table {
     /// Idiom: `Box<[T]>` is a heap slice of fixed length — a `Vec` without the
     /// capacity to grow, which is exactly what a table with a fixed mask wants.
-    entries: Box<[Option<Entry>]>,
-    hits: u64,
-    probes: u64,
-    cutoffs: u64,
+    slots: Box<[Slot]>,
+    hits: AtomicU64,
+    probes: AtomicU64,
+    cutoffs: AtomicU64,
 }
 
 impl Default for Table {
@@ -78,7 +194,14 @@ impl Default for Table {
 
 impl Table {
     pub fn new() -> Table {
-        Table { entries: vec![None; ENTRIES].into_boxed_slice(), hits: 0, probes: 0, cutoffs: 0 }
+        // `AtomicU64` is not `Clone`, so `vec![...; N]` is unavailable: each slot has to be
+        // constructed. One allocation either way.
+        Table {
+            slots: (0..ENTRIES).map(|_| Slot::empty()).collect::<Vec<_>>().into_boxed_slice(),
+            hits: AtomicU64::new(0),
+            probes: AtomicU64::new(0),
+            cutoffs: AtomicU64::new(0),
+        }
     }
 
     /// Forget everything, keeping the allocation.
@@ -92,10 +215,13 @@ impl Table {
     /// kept at all: building a fresh one costs 7.3 ms, which is 7% of a late-game
     /// thinking budget. Overwriting in place costs a memset and no page faults.
     pub fn clear(&mut self) {
-        self.entries.fill(None);
-        self.hits = 0;
-        self.probes = 0;
-        self.cutoffs = 0;
+        for slot in self.slots.iter() {
+            slot.check.store(0, Atomicity::Relaxed);
+            slot.data.store(0, Atomicity::Relaxed);
+        }
+        self.hits.store(0, Atomicity::Relaxed);
+        self.probes.store(0, Atomicity::Relaxed);
+        self.cutoffs.store(0, Atomicity::Relaxed);
     }
 
     /// Fraction of probes that found an entry for *this* position — a key match,
@@ -114,10 +240,10 @@ impl Table {
     /// previous one's best move, which changes the move order and therefore the mix
     /// of entries the table ends up holding.
     pub fn key_match_rate(&self) -> f64 {
-        if self.probes == 0 {
+        if self.probes.load(Atomicity::Relaxed) == 0 {
             0.0
         } else {
-            self.hits as f64 / self.probes as f64
+            self.hits.load(Atomicity::Relaxed) as f64 / self.probes.load(Atomicity::Relaxed) as f64
         }
     }
 
@@ -134,10 +260,10 @@ impl Table {
     /// | Kiwipete | 0.467 | 0.243 |
     /// | Ruy Lopez | 0.295 | 0.159 |
     pub fn cutoff_rate(&self) -> f64 {
-        if self.probes == 0 {
+        if self.probes.load(Atomicity::Relaxed) == 0 {
             0.0
         } else {
-            self.cutoffs as f64 / self.probes as f64
+            self.cutoffs.load(Atomicity::Relaxed) as f64 / self.probes.load(Atomicity::Relaxed) as f64
         }
     }
 
@@ -150,26 +276,29 @@ impl Table {
     ///
     /// `ply` is needed because mate scores are stored relative to the node that
     /// found them — see [`Table::store`].
-    pub fn probe(&mut self, key: u64, depth: u32, alpha: i32, beta: i32, ply: i32) -> Hit {
-        self.probes += 1;
-        let Some(entry) = self.entries[self.index(key)] else {
-            return Hit { cutoff: None, best: None };
-        };
-        // A different position living at the same index. Its score says nothing
-        // about ours.
-        if entry.key != key {
+    pub fn probe(&self, key: u64, depth: u32, alpha: i32, beta: i32, ply: i32) -> Hit {
+        self.probes.fetch_add(1, Atomicity::Relaxed);
+        let slot = &self.slots[self.index(key)];
+        let data = slot.data.load(Atomicity::Relaxed);
+        let check = slot.check.load(Atomicity::Relaxed);
+        // An empty slot, another position at the same index, and a torn write are the same
+        // answer here — and one comparison covers all three.
+        if check ^ data != key {
             return Hit { cutoff: None, best: None };
         }
-        self.hits += 1;
+        let Some((entry_depth, stored_score, bound, best)) = unpack(data) else {
+            return Hit { cutoff: None, best: None };
+        };
+        self.hits.fetch_add(1, Atomicity::Relaxed);
 
-        let score = from_table(entry.score, ply);
+        let score = from_table(stored_score, ply);
         // A shallower entry was searched less thoroughly than we are about to
         // search: its score is not trustworthy for this depth. Its *move* still
         // is — a good move stays a good move.
-        let cutoff = if entry.depth < depth {
+        let cutoff = if entry_depth < depth {
             None
         } else {
-            match entry.bound {
+            match bound {
                 Bound::Exact => Some(score),
                 Bound::Lower if score >= beta => Some(score),
                 Bound::Upper if score <= alpha => Some(score),
@@ -177,9 +306,9 @@ impl Table {
             }
         };
         if cutoff.is_some() {
-            self.cutoffs += 1;
+            self.cutoffs.fetch_add(1, Atomicity::Relaxed);
         }
-        Hit { cutoff, best: entry.best }
+        Hit { cutoff, best }
     }
 
     /// Record what a search of `depth` plies concluded about `key`.
@@ -188,14 +317,14 @@ impl Table {
     /// lets a stale deep entry hold a slot for the whole search; always replacing
     /// keeps the table biased towards what the search is looking at now. Worth
     /// revisiting with a measurement rather than by intuition.
-    pub fn store(&mut self, key: u64, depth: u32, score: i32, bound: Bound, best: Option<Move>) {
+    pub fn store(&self, key: u64, depth: u32, score: i32, bound: Bound, best: Option<Move>) {
         self.store_at(key, depth, score, bound, best, 0)
     }
 
     /// As [`Table::store`], with the `ply` at which the score was found so mate
     /// scores can be made root-independent.
     pub fn store_at(
-        &mut self,
+        &self,
         key: u64,
         depth: u32,
         score: i32,
@@ -203,9 +332,12 @@ impl Table {
         best: Option<Move>,
         ply: i32,
     ) {
-        let i = self.index(key);
-        self.entries[i] =
-            Some(Entry { key, depth, score: to_table(score, ply), bound, best });
+        let data = pack(depth, to_table(score, ply), bound, best);
+        let slot = &self.slots[self.index(key)];
+        // There is no write order that closes the window in which a reader sees one new word
+        // beside one old one — which is precisely why the XOR is there instead of an order.
+        slot.check.store(key ^ data, Atomicity::Relaxed);
+        slot.data.store(data, Atomicity::Relaxed);
     }
 }
 
