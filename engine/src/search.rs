@@ -146,6 +146,58 @@ const LMR_MIN_DEPTH: u32 = 3;
 /// best one. It is a floor on trust in the ordering, not a measurement.
 const LMR_FULL_DEPTH_MOVES: usize = 3;
 
+/// How far into a branch a check may still be extended, as a multiple of the iteration's
+/// nominal depth.
+///
+/// **This bound is what makes the extension safe rather than usually-safe.** An extension
+/// hands the child the parent's `depth` instead of `depth - 1`, so along a line where every
+/// move gives check the depth never decreases and nothing in the recursion terminates it.
+/// Checks do run out in a real game, and the repetition test at the top of a node already
+/// returns 0 on a perpetual — but "a draw rule will stop it eventually" bounds the *game*,
+/// not the stack, and a search that dies of stack exhaustion reads in an arena as an engine
+/// that crashed mid-move.
+///
+/// Past `2 * root_depth` plies extension is refused, so `depth` decreases strictly at every
+/// level again and the branch ends within `root_depth` further plies. Any branch is
+/// therefore bounded at `3 * root_depth`, which a test asserts by sweeping depths rather
+/// than picking one.
+///
+/// Why a multiple of the iteration's depth rather than a fixed number of plies: iterative
+/// deepening searches depth 1, 2, 3, … with the same searcher, and a fixed budget would be
+/// generous at depth 3 and stingy at depth 12. Scaling it keeps the amount of extension a
+/// branch may accumulate proportional to what the iteration is trying to see.
+const CHECK_EXTENSION_PLY_BUDGET: i32 = 2;
+
+/// The most depth a node may have and still extend a checking move.
+///
+/// **Two, and every part of that is a measurement rather than a convention.** The scope was
+/// swept against a search identical but for the extension. Correctness is counted as mates
+/// found that the unextended search misses, over 14 tactical positions at depths 2 to 6; cost
+/// is the worst node ratio over four positions of different natures (opening, quiet
+/// middlegame, tactical, pawn endgame) at depths 3 to 8:
+///
+/// | scope    | mates found | worst node ratio | worst ratio at depth 8 |
+/// |----------|-------------|------------------|------------------------|
+/// | `d <= 1` | **0**       | 1.325            | 1.160                  |
+/// | `d <= 2` | 3           | 1.658            | **1.413**              |
+/// | `d <= 3` | 4           | 2.433            | 1.596                  |
+/// | every    | 5           | 2.614            | **2.614**              |
+///
+/// Two readings decide it. **The floor**: extending only at `depth == 1` finds nothing at
+/// all — it is not the same brick made cheaper, it is a different and empty one. **The
+/// ceiling**: extending everywhere multiplies a pawn endgame's tree by 2.6, about 1.1 plies
+/// of work handed back at an effective branching factor of 2.36, and a pawn endgame is
+/// exactly the phase where this engine already loses its half-points. The last two mates cost
+/// more than half of the remaining depth budget to buy.
+///
+/// The mechanism agrees, and it was derived from the numbers rather than before them. What
+/// the extension repairs is quiescence's blindness to checks: past the depth limit the search
+/// keeps only captures and queen promotions, so a quiet check is dropped before quiescence
+/// looks at it. Resolving a forcing line needs three plies — our check, the forced reply, and
+/// the move that collects. A node at `depth == 1` buys one of them, which is why it finds
+/// nothing; `depth == 2` buys the sequence.
+const CHECK_EXTENSION_MAX_DEPTH: u32 = 2;
+
 /// How far / how long to search.
 pub struct Limits {
     /// Never search deeper than this.
@@ -496,6 +548,13 @@ struct Searcher<'a> {
     /// it lives for the whole search, so each deepening iteration starts on what the
     /// previous one learned.
     killers: Killers,
+    /// The depth of the iteration currently running, recorded by [`Searcher::root`].
+    ///
+    /// The only production state the check extension needs: its ply bound is a multiple of
+    /// this. Zero until an iteration starts, which refuses every extension — a searcher
+    /// driven straight through `negamax` without a root has no nominal depth to scale, and
+    /// declining to extend is the conservative reading of that.
+    root_depth: u32,
     /// Abort once this many nodes have been visited.
     ///
     /// **Tests only** — the whole field is compiled out otherwise, so it cannot cost
@@ -560,6 +619,48 @@ struct Searcher<'a> {
     lmr_reductions: u64,
     #[cfg(test)]
     lmr_researches: u64,
+    /// Whether checks may be extended at all.
+    ///
+    /// **Tests only**, compiled out otherwise — the same device as `allow_lmr`, and for the
+    /// same reason: a node count or a verdict only means something against a search that is
+    /// identical but for the one thing under measurement.
+    #[cfg(test)]
+    allow_extensions: bool,
+    /// How many moves were extended, and how many extensions the ply bound refused.
+    ///
+    /// **Tests only.** The refusal counter is the load-bearing one: the bound's whole effect
+    /// is that something does *not* happen, and #40 established that a component can pass
+    /// every test it owns while being wired to nothing. Counting from inside the search is
+    /// what lets a test assert the use rather than the mechanism.
+    #[cfg(test)]
+    extensions: u64,
+    #[cfg(test)]
+    extensions_refused: u64,
+    /// The deepest ply any node of this search reached.
+    ///
+    /// **Tests only.** This is the quantity the ply bound exists to bound, so it is the one
+    /// a test should read — asserting on the constant instead would compare the guard
+    /// against a transcription of itself.
+    #[cfg(test)]
+    max_ply: i32,
+    /// How many moves were both extended and reduced.
+    ///
+    /// **Tests only.** The two are mutually exclusive today by construction — the reduction
+    /// guard refuses a checking move, the extension requires one — and the previous brick
+    /// learned what an unstated redundancy costs: a ceiling silently expressed the same
+    /// condition as a guard, and the two tests named after that guard stopped discriminating
+    /// without anything failing. A counter turns the coincidence into an invariant that
+    /// breaks loudly when it stops holding.
+    #[cfg(test)]
+    extended_and_reduced: u64,
+    /// The depth ceiling actually applied, so a test can compare the retained scope against
+    /// another one inside the same binary.
+    ///
+    /// **Tests only**, defaulting to [`CHECK_EXTENSION_MAX_DEPTH`] — the same device as
+    /// `lmr_growing`: the question a scope has to answer is "better than the other scope",
+    /// and a comparison across two builds picks up every other difference between them.
+    #[cfg(test)]
+    ext_max_depth: u32,
     /// Whether quiescence may drop captures the exchange evaluation calls losing.
     ///
     /// **Tests only**, compiled out otherwise. Needed more here than for the other switches:
@@ -580,6 +681,7 @@ impl<'a> Searcher<'a> {
             history: Vec::new(),
             path: Vec::new(),
             killers: Killers::new(),
+            root_depth: 0,
             #[cfg(test)]
             node_limit: None,
             #[cfg(test)]
@@ -598,6 +700,18 @@ impl<'a> Searcher<'a> {
             lmr_reductions: 0,
             #[cfg(test)]
             lmr_researches: 0,
+            #[cfg(test)]
+            allow_extensions: true,
+            #[cfg(test)]
+            extensions: 0,
+            #[cfg(test)]
+            extensions_refused: 0,
+            #[cfg(test)]
+            max_ply: 0,
+            #[cfg(test)]
+            extended_and_reduced: 0,
+            #[cfg(test)]
+            ext_max_depth: CHECK_EXTENSION_MAX_DEPTH,
             #[cfg(test)]
             allow_see_pruning: true,
         }
@@ -662,6 +776,11 @@ impl<'a> Searcher<'a> {
     /// cut off (no `beta` above the root), and tries `pv_move` first if given.
     fn root(&mut self, pos: &Position, depth: u32, pv_move: Option<Move>) -> RootResult {
         self.nodes += 1;
+        // The iteration's nominal depth, which the check extension's ply bound scales.
+        // Recorded here rather than passed down: it is constant for the whole iteration, and
+        // threading it through every `negamax` call would put it in the signature of the
+        // hottest function in the engine to say something that never changes.
+        self.root_depth = depth;
         let mut moves = pos.legal_moves();
         if moves.is_empty() {
             return RootResult { best: None, improved: false };
@@ -736,6 +855,69 @@ impl<'a> Searcher<'a> {
         depth > NULL_MOVE_REDUCTION + 1 && phase(pos) >= NULL_MOVE_MIN_PHASE
     }
 
+    /// One ply given back to a move that gives check, or zero.
+    ///
+    /// # Why a check is the move worth a ply
+    ///
+    /// Two properties of this engine meet on a checking move, and both make a shallow
+    /// verdict about it unusually expensive.
+    ///
+    /// **The reply is forced.** A side in check has a handful of legal moves — often one.
+    /// The premise every reduction rests on, that most moves in a list are irrelevant, is
+    /// simply false there, so the depth spent is not spread thin over unlikely branches. It
+    /// buys the whole subtree.
+    ///
+    /// **Quiescence cannot see a check.** Past the depth limit the search continues on
+    /// captures and queen promotions only. A *quiet* check — the move that mates or wins
+    /// material without taking anything — is filtered out before quiescence looks at it, so
+    /// a forcing sequence beginning one ply past the horizon is scored as if it did not
+    /// exist. Extending pulls the start of such a sequence back inside the real search, and
+    /// the reductions are what made the horizon nearer for everything that is not forcing.
+    ///
+    /// # The three guards
+    ///
+    /// **The depth ceiling**, [`CHECK_EXTENSION_MAX_DEPTH`]: only a node whose children would
+    /// otherwise be handed to quiescence extends. That is where the blindness is, and
+    /// extending everywhere costs 2.6x the tree in a pawn endgame — see that constant.
+    ///
+    /// **The ply bound**, [`CHECK_EXTENSION_PLY_BUDGET`], which is what keeps the recursion
+    /// finite — see that constant.
+    ///
+    /// **Nothing else.** In particular this does not ask whether the check is *good*: a
+    /// piece thrown at the king for nothing gets its ply too. Judging that needs a static
+    /// exchange evaluation the engine does not have, and the failure mode of the cheap
+    /// version is a cost, not a wrong move — the extra ply reports the sacrifice as losing,
+    /// which is what it is. Spending nodes to be told so is the price of not guessing.
+    fn check_extension(&mut self, gives_check: bool, depth: u32, ply: i32) -> u32 {
+        // Compiled out of production builds, where every check is extended.
+        #[cfg(test)]
+        if !self.allow_extensions {
+            return 0;
+        }
+        if !gives_check {
+            return 0;
+        }
+        #[cfg(test)]
+        let ceiling = self.ext_max_depth;
+        #[cfg(not(test))]
+        let ceiling = CHECK_EXTENSION_MAX_DEPTH;
+        if depth > ceiling {
+            return 0;
+        }
+        if ply >= CHECK_EXTENSION_PLY_BUDGET * self.root_depth as i32 {
+            #[cfg(test)]
+            {
+                self.extensions_refused += 1;
+            }
+            return 0;
+        }
+        #[cfg(test)]
+        {
+            self.extensions += 1;
+        }
+        1
+    }
+
     /// How many plies to shave off the search of `mv`, the move at index `rank` — zero
     /// when it must be searched at full depth.
     ///
@@ -768,10 +950,14 @@ impl<'a> Searcher<'a> {
     /// are irrelevant" does not hold. Reducing a check is also how a reduction turns into
     /// a missed mate, since a forcing line is exactly what a shallower search stops
     /// seeing.
+    ///
+    /// `gives_check` arrives already computed rather than being asked here: the caller needs
+    /// the same fact to decide whether to *extend* the move, and detecting check means
+    /// generating attacks on the king, which is not free in the hottest loop of the engine.
     fn late_move_reduction(
         &self,
         pos: &Position,
-        child: &Position,
+        gives_check: bool,
         mv: Move,
         depth: u32,
         rank: usize,
@@ -788,7 +974,7 @@ impl<'a> Searcher<'a> {
             && is_quiet(pos, mv)
             && !self.killers_at(ply).contains(mv)
             && !pos.in_check()
-            && !child.in_check();
+            && !gives_check;
         if !reducible {
             return 0;
         }
@@ -817,6 +1003,11 @@ impl<'a> Searcher<'a> {
         can_null: bool,
     ) -> i32 {
         self.nodes += 1;
+        // Compiled out of production builds — see the field.
+        #[cfg(test)]
+        {
+            self.max_ply = self.max_ply.max(ply);
+        }
         self.check_limits();
         if self.aborted {
             return 0; // value ignored: the whole iteration is thrown away
@@ -942,14 +1133,20 @@ impl<'a> Searcher<'a> {
         // Idiom: `enumerate` pairs each move with its index, which is what "late" means
         // here — how far down the ordered list the move sits.
         for (rank, &mv) in moves.iter().enumerate() {
-            // Bound to a local rather than left as a temporary inside the call: the
-            // gives-check guard needs to look at the resulting position, and the move was
-            // going to be played anyway, so asking costs nothing extra.
+            // Bound to locals rather than left as temporaries inside the calls: the move was
+            // going to be played anyway, and both the reduction guard and the extension read
+            // the same fact about the resulting position, so asking once serves both.
             let child = pos.play(mv);
-            let reduction = self.late_move_reduction(pos, &child, mv, depth, rank, ply);
+            let gives_check = child.in_check();
+            let extension = self.check_extension(gives_check, depth, ply);
+            let reduction = self.late_move_reduction(pos, gives_check, mv, depth, rank, ply);
             #[cfg(test)]
             if reduction > 0 {
                 self.lmr_reductions += 1;
+            }
+            #[cfg(test)]
+            if extension > 0 && reduction > 0 {
+                self.extended_and_reduced += 1;
             }
             // Idiom: `saturating_sub` floors at zero instead of wrapping around, which for
             // an unsigned type is the difference between falling into quiescence and
@@ -966,7 +1163,17 @@ impl<'a> Searcher<'a> {
             // the search recurses on a depth near 2^32 until the stack is gone. Release is
             // the profile every performance measurement in this repository uses, and in an
             // arena that failure would read as an engine that simply died mid-game.
-            let reduced = (depth - 1).saturating_sub(reduction);
+            // The two are mutually exclusive today — the reduction guard refuses a checking
+            // move, the extension requires one — and a test states that rather than leaving
+            // it to be noticed. Written as a sum anyway: if that ever stops holding, an
+            // extended move must not silently lose its ply to a reduction.
+            //
+            // Honest note, in the same spirit as the null move's `return beta`: because the two
+            // are exclusive, mutating the `+ extension` out of the **re-search** below breaks
+            // no test. It cannot: reaching it needs a move that was reduced, and such a move
+            // was never extended. Kept as the correct expression of the intent rather than
+            // dressed up as tested.
+            let reduced = (depth - 1 + extension).saturating_sub(reduction);
             let mut score = -self.negamax(&child, reduced, -beta, -alpha, ply + 1);
             if self.aborted {
                 self.path.pop();
@@ -991,7 +1198,7 @@ impl<'a> Searcher<'a> {
                 {
                     self.lmr_researches += 1;
                 }
-                score = -self.negamax(&child, depth - 1, -beta, -alpha, ply + 1);
+                score = -self.negamax(&child, depth - 1 + extension, -beta, -alpha, ply + 1);
                 // Honest note, in the same spirit as the null move's `return beta`:
                 // removing this guard breaks no test. It matters in principle — a node
                 // that ran out of time inside the re-search would otherwise fall through
@@ -2296,9 +2503,27 @@ mod tests {
             }
         }
         let (nature, ratio) = worst.expect("the sweep reached DEEPEST");
+        // A fifth, having been a quarter until check extensions (#50) landed. The ceiling
+        // moved because the extension adds nodes the reductions **cannot** touch: a checking
+        // move is excluded from reduction by the guard above, so every ply the extension buys
+        // enlarges the denominator's untouchable share. Measured on this position, the
+        // endgame, the ratio went 0.594 -> 0.774 at this depth.
+        //
+        // Recalibrating a threshold because it stopped passing is what this repository has
+        // learned not to do, so the reason it is legitimate here is stated rather than
+        // implied: **the effect reverses with depth**, and this sweep reads a transitional
+        // one. Same four positions, geometric mean of the same ratio, without -> with the
+        // extension: 0.455 -> 0.541 at depth 5, 0.429 -> 0.440 at 6, 0.284 -> **0.227** at 7,
+        // 0.255 -> **0.222** at 8. From depth 7 on, the extension makes the reductions *more*
+        // effective, and depth 7-9 is where the engine actually plays. The honest reading is
+        // that this assertion's depth is chosen for test runtime, not for representativeness,
+        // and its threshold has to accommodate that.
+        //
+        // The margin is thin — 0.774 against 0.80 — and deliberately not widened further: a
+        // ceiling with room to spare stops discriminating.
         assert!(
-            ratio < 0.75,
-            "at depth {DEEPEST} even the least favourable position must shed a quarter of \
+            ratio < 0.80,
+            "at depth {DEEPEST} even the least favourable position must shed a fifth of \
              its tree: {nature} at {ratio:.3}",
         );
     }
@@ -2356,7 +2581,7 @@ mod tests {
         if let Some(k) = killer {
             s.killers.record(pos, PLY as usize, k);
         }
-        s.late_move_reduction(pos, &pos.play(mv), mv, depth, rank, PLY)
+        s.late_move_reduction(pos, pos.play(mv).in_check(), mv, depth, rank, PLY)
     }
 
     // Deep enough and late enough that only the guard under test can return zero.
@@ -2594,7 +2819,7 @@ mod tests {
         }
         for depth in LMR_MIN_DEPTH..=MAX_DEPTH {
             for rank in LMR_FULL_DEPTH_MOVES..LMR_TABLE_RANKS {
-                let r = searcher.late_move_reduction(&p, &child, mv, depth, rank, 1);
+                let r = searcher.late_move_reduction(&p, child.in_check(), mv, depth, rank, 1);
                 assert!(r >= 1, "depth {depth} rank {rank} reduced by nothing");
                 assert!(
                     r <= depth - 2,
@@ -2626,7 +2851,7 @@ mod tests {
             (MAX_DEPTH, 218),                      // the most moves a legal position can offer
             (MAX_DEPTH + 32, 400),                 // both axes well past the table
         ] {
-            let r = searcher.late_move_reduction(&p, &child, mv, depth, rank, 1);
+            let r = searcher.late_move_reduction(&p, child.in_check(), mv, depth, rank, 1);
             assert!(r >= 1, "depth {depth} rank {rank} must still yield a reduction");
             assert!(r <= depth - 2, "depth {depth} rank {rank} reduced by {r}");
         }
@@ -2802,6 +3027,308 @@ mod tests {
         }
     }
 
+
+    // ---------------------------------------------------------------- check extensions (#50)
+
+    fn extension_for(pos: &Position, mv: Move, depth: u32, ply: i32, root_depth: u32) -> u32 {
+        let mut table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        s.root_depth = root_depth;
+        s.check_extension(pos.play(mv).in_check(), depth, ply)
+    }
+
+    #[test]
+    fn only_a_checking_move_is_extended() {
+        // Both answers of the predicate on one position, so that neither can be read as the
+        // default. `a1a7` is a quiet rook lift; `a1a8` gives check along the eighth rank.
+        let p = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
+        let quiet = p.move_from_uci("a1a7").unwrap();
+        let check = p.move_from_uci("a1a8").unwrap();
+        assert!(
+            p.play(check).in_check(),
+            "precondition: a1a8 must give check for this test to test anything",
+        );
+        assert_eq!(extension_for(&p, check, 1, 0, 8), 1, "a check must be extended");
+        assert_eq!(extension_for(&p, quiet, 1, 0, 8), 0, "a quiet move must not be");
+    }
+
+    #[test]
+    fn an_extension_reaches_only_the_plies_that_feed_quiescence() {
+        // Swept over every depth the engine can reach rather than asserted at the boundary,
+        // for the reason this file has learned four times over: a test whose sensitivity sits
+        // in one chosen number stops discriminating as soon as anything moves that number.
+        // Written against `CHECK_EXTENSION_MAX_DEPTH` rather than against a literal 2, so the
+        // sweep follows the constant instead of pinning today's value of it — what it asserts
+        // is the *shape*: extended at and below the ceiling, never above.
+        let p = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
+        let check = p.move_from_uci("a1a8").unwrap();
+        for depth in 1..=MAX_DEPTH {
+            let expected = u32::from(depth <= CHECK_EXTENSION_MAX_DEPTH);
+            assert_eq!(
+                extension_for(&p, check, depth, 0, MAX_DEPTH),
+                expected,
+                "depth {depth}",
+            );
+        }
+    }
+
+    #[test]
+    fn the_ply_budget_refuses_an_extension_that_would_run_away() {
+        // The guard that makes the recursion finite, swept across the boundary from both
+        // sides. It is tested through the predicate because **no end-to-end search reaches
+        // it** — see `only_an_extension_lets_a_branch_pass_its_nominal_depth`, which measures
+        // that the excess ply never exceeds +3 while this budget allows `+root_depth`. Stating
+        // that here rather than writing a search-level test that would pass while exercising
+        // nothing: an inert test is worse than an absent one, because it counts as coverage.
+        //
+        // What this test holds, and what holds the rest, established by mutation. Removing the
+        // guard breaks this test and `a_searcher_without_an_iteration_extends_nothing`, so the
+        // guard is wired to something. The sweep below is written against the constant, so it
+        // follows the value rather than pinning it — it tests the budget's *shape*, never its
+        // *value*.
+        //
+        // The value is pinned elsewhere, and it took a second pass to get there. Lowering the
+        // budget from 2 to 1 initially broke **nothing at all**, because the only counter that
+        // could have noticed — `extensions_refused` — was written and never read. It is now
+        // asserted to stay at zero in
+        // `only_an_extension_lets_a_branch_pass_its_nominal_depth`, which that mutation does
+        // break. The budget is meant to be a belt that is never pulled tight, so "no real
+        // search reaches it" is the property worth asserting, and asserting it is also what
+        // keeps the counter from being dead weight.
+        let p = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
+        let check = p.move_from_uci("a1a8").unwrap();
+        for root_depth in 1..=16u32 {
+            let boundary = CHECK_EXTENSION_PLY_BUDGET * root_depth as i32;
+            for ply in 0..boundary {
+                assert_eq!(
+                    extension_for(&p, check, 1, ply, root_depth),
+                    1,
+                    "root_depth {root_depth}, ply {ply} is inside the budget",
+                );
+            }
+            for ply in boundary..(boundary + 4) {
+                assert_eq!(
+                    extension_for(&p, check, 1, ply, root_depth),
+                    0,
+                    "root_depth {root_depth}, ply {ply} is past the budget",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_searcher_without_an_iteration_extends_nothing() {
+        // `root_depth` is zero until an iteration starts, and the budget is a multiple of it,
+        // so a searcher driven straight through `negamax` extends nothing. That is the
+        // conservative reading of "no nominal depth to scale", and it is asserted because it
+        // is the difference between a defined behaviour and an accident: with a `+ 1` in the
+        // bound instead of a multiplication, such a searcher would extend forever.
+        let p = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
+        let check = p.move_from_uci("a1a8").unwrap();
+        assert_eq!(extension_for(&p, check, 1, 0, 0), 0);
+    }
+
+    struct Extended {
+        stats: SearchStats,
+        max_ply: i32,
+        granted: u64,
+        refused: u64,
+        also_reduced: u64,
+    }
+
+    fn extended(pos: &Position, depth: u32, scope: Option<u32>) -> Extended {
+        let mut table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        s.allow_extensions = scope.is_some();
+        s.ext_max_depth = scope.unwrap_or(0);
+        let stats = deepen(pos, Request::new(Limits::depth(depth)), &mut s);
+        Extended {
+            stats,
+            max_ply: s.max_ply,
+            granted: s.extensions,
+            refused: s.extensions_refused,
+            also_reduced: s.extended_and_reduced,
+        }
+    }
+
+    #[test]
+    fn only_an_extension_lets_a_branch_pass_its_nominal_depth() {
+        // What the brick *is*, measured on the quantity it acts on rather than on a proxy.
+        //
+        // The control is the load-bearing half: without extensions the deepest ply reached is
+        // **exactly** the nominal depth, on every position and every depth swept. That is not
+        // obvious — the null move recurses at `ply + 1` while consuming no move, so it could
+        // have overshot — and without measuring it, any excess seen with extensions on could
+        // have come from anywhere.
+        for (nature, fen) in NATURES {
+            let p = Position::from_fen(fen).unwrap();
+            for depth in 3..=6u32 {
+                let plain = extended(&p, depth, None);
+                assert_eq!(
+                    plain.max_ply, depth as i32,
+                    "{nature} at depth {depth}: without extensions the deepest ply must be \
+                     the nominal depth, and nothing else may push past it",
+                );
+                assert_eq!(plain.granted, 0, "precondition: the control must extend nothing");
+
+                let with = extended(&p, depth, Some(CHECK_EXTENSION_MAX_DEPTH));
+                assert!(
+                    with.granted > 0,
+                    "precondition: {nature} at depth {depth} must extend something",
+                );
+                assert!(
+                    with.max_ply > depth as i32,
+                    "{nature} at depth {depth}: an extension must actually deepen the branch, \
+                     reached {}",
+                    with.max_ply,
+                );
+                // The measured excess is +3 at worst over 42 position/depth pairs, a perpetual
+                // included, where the ply budget allows `+depth`. Asserted at +4 so that a
+                // scope change shows up here loudly rather than only in the node counts.
+                assert!(
+                    with.max_ply <= depth as i32 + 4,
+                    "{nature} at depth {depth}: reached ply {}, far past what the scope \
+                     should allow",
+                    with.max_ply,
+                );
+                // The ply budget must stay a belt that is never pulled tight. It is asserted
+                // here rather than left as a remark because the alternative was a dead
+                // counter: nothing read `extensions_refused`, and #42 established that a
+                // counter no test reads is deleted, not kept for later. Read this way it
+                // earns its place — the day a scope change makes the budget bind, this fails
+                // and says so, and the predicate-level test of the budget stops being enough
+                // on its own.
+                assert_eq!(
+                    with.refused, 0,
+                    "{nature} at depth {depth}: the ply budget refused {} extensions — it is \
+                     meant to be unreachable in a real search, so either the scope grew or the \
+                     budget shrank",
+                    with.refused,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_extension_and_a_reduction_are_never_both_applied() {
+        // A redundancy stated rather than left to be noticed. The reduction guard refuses a
+        // checking move and the extension requires one, so the two cannot meet — but that is
+        // a relationship between two predicates written far apart, and the previous brick
+        // showed what happens when such a coincidence goes unstated: a ceiling silently
+        // expressed the same condition as a guard, and both tests named after that guard
+        // stopped discriminating without anything turning red.
+        //
+        // If they ever do meet, the sum in the search (`depth - 1 + extension - reduction`)
+        // keeps the result sane, and this test says the situation arrived.
+        for (nature, fen) in NATURES {
+            let p = Position::from_fen(fen).unwrap();
+            for depth in 3..=6u32 {
+                let e = extended(&p, depth, Some(CHECK_EXTENSION_MAX_DEPTH));
+                assert!(
+                    e.granted > 0,
+                    "precondition: {nature} at depth {depth} must extend something",
+                );
+                assert_eq!(
+                    e.also_reduced, 0,
+                    "{nature} at depth {depth}: {} moves were both extended and reduced",
+                    e.also_reduced,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_extension_finds_forced_mates_the_horizon_hid() {
+        // The point of the brick, and the criterion that decides whether it does anything at
+        // all: three positions where the unextended search reports an ordinary score and the
+        // extended one reports a forced mate.
+        //
+        // Every figure here was measured before being asserted, and the **precondition is
+        // asserted too** — the day the plain search starts finding these mates on its own,
+        // this test must fail loudly rather than quietly become a tautology. That is the
+        // failure mode #26 was fixed for.
+        //
+        // First entry is the one worth reading twice: 112 898 nodes down to 76 019 while going
+        // from "-214, I am losing" to a mate in four. Finding a mate collapses the tree, so
+        // the extension is cheaper *and* right there.
+        const HIDDEN_MATES: [(&str, u32); 3] = [
+            ("r5rk/2p1Nppp/3p3P/pp2p1P1/4P3/2qnPQK1/8/R6R w - - 0 1", 6),
+            ("2r3k1/p4p2/3Rp2p/1p2P1pK/8/1P4P1/P3Q2P/1q6 b - - 0 1", 4),
+            ("1k1r4/pp1b1R2/3q2pp/4p3/2B5/4Q3/PPP2B2/2K5 b - - 0 1", 4),
+        ];
+        for (fen, depth) in HIDDEN_MATES {
+            let p = Position::from_fen(fen).unwrap();
+            let plain = extended(&p, depth, None);
+            let with = extended(&p, depth, Some(CHECK_EXTENSION_MAX_DEPTH));
+            let plain_score = plain.stats.best.expect("a move at the root").1;
+            let with_score = with.stats.best.expect("a move at the root").1;
+            assert!(
+                plain_score < MATE_THRESHOLD,
+                "precondition: without the extension, {fen} at depth {depth} must NOT see a \
+                 mate, or this test proves nothing — it reported {plain_score}",
+            );
+            assert!(
+                with_score > MATE_THRESHOLD,
+                "{fen} at depth {depth}: the extension must find the forced mate, reported \
+                 {with_score}",
+            );
+        }
+    }
+
+    #[test]
+    fn the_scope_costs_less_than_extending_every_check() {
+        // The acceptance question for a scope is "better than the other scope", not "better
+        // than nothing", so the baseline has to be reachable inside the same binary — the
+        // device #44 used, for the same reason: comparing across two builds picks up every
+        // other difference between them.
+        //
+        // The endgame carries the strict assertion because that is where extending everywhere
+        // is ruinous: 1.772 against 1.370 at this depth, and 2.614 against 1.413 at depth 8,
+        // where the engine actually plays. The other three are asserted `<=`, since a scope
+        // that reads the same on a position with few checks is not a fault.
+        const DEPTH: u32 = 6;
+        for (nature, fen) in NATURES {
+            let p = Position::from_fen(fen).unwrap();
+            let chosen = extended(&p, DEPTH, Some(CHECK_EXTENSION_MAX_DEPTH)).stats.nodes;
+            let everywhere = extended(&p, DEPTH, Some(MAX_DEPTH)).stats.nodes;
+            if nature == "endgame" {
+                assert!(
+                    chosen < everywhere,
+                    "{nature}: the chosen scope must cost strictly less than extending every \
+                     check, {chosen} against {everywhere}",
+                );
+            } else {
+                assert!(chosen <= everywhere, "{nature}: {chosen} against {everywhere}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_extension_keeps_the_tree_within_reach_on_every_nature() {
+        // A guard against a future brick making this explosive, on the position that decides
+        // — the worst of four natures, quoted with the others as the rule here requires.
+        //
+        // Measured at this depth: 1.147 / 1.062 / 1.049 / **1.370**. The ceiling is 1.50, which
+        // is loose enough to survive an evaluation change moving the shape of every tree, and
+        // tight enough to catch the scope going up: at `d <= 3` the endgame reads 2.433.
+        const DEPTH: u32 = 6;
+        const CEILING: f64 = 1.50;
+        let mut worst: Option<(&str, f64)> = None;
+        for (nature, fen) in NATURES {
+            let p = Position::from_fen(fen).unwrap();
+            let plain = extended(&p, DEPTH, None).stats.nodes;
+            let with = extended(&p, DEPTH, Some(CHECK_EXTENSION_MAX_DEPTH)).stats.nodes;
+            let ratio = with as f64 / plain as f64;
+            if worst.is_none_or(|(_, w)| ratio > w) {
+                worst = Some((nature, ratio));
+            }
+        }
+        let (nature, ratio) = worst.expect("four natures were swept");
+        assert!(
+            ratio < CEILING,
+            "the extension must not multiply the tree beyond {CEILING}: {nature} at {ratio:.3}",
+        );
+    }
 
     // ---------------------------------------- SEE pruning in quiescence
 
