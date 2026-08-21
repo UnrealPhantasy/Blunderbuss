@@ -169,6 +169,12 @@ pub struct Hit {
     /// The best move recorded for this position, whatever the depth. Useful for
     /// ordering even when the entry is too shallow to cut off.
     pub best: Option<Move>,
+    /// Whether an entry for *this* position was found at all, cutoff or not.
+    ///
+    /// Reported rather than inferred: an entry may legitimately hold `best: None`, so the
+    /// caller cannot tell a miss from a match by looking at the other two fields. The rates
+    /// that used to live on the table are computed from this, per searcher.
+    pub matched: bool,
 }
 
 /// Number of entries. A power of two, so the index is a mask rather than a
@@ -181,9 +187,12 @@ pub struct Table {
     /// Idiom: `Box<[T]>` is a heap slice of fixed length — a `Vec` without the
     /// capacity to grow, which is exactly what a table with a fixed mask wants.
     slots: Box<[Slot]>,
-    hits: AtomicU64,
-    probes: AtomicU64,
-    cutoffs: AtomicU64,
+    // No counters here, and that absence is measured rather than tidy. A single
+    // `fetch_add` per probe puts eight cores in a fight over one cache line: with the
+    // counters in this struct, `go depth 11` took 4,01 s on eight threads and 1,01 s
+    // without them. Counting is a diagnostic, so it lives per-searcher — see
+    // `Searcher::table_probes` — where it costs a plain increment on a line nobody else
+    // touches.
 }
 
 impl Default for Table {
@@ -198,9 +207,6 @@ impl Table {
         // constructed. One allocation either way.
         Table {
             slots: (0..ENTRIES).map(|_| Slot::empty()).collect::<Vec<_>>().into_boxed_slice(),
-            hits: AtomicU64::new(0),
-            probes: AtomicU64::new(0),
-            cutoffs: AtomicU64::new(0),
         }
     }
 
@@ -219,52 +225,6 @@ impl Table {
             slot.check.store(0, Atomicity::Relaxed);
             slot.data.store(0, Atomicity::Relaxed);
         }
-        self.hits.store(0, Atomicity::Relaxed);
-        self.probes.store(0, Atomicity::Relaxed);
-        self.cutoffs.store(0, Atomicity::Relaxed);
-    }
-
-    /// Fraction of probes that found an entry for *this* position — a key match,
-    /// whatever came of it.
-    ///
-    /// Worth reporting on its own: a table that is never read and a table whose
-    /// every hit is rejected as a collision look identical from the node count, and
-    /// only this rate separates a working table from a decorative one.
-    ///
-    /// Note what it is **not**: a matched entry may still be too shallow to cut off,
-    /// in which case it contributes ordering only. Measured at depth 7, roughly half
-    /// of the key matches fall in that case — see [`Table::cutoff_rate`].
-    ///
-    /// Measure it through [`search_timed`](crate::search::search_timed), never by
-    /// driving `Searcher::root` in a loop: the real search feeds each iteration the
-    /// previous one's best move, which changes the move order and therefore the mix
-    /// of entries the table ends up holding.
-    pub fn key_match_rate(&self) -> f64 {
-        if self.probes.load(Atomicity::Relaxed) == 0 {
-            0.0
-        } else {
-            self.hits.load(Atomicity::Relaxed) as f64 / self.probes.load(Atomicity::Relaxed) as f64
-        }
-    }
-
-    /// Fraction of probes that returned a score, i.e. that saved a whole subtree.
-    ///
-    /// The stricter of the two rates, and the one that measures what the table buys
-    /// in pruning. The gap with [`Table::key_match_rate`] is the share of matches
-    /// that were useful for move ordering but not deep enough to cut off. Measured
-    /// through `search_timed(pos, Limits::depth(7))`, release build:
-    ///
-    /// | position | key match | cutoff |
-    /// |---|---|---|
-    /// | start position | 0.196 | 0.116 |
-    /// | Kiwipete | 0.467 | 0.243 |
-    /// | Ruy Lopez | 0.295 | 0.159 |
-    pub fn cutoff_rate(&self) -> f64 {
-        if self.probes.load(Atomicity::Relaxed) == 0 {
-            0.0
-        } else {
-            self.cutoffs.load(Atomicity::Relaxed) as f64 / self.probes.load(Atomicity::Relaxed) as f64
-        }
     }
 
     fn index(&self, key: u64) -> usize {
@@ -277,19 +237,17 @@ impl Table {
     /// `ply` is needed because mate scores are stored relative to the node that
     /// found them — see [`Table::store`].
     pub fn probe(&self, key: u64, depth: u32, alpha: i32, beta: i32, ply: i32) -> Hit {
-        self.probes.fetch_add(1, Atomicity::Relaxed);
         let slot = &self.slots[self.index(key)];
         let data = slot.data.load(Atomicity::Relaxed);
         let check = slot.check.load(Atomicity::Relaxed);
         // An empty slot, another position at the same index, and a torn write are the same
         // answer here — and one comparison covers all three.
         if check ^ data != key {
-            return Hit { cutoff: None, best: None };
+            return Hit { cutoff: None, best: None, matched: false };
         }
         let Some((entry_depth, stored_score, bound, best)) = unpack(data) else {
-            return Hit { cutoff: None, best: None };
+            return Hit { cutoff: None, best: None, matched: false };
         };
-        self.hits.fetch_add(1, Atomicity::Relaxed);
 
         let score = from_table(stored_score, ply);
         // A shallower entry was searched less thoroughly than we are about to
@@ -305,10 +263,7 @@ impl Table {
                 _ => None,
             }
         };
-        if cutoff.is_some() {
-            self.cutoffs.fetch_add(1, Atomicity::Relaxed);
-        }
-        Hit { cutoff, best }
+        Hit { cutoff, best, matched: true }
     }
 
     /// Record what a search of `depth` plies concluded about `key`.
@@ -374,6 +329,64 @@ fn from_table(score: i32, ply: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    /// The property the whole lock-free design rests on, and the only one no *sequential* test
+    /// can reach: a slot written by several threads at once must never be read as the pairing of
+    /// one writer's key with another's data.
+    ///
+    /// Eight threads hammer **one** slot with distinct (key, data) pairs, chosen so the data
+    /// encodes which key produced it. Every probe that succeeds is then checkable: it must hand
+    /// back the data belonging to the key it asked for.
+    ///
+    /// This cannot prove tearing never happens — it is a race, so absence is not observable. It
+    /// does catch the version that stores the key plainly, which is what matters: the argument in
+    /// [`Slot`] says the XOR makes a torn pair fail the comparison, and this is that argument
+    /// exposed to a real race rather than left as prose.
+    #[test]
+    fn a_slot_hammered_by_eight_threads_never_mixes_one_key_with_another_data() {
+        use std::sync::atomic::{AtomicU64, Ordering as At};
+        const THREADS: u64 = 8;
+        const ROUNDS: u64 = 20_000;
+        let table = Table::new();
+        // All keys share their low 20 bits, so `index` sends every one of them to the same
+        // slot: without that they would spread out and never collide.
+        let key_of = |t: u64| (t << 32) | 0xABCD;
+        let bad = AtomicU64::new(0);
+        let seen = AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let (table, bad, seen) = (&table, &bad, &seen);
+                scope.spawn(move || {
+                    // The depth carries the writer's identity, so a mismatched pair is visible.
+                    let depth = (t + 1) as u32;
+                    for _ in 0..ROUNDS {
+                        table.store(key_of(t), depth, t as i32, Bound::Exact, None);
+                        for other in 0..THREADS {
+                            let hit = table.probe(key_of(other), 1, -30_000, 30_000, 0);
+                            if let Some(score) = hit.cutoff {
+                                seen.fetch_add(1, At::Relaxed);
+                                if score != other as i32 {
+                                    bad.fetch_add(1, At::Relaxed);
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        assert!(
+            seen.load(At::Relaxed) > 0,
+            "precondition: no probe ever matched, so the race was never exercised",
+        );
+        assert_eq!(
+            bad.load(At::Relaxed),
+            0,
+            "{} of {} successful probes returned another writer's data",
+            bad.load(At::Relaxed),
+            seen.load(At::Relaxed),
+        );
+    }
     use crate::position::Position;
     use crate::search::MATE;
 
@@ -384,7 +397,7 @@ mod tests {
 
     #[test]
     fn an_exact_entry_is_returned() {
-        let mut t = Table::new();
+        let t = Table::new();
         t.store(1234, 4, 42, Bound::Exact, Some(a_move()));
         let hit = t.probe(1234, 4, -100, 100, 0);
         assert_eq!(hit.cutoff, Some(42));
@@ -395,7 +408,7 @@ mod tests {
     fn a_shallower_entry_does_not_cut_off() {
         // Stored at depth 2, asked about depth 5: the score was obtained by a
         // less thorough search and must not stand in for a deeper one.
-        let mut t = Table::new();
+        let t = Table::new();
         t.store(1234, 2, 42, Bound::Exact, Some(a_move()));
         let hit = t.probe(1234, 5, -100, 100, 0);
         assert_eq!(hit.cutoff, None, "a shallow score must not be reused as deep");
@@ -407,7 +420,7 @@ mod tests {
         // Two keys one table-size apart share an index — the collision case. This is
         // the test that guards the failure nobody would notice: one position's score
         // silently attributed to another.
-        let mut t = Table::new();
+        let t = Table::new();
         let key = 1234u64;
         let colliding = key + (ENTRIES as u64);
         assert_eq!(t.index(key), t.index(colliding), "the keys must actually collide");
@@ -420,7 +433,7 @@ mod tests {
 
     #[test]
     fn a_lower_bound_cuts_only_at_or_above_beta() {
-        let mut t = Table::new();
+        let t = Table::new();
         t.store(7, 4, 50, Bound::Lower, None);
         // The true value is >= 50. That settles a window whose beta is <= 50...
         assert_eq!(t.probe(7, 4, -100, 50, 0).cutoff, Some(50));
@@ -431,7 +444,7 @@ mod tests {
 
     #[test]
     fn an_upper_bound_cuts_only_at_or_below_alpha() {
-        let mut t = Table::new();
+        let t = Table::new();
         t.store(7, 4, 50, Bound::Upper, None);
         // The true value is <= 50, so a window already demanding 50 or more is
         // settled: this node cannot deliver.
@@ -445,7 +458,7 @@ mod tests {
         // A mate found 3 plies from the root scores `MATE - 3`. Cached and read
         // back 7 plies from the root, it must read as `MATE - 7` — the same mate,
         // the same number of moves away from *the node*, not from the root.
-        let mut t = Table::new();
+        let t = Table::new();
         t.store_at(99, 4, MATE - 3, Bound::Exact, None, 3);
         let hit = t.probe(99, 4, -MATE, MATE, 7);
         assert_eq!(hit.cutoff, Some(MATE - 7));
@@ -453,7 +466,7 @@ mod tests {
 
     #[test]
     fn a_losing_mate_score_survives_too() {
-        let mut t = Table::new();
+        let t = Table::new();
         t.store_at(99, 4, -(MATE - 3), Bound::Exact, None, 3);
         assert_eq!(t.probe(99, 4, -MATE, MATE, 7).cutoff, Some(-(MATE - 7)));
     }
@@ -462,27 +475,30 @@ mod tests {
     fn an_ordinary_score_is_stored_verbatim() {
         // Only mate scores are ply-relative; a material evaluation must not be
         // shifted by the distance from the root.
-        let mut t = Table::new();
+        let t = Table::new();
         t.store_at(5, 3, 150, Bound::Exact, None, 6);
         assert_eq!(t.probe(5, 3, -1000, 1000, 11).cutoff, Some(150));
     }
 
     #[test]
-    fn the_two_rates_measure_different_things() {
-        let mut t = Table::new();
-        assert_eq!(t.key_match_rate(), 0.0, "no probe yet");
-        assert_eq!(t.cutoff_rate(), 0.0, "no probe yet");
-
-        // Three probes: a match that cuts off, a match too shallow to cut off, and
-        // a miss. The point of the test is the middle one — it is a key match that
-        // buys ordering only, and counting it as a cutoff would overstate the table.
+    fn a_match_and_a_cutoff_are_two_different_answers() {
+        // The distinction the two rates are built on, asserted where it actually lives now that
+        // the counting moved to the searcher: `matched` says an entry for this position exists,
+        // `cutoff` says it settles the current window. The middle case is the point — a key
+        // match that buys move ordering only, and counting it as a cutoff would overstate what
+        // the table buys in pruning.
+        let t = Table::new();
         t.store(1, 5, 0, Bound::Exact, None);
         t.store(2, 1, 0, Bound::Exact, None);
-        t.probe(1, 5, -1, 1, 0); // deep enough  -> match + cutoff
-        t.probe(2, 5, -1, 1, 0); // too shallow  -> match, no cutoff
-        t.probe(3, 5, -1, 1, 0); // absent       -> neither
 
-        assert!((t.key_match_rate() - 2.0 / 3.0).abs() < 1e-9, "two of three matched");
-        assert!((t.cutoff_rate() - 1.0 / 3.0).abs() < 1e-9, "only one settled the window");
+        let deep = t.probe(1, 5, -1, 1, 0);
+        assert!(deep.matched && deep.cutoff.is_some(), "deep enough: a match that cuts off");
+
+        let shallow = t.probe(2, 5, -1, 1, 0);
+        assert!(shallow.matched, "the entry is for this position, whatever its depth");
+        assert!(shallow.cutoff.is_none(), "too shallow: ordering only, never a cutoff");
+
+        let absent = t.probe(3, 5, -1, 1, 0);
+        assert!(!absent.matched && absent.cutoff.is_none(), "no entry: neither");
     }
 }
