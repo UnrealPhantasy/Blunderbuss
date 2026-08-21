@@ -17,7 +17,7 @@
 //! positions at one ply usually share the same threat, so the refutation that
 //! worked next door tends to work here too.
 
-use crate::position::{Move, Piece, Position};
+use crate::position::{Color, Move, Piece, Position, Square, SquareSet};
 use crate::search::MAX_DEPTH;
 
 // Piece values used *for ordering only* (not for evaluation): only their relative
@@ -33,6 +33,102 @@ fn value(piece: Piece) -> i32 {
         // only here to make the match exhaustive.
         Piece::King => 20_000,
     }
+}
+
+/// The material a capture wins or loses once **both sides have taken turns recapturing** on the
+/// destination square — a static exchange evaluation.
+///
+/// # Why MVV-LVA is not enough
+///
+/// MVV-LVA ranks `pawn takes queen` above `queen takes pawn`, which is right, but it cannot see
+/// what happens *next*. `Nxd5` when d5 is defended by a pawn is scored as winning a knight's
+/// worth of material when it loses one. The search finds out — two plies later, having built the
+/// whole subtree first. This function answers the same question before the move is searched, for
+/// the cost of a few bitboard lookups.
+///
+/// # The algorithm, and the one thing that makes it non-trivial
+///
+/// Pieces capture on the square in turn, cheapest first, each side free to stop when continuing
+/// would lose material. The gains are accumulated on a stack and then folded back with a
+/// **negamax minimum**: a side only continues if doing so is better than standing pat.
+///
+/// What makes it more than a two-step calculation is **uncovering**. Removing the piece that just
+/// captured can reveal a sliding attacker behind it — a rook behind a rook, a queen behind a
+/// bishop. So the attacker set is recomputed at every step against the *current* hypothetical
+/// occupation, which is exactly what [`Position::attackers`] takes an `occupied` argument for.
+/// A version that computed the attackers once would misjudge every battery, and batteries are
+/// what exchange sequences are made of.
+///
+/// # What it deliberately does not handle
+///
+/// **En passant and promotions return 0** — "no information" — rather than a wrong number. The
+/// captured pawn of an en passant is not on the destination square, and a promotion changes the
+/// value of the capturing piece mid-sequence; both need special cases that would earn their
+/// complexity only if this function were also used for pruning. It is used for *ordering*, where
+/// a missing verdict costs a few nodes and a wrong verdict costs a bad move order.
+pub fn see(pos: &Position, mv: Move) -> i32 {
+    let Some(victim) = pos.piece_on(mv.to) else {
+        return 0; // quiet move, or en passant — nothing to weigh on this square
+    };
+    let Some(attacker) = pos.piece_on(mv.from) else {
+        return 0;
+    };
+    if mv.promotion.is_some() {
+        return 0; // the capturing piece changes value mid-sequence — out of scope
+    }
+
+    // `gain[d]` is the material balance for the side to move at depth `d`, assuming the exchange
+    // stops there. Thirty-two is more than any legal sequence: every step removes a piece.
+    let mut gain = [0i32; 32];
+    gain[0] = value(victim);
+    let mut on_square = value(attacker);
+    let mut occupied = pos.occupied() ^ SquareSet::of(mv.from);
+    let mut side = !pos.side_to_move();
+    let mut d = 0usize;
+
+    loop {
+        d += 1;
+        gain[d] = on_square - gain[d - 1];
+        let Some((square, piece)) = cheapest_attacker(pos, mv.to, side, occupied) else {
+            break;
+        };
+        on_square = value(piece);
+        occupied ^= SquareSet::of(square);
+        side = !side;
+        if d + 1 >= gain.len() {
+            break;
+        }
+    }
+    // Fold back: at each step the side to move takes the exchange only if it beats stopping.
+    while d > 1 {
+        d -= 1;
+        gain[d - 1] = -std::cmp::max(-gain[d - 1], gain[d]);
+    }
+    gain[0]
+}
+
+/// The least valuable piece of `color` attacking `square` under `occupied`, if any.
+///
+/// Cheapest first is not a heuristic here but the rule of the exchange: recapturing with the
+/// queen when a pawn would do loses material the sequence would otherwise keep.
+fn cheapest_attacker(
+    pos: &Position,
+    square: Square,
+    color: Color,
+    occupied: SquareSet,
+) -> Option<(Square, Piece)> {
+    let attackers = pos.attackers(square, color, occupied);
+    if attackers.is_empty() {
+        return None;
+    }
+    for piece in [Piece::Pawn, Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen, Piece::King]
+    {
+        let of_type = attackers & pos.pieces_of(color, piece);
+        if let Some(sq) = of_type.next_square() {
+            return Some((sq, piece));
+        }
+    }
+    None
 }
 
 /// The MVV-LVA score of a move.
@@ -201,9 +297,12 @@ fn score(pos: &Position, mv: Move, killers: KillerSlots) -> i32 {
 /// Sorts `moves` in place: best captures first, then the killers of this node,
 /// then the remaining quiet moves.
 pub fn order_moves(pos: &Position, moves: &mut [Move], killers: KillerSlots) {
-    // Idiom: `sort_by_key` with `Reverse` sorts by the key in *descending* order,
-    // so the highest score comes first.
-    moves.sort_by_key(|&mv| std::cmp::Reverse(score(pos, mv, killers)));
+    // Idiom: `sort_by_cached_key` computes each key **once** and sorts the keys, where
+    // `sort_by_key` is free to recompute a key on every comparison — and `score` is not free:
+    // it reads the board through `is_quiet`, then `mvv_lva`, then the killer slots.
+    //
+    // `Reverse` sorts by the key in *descending* order, so the highest score comes first.
+    moves.sort_by_cached_key(|&mv| std::cmp::Reverse(score(pos, mv, killers)));
 }
 
 #[cfg(test)]
@@ -518,4 +617,94 @@ mod tests {
         assert!(!is_quiet(&ep, uci_move(&ep, "e5d6")), "en passant is a capture");
         assert!(is_quiet(&ep, uci_move(&ep, "e5e6")), "the pawn push is quiet");
     }
+
+    // ------------------------------------------------------- static exchange evaluation
+
+    fn see_of(fen: &str, uci: &str) -> i32 {
+        let p = Position::from_fen(fen).unwrap();
+        let mv = p.move_from_uci(uci).unwrap();
+        see(&p, mv)
+    }
+
+    // Every expected value below is computed **by hand from the rules**, not read off the
+    // implementation. That direction matters: asserting what the code returns would pin a bug as
+    // firmly as a feature, and an exchange evaluation is precisely the kind of code whose bugs
+    // are invisible — a wrong sign costs nodes and a bad move order, never a crash.
+
+    #[test]
+    fn an_undefended_capture_is_worth_the_piece() {
+        // Rd1xd5 takes a knight nobody defends: the black king on e8 is far away.
+        // By hand: +320, the sequence ends immediately.
+        assert_eq!(see_of("4k3/8/8/3n4/8/8/8/K2R4 w - - 0 1", "d1d5"), 320);
+    }
+
+    #[test]
+    fn a_defended_capture_costs_the_difference() {
+        // Same, but a pawn on c6 defends d5. Rxd5 wins a knight (320) and loses a rook (500)
+        // to cxd5. By hand: 320 - 500 = **-180**. MVV-LVA scores this move *positively* — it
+        // sees the knight and not the recapture, which is the whole reason this function exists.
+        assert_eq!(see_of("4k3/8/2p5/3n4/8/8/8/K2R4 w - - 0 1", "d1d5"), -180);
+    }
+
+    #[test]
+    fn an_even_trade_is_worth_nothing() {
+        // dxc5 takes a pawn, bxc5 takes it back. By hand: 100 - 100 = 0. A zero here must not be
+        // confused with "no information": the caller distinguishes them, and this is the value
+        // that separates a losing capture from an acceptable one.
+        assert_eq!(see_of("4k3/8/1p6/2p5/3P4/8/8/4K3 w - - 0 1", "d4c5"), 0);
+    }
+
+    #[test]
+    fn a_battery_behind_the_capturing_piece_is_counted() {
+        // **The case that makes this more than arithmetic.** White rooks on d1 and d2, black rook
+        // on d5 defended by a knight on c6.
+        //
+        // Rd2xd5 (+500), Nxd5 (-500), and now the rook on d1 — which was *behind* the one that
+        // captured and attacked nothing at the start — recaptures the knight (+320).
+        // By hand: 500 - 500 + 320 = **+320**.
+        //
+        // An implementation that computed the attacker set once, before the sequence, would stop
+        // after two steps and answer 0. That is why `Position::attackers` takes a hypothetical
+        // occupation rather than reading the board.
+        assert_eq!(see_of("4k3/8/1n6/3r4/8/8/3R4/3RK3 w - - 0 1", "d2d5"), 320);
+    }
+
+    #[test]
+    fn the_cheapest_defender_recaptures_and_not_the_strongest() {
+        // **The case that pins *which* defender recaptures**, where the battery above pins
+        // *whether* an uncovered slider joins. Both are hand-computable and they fail apart:
+        // reversing the piece order in `cheapest_attacker` leaves the battery test green.
+        //
+        // Black knight on d5, defended twice — a pawn on c6 and the queen on d8. White rook
+        // battery on d1+d2.
+        //
+        // Rd2xd5 (+320 knight), cxd5 (-500 rook), Rxd5 (+100 pawn), Qxd5 (-500 rook),
+        // and White is out of attackers. By hand, folding back: **-180**.
+        //
+        // Recapturing with the queen instead — the same sequence run cheapest-last — folds back
+        // to **+220**: "losing, prune it" becomes "winning, keep it" on one position.
+        assert_eq!(see_of("3q3k/8/2p5/3n4/8/8/3R4/3R3K w - - 0 1", "d2d5"), -180);
+    }
+
+    #[test]
+    fn what_the_evaluation_declines_to_judge_returns_zero() {
+        // En passant (the captured pawn is not on the destination square) and promotions (the
+        // capturing piece changes value mid-sequence) return 0 — "no information" — rather than a
+        // number that would be wrong. Both are documented as out of scope, and a test says so, so
+        // that a future reader does not mistake the zero for "this capture is even".
+        let ep = Position::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1").unwrap();
+        let mv = ep.move_from_uci("e5d6").unwrap();
+        assert_eq!(see(&ep, mv), 0, "en passant is out of scope");
+
+        let promo = Position::from_fen("3r3k/4P3/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let mv = promo.move_from_uci("e7d8q").unwrap();
+        assert_eq!(see(&promo, mv), 0, "a capturing promotion is out of scope");
+    }
+
+    #[test]
+    fn a_quiet_move_has_no_exchange_to_evaluate() {
+        assert_eq!(see_of("4k3/8/8/8/8/8/8/K2R4 w - - 0 1", "d1d5"), 0);
+    }
+
+
 }
