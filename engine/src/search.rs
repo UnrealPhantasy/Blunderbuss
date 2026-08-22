@@ -3214,7 +3214,7 @@ mod tests {
                     );
                 }
                 assert!(
-                    !(mated(cut) && !mated(plain)),
+                    !mated(cut) || mated(plain),
                     "{fen} d{depth}: the cut invented a mate the search did not see",
                 );
             }
