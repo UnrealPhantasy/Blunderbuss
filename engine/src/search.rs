@@ -3221,13 +3221,22 @@ mod tests {
         // always could — six criteria of that shape have been struck from earlier issues in this
         // repository after being measured false. What survives and is worth asserting is that
         // the *move played* does not change on a mate.
+        // Counts the pairs where a mate was found **and** the cut actually fired, which is the
+        // only configuration that says anything about a mate surviving pruning. Measured: 3 of
+        // 21, all on the ladder mate at depths 7 to 9 (73 to 137 firings). The other two
+        // positions never trigger the cut at any depth in this range, and the reason is the same
+        // one that made the first draft of `the_cut_fires_on_real_positions` rest on a false
+        // premise: they are so lopsided that the window tracks the score, so the evaluation never
+        // clears beta by the margin. Without this counter the test compared two identical
+        // searches in 18 of 21 cases and proved nothing at all.
+        let mut exercised = 0;
         for fen in [
             "6k1/5ppp/8/8/8/8/8/R6K w - - 0 1",
             "7k/8/8/8/8/8/1R6/R6K b - - 0 1",
             "3k4/8/3K4/8/8/8/8/6R1 w - - 0 1",
         ] {
             let p = Position::from_fen(fen).unwrap();
-            for depth in 3..=7u32 {
+            for depth in 3..=9u32 {
                 let mut t1 = Table::new();
                 let mut a = Searcher::new(MoveOrder::Full, None, &mut t1);
                 a.allow_rfp = false;
@@ -3235,7 +3244,14 @@ mod tests {
                 let mut t2 = Table::new();
                 let mut b = Searcher::new(MoveOrder::Full, None, &mut t2);
                 let cut = deepen(&p, Request::new(Limits::depth(depth)), &mut b).best;
+                // The precondition that makes the comparison mean something: the cut has to have
+                // *fired* in this search. Without it the test would happily pass on a position
+                // the brick never touched, which proves nothing about mates surviving pruning —
+                // it only proves that two identical searches agree.
                 let mated = |x: Option<(Move, i32)>| x.is_some_and(|(_, sc)| sc.abs() > MATE_THRESHOLD);
+                if mated(plain) && b.rfp_taken > 0 {
+                    exercised += 1;
+                }
                 if mated(plain) {
                     assert!(mated(cut), "{fen} d{depth}: the cut lost a mate the search had");
                     assert_eq!(
@@ -3250,6 +3266,14 @@ mod tests {
                 );
             }
         }
+        // Asserted as a precondition rather than pinned to the measured 3: a constant would be
+        // hostage to anything that shifts where the cut fires, and would then pass while testing
+        // nothing — which is the failure mode this whole assertion exists to close.
+        assert!(
+            exercised > 0,
+            "no case both found a mate and fired the cut, so this test compared identical \
+             searches throughout and says nothing about mates surviving pruning",
+        );
     }
 
     #[test]
