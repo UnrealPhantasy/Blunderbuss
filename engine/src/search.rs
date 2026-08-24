@@ -1595,7 +1595,7 @@ mod tests {
         // before anyone lowers `NULL_MOVE_MIN_PHASE` for the extra nodes: the cost is
         // a wrong verdict, one ply past where this test looks.
         for (name, fen) in [
-            // Trébuchet: whoever moves loses the pawn, and with it the game.
+            // Trebuchet: whoever moves loses the pawn, and with it the game.
             ("trebuchet", "8/8/8/p1p5/P1P5/8/8/K6k w - - 0 1"),
             // Opposition: White to move cannot make progress; Black to move loses.
             ("opposition", "8/8/8/3k4/8/3K4/3P4/8 w - - 0 1"),
@@ -3484,7 +3484,7 @@ mod tests {
 
     /// Même balayage, depuis une position de départ choisie.
     ///
-    /// Le jeu pseudo-aléatoire depuis l'ouverture ne produit que 17 mats sur 2 000 comparaisons —
+    /// Pseudo-random play from the opening yields only 17 mates in 2 000 comparisons —
     /// une base étroite pour la propriété dont dépend toute la brique. Partir d'une position
     /// **tactique** en donne bien plus par comparaison, parce que les mats y sont proches.
     fn see_pruning_sweep_from(games: u64, depths: &[u32], start: &str) -> Sweep {
@@ -3581,10 +3581,10 @@ mod tests {
         //
         // Positions come from pseudo-random play rather than a hand-picked list: a list chosen
         // by the author of the pruning is the one place its blind spots are least likely to be.
-        // Deux sources, cumulées : le jeu pseudo-aléatoire depuis l'ouverture, qui balaie des
-        // positions quelconques, et de courtes marches depuis les positions **tactiques** de la
-        // suite ci-dessus, où les mats sont proches. La première seule ne produisait que 17 mats
-        // sur 2 000 comparaisons — rassurant mais mince pour la propriété qui décide la brique.
+        // Two sources, cumulated: pseudo-random play from the opening, which sweeps arbitrary
+        // positions, and short walks from the **tactical** positions of the suite above, where
+        // mates are close. The first alone produced only 17 mates in 2 000 comparisons —
+        // reassuring but thin for the property that decides the brick.
         let mut s = see_pruning_sweep(1_000, &[5, 6]);
         for fen in TACTICS {
             let t = see_pruning_sweep_from(40, &[5, 6], fen);

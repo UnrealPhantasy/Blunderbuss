@@ -144,8 +144,11 @@ impl Position {
     /// caller *must* decide what to do with an invalid FEN, it cannot ignore it
     /// by accident. `?` propagates the error if parsing fails. The `false` in
     /// `from_fen` disables Chess960 mode (out of scope).
-    /// La position en FEN. **Tests seulement** : sert à identifier une position trouvée par un
-    /// balayage, pour qu'un défaut soit reproductible à partir d'une chaîne.
+    /// The position as FEN. Written so a sweep can **name** the position it disagreed on, and a
+    /// defect be reproduced from a string rather than from a seed and a walk.
+    ///
+    /// It went uncalled from the day it was written until #69, where the sweep it exists for had
+    /// been red for three days and could not say on which positions.
     #[cfg(test)]
     pub fn to_fen(&self) -> String {
         format!("{}", self.0)
