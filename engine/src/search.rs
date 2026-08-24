@@ -3161,6 +3161,37 @@ mod tests {
     }
 
     #[test]
+    fn the_cut_returns_the_evaluation_and_not_beta() {
+        // The one decision in this brick that the doc comment argued at length and nothing
+        // asserted: returning `eval` rather than `beta`. Mutating the return to `Some(beta)` left
+        // the entire suite green, which is exactly the gap #39 chose to close with an honest note
+        // instead of a test. Here a test is cheap, so it is the test.
+        //
+        // The distance is not decorative. This value becomes the parent's `best`, which decides
+        // the bound class and the number written to the transposition table: returning `beta`
+        // would store "at least beta" where the node actually knows "at least eval", and eval can
+        // sit hundreds of centipawns higher.
+        let p = Position::from_fen("4k3/8/8/8/8/8/8/3QK2R w K - 0 1").unwrap();
+        let mut table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        let beta = 100;
+        let cut = s.reverse_futility(&p, 1, beta).expect("precondition: this node must be cut");
+        // The precondition is load-bearing and its absence is how two tests in this file were
+        // written inert earlier: if `eval` merely equalled `beta`, the assertion below would pass
+        // against the mutation it exists to catch.
+        assert!(
+            cut > beta + RFP_MARGIN,
+            "precondition: the evaluation must clear beta by more than the margin, otherwise \
+             `eval` and `beta` are indistinguishable here",
+        );
+        assert_eq!(
+            cut,
+            evaluate(&p),
+            "the cut must return the static evaluation, not the bound it was compared against",
+        );
+    }
+
+    #[test]
     fn the_ceiling_is_where_the_cut_stops() {
         // The gate that makes the brick viable rather than a detail: `evaluate` is called in one
         // other place in this engine, so every node past the ceiling would pay for an evaluation
