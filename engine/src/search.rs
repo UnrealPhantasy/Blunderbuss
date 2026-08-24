@@ -1610,7 +1610,7 @@ mod tests {
             // Swept rather than fixed at one depth, and the reason is measured: with
             // the guard removed, the node difference is **0 at depth 4** on both
             // positions — a single-depth test there would be green whether or not the
-            // guard exists — and only **1 node** on the trébuchet at depth 6. One
+            // guard exists — and only **1 node** on the trebuchet at depth 6. One
             // depth is one constant away from being inert, and nothing in the test
             // would say so. Eight opportunities have to go quiet at once instead of
             // one. Costs 0.5 s, and under the mutation it fails at depth 5.
@@ -3482,11 +3482,12 @@ mod tests {
         )
     }
 
-    /// Même balayage, depuis une position de départ choisie.
+    /// The same sweep, from a chosen starting position.
     ///
-    /// Pseudo-random play from the opening yields only 17 mates in 2 000 comparisons —
-    /// une base étroite pour la propriété dont dépend toute la brique. Partir d'une position
-    /// **tactique** en donne bien plus par comparaison, parce que les mats y sont proches.
+    /// Pseudo-random play from the opening reaches a mate rarely — 17 in 2 000 comparisons — which
+    /// is a narrow base for the property the whole brick depends on. Starting from a position
+    /// where mates are close multiplies them without hand-picking the positions themselves, which
+    /// is what a list chosen by the author of the pruning would do.
     fn see_pruning_sweep_from(games: u64, depths: &[u32], start: &str) -> Sweep {
         let mut rng = Xorshift(0x5EED_5EED);
         let mut out = Sweep {
