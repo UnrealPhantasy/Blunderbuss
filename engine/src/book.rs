@@ -172,7 +172,7 @@ mod tests {
 
     /// The generated book, whose lines nobody can check by eye — which is exactly why a test
     /// checks them. A corrupted regeneration has to be a test failure, not a discovery in a game.
-    const GENERATED: &str = include_str!("../../book-genere.txt");
+    const GENERATED: &str = include_str!("../../book-generated.txt");
 
     #[test]
     fn every_line_of_both_books_is_legal() {
@@ -181,7 +181,7 @@ mod tests {
         assert!(hand.len() > 40, "the hand-written book answers only {} positions", hand.len());
 
         let (generated, skipped) = Book::from_lines(GENERATED);
-        assert_eq!(skipped, 0, "{skipped} line(s) of book-genere.txt contain an illegal move");
+        assert_eq!(skipped, 0, "{skipped} line(s) of book-generated.txt contain an illegal move");
         assert!(
             generated.len() > 5_000,
             "the generated book answers only {} positions",

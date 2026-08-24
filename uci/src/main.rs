@@ -184,7 +184,7 @@ fn allocate(divisor: u64, remaining: Duration, increment: Duration) -> Duration 
 ///   importantly, *readable*: the tests point at lines a person can check by eye, including the
 ///   London written in both move orders so the transposition property is data rather than a
 ///   claim.
-/// - `book-genere.txt` is 8 700 positions produced by Stockfish to twelve plies. Far deeper, and
+/// - `book-generated.txt` is 8 700 positions produced by Stockfish to twelve plies. Far deeper, and
 ///   opaque — nobody can verify one of its lines by reading it.
 ///
 /// Beside the executable first because that is where an arena finds it: `match.sh` runs
@@ -199,7 +199,7 @@ fn load_book() -> Option<Book> {
         .into_iter()
         .chain(Some(std::path::PathBuf::from(".")));
     for dir in dirs {
-        for name in ["book.txt", "book-genere.txt"] {
+        for name in ["book.txt", "book-generated.txt"] {
             if let Ok(t) = std::fs::read_to_string(dir.join(name)) {
                 text.push_str(&t);
                 text.push('\n');
