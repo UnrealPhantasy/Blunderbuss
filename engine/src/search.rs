@@ -357,8 +357,14 @@ pub fn search_timed(pos: &Position, limits: Limits) -> SearchStats {
 pub struct Engine {
     table: Table,
     /// How many games this engine has been told it is starting. Seeds the book so successive
-    /// games do not follow the same line, while two runs of the same sequence still do — the
-    /// diversity is across games, not across runs, so no measurement loses its reproducibility.
+    /// games **within one session** do not follow the same line, while two runs of the same
+    /// sequence still do.
+    ///
+    /// Measured consequence, stated rather than discovered: a fresh process replays the same
+    /// opening, so eight separate runs of the binary all play the same first move. Deliberate —
+    /// a GUI session and an arena match both keep the process alive and send `ucinewgame`, which
+    /// is where diversity is wanted, and a clock- or pid-derived seed would cost the
+    /// reproducibility every measurement here leans on.
     games: u64,
     /// The opening moves played without searching. `None` is "no book", which is not the same as
     /// an empty one: they behave identically and mean different things, so the distinction is
@@ -3038,10 +3044,20 @@ mod tests {
     }
 
     #[test]
-    fn successive_games_do_not_all_follow_one_line() {
+    fn successive_games_in_one_session_do_not_all_follow_one_line() {
         // Diversity is most of what a book buys against a human: an engine that replays one line
-        // every game hands over free preparation. Measured over the start position, where the
-        // shipped book offers several first moves.
+        // every game hands over free preparation.
+        //
+        // **In one session**, and the qualifier is measured rather than decorative. The seed is a
+        // game counter, so a *fresh process* replays the same sequence — eight separate runs of
+        // the binary all open `e2e4`. That is a deliberate trade and not an oversight: a GUI
+        // session and an arena match both keep the process alive across games and send
+        // `ucinewgame`, which is where the diversity is needed, while a seed drawn from the clock
+        // or the pid would make two runs of the same match differ and cost the reproducibility
+        // every measurement in this repository leans on.
+        //
+        // Naming it here because the first version of this test asserted diversity in a scenario
+        // that is not the deployed one — the same shape as two inert tests found in #66.
         let mut e = booked();
         let start = Position::initial();
         let mut seen = std::collections::HashSet::new();

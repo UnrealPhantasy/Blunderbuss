@@ -43,6 +43,21 @@ use std::collections::HashMap;
 /// brick (statistics filtered by rating band) has somewhere to put its numbers.
 type Entry = Vec<(Move, u32)>;
 
+/// The most weight one move can accumulate, and it exists because of a defect a test found.
+///
+/// A weight counts the lines passing through a move. In a **generated** tree that number measures
+/// the size of the subtree below it, not the quality of the move — an artefact of how the file
+/// was produced. Merging a hand-written book of 27 lines with a generated one of 8 700 therefore
+/// let the large file drown the small one: `c2c4`, offered by two authored lines against
+/// thousands through `e2e4`, was picked roughly once in four thousand, and the merged book opened
+/// three ways instead of four.
+///
+/// Capping keeps a small deliberate line from being erased by a large mechanical one, while
+/// preserving the ordering the weights are for. The value is not tuned and does not need to be:
+/// stage two of this brick replaces these counts with statistics filtered by rating band, and
+/// this cap goes with them.
+const WEIGHT_CAP: u32 = 8;
+
 pub struct Book {
     entries: HashMap<u64, Entry>,
     /// Rust idiom: interior state on a `&self` method would need `Cell`. It is kept as a plain
@@ -91,7 +106,7 @@ impl Book {
             for (key, mv) in steps {
                 let slot = entries.entry(key).or_default();
                 match slot.iter_mut().find(|(m, _)| *m == mv) {
-                    Some((_, weight)) => *weight += 1,
+                    Some((_, weight)) => *weight = (*weight + 1).min(WEIGHT_CAP),
                     None => slot.push((mv, 1)),
                 }
             }
@@ -155,11 +170,54 @@ mod tests {
     /// author believes.
     const SHIPPED: &str = include_str!("../../book.txt");
 
+    /// The generated book, whose lines nobody can check by eye — which is exactly why a test
+    /// checks them. A corrupted regeneration has to be a test failure, not a discovery in a game.
+    const GENERATED: &str = include_str!("../../book-genere.txt");
+
     #[test]
-    fn every_line_of_the_shipped_book_is_legal() {
-        let (book, skipped) = Book::from_lines(SHIPPED);
+    fn every_line_of_both_books_is_legal() {
+        let (hand, skipped) = Book::from_lines(SHIPPED);
         assert_eq!(skipped, 0, "{skipped} line(s) of book.txt contain an illegal move");
-        assert!(book.len() > 40, "the book answers only {} positions", book.len());
+        assert!(hand.len() > 40, "the hand-written book answers only {} positions", hand.len());
+
+        let (generated, skipped) = Book::from_lines(GENERATED);
+        assert_eq!(skipped, 0, "{skipped} line(s) of book-genere.txt contain an illegal move");
+        assert!(
+            generated.len() > 5_000,
+            "the generated book answers only {} positions",
+            generated.len(),
+        );
+    }
+
+    #[test]
+    fn concatenating_the_two_books_merges_them_by_position() {
+        // Why there are two files rather than a choice between them. They have opposite
+        // strengths — the hand-written one is broader at the root and readable, the generated one
+        // is far deeper and opaque — and the line format merges them for free, since a position
+        // offered by both simply collects both continuations.
+        let (hand, _) = Book::from_lines(SHIPPED);
+        let (generated, _) = Book::from_lines(GENERATED);
+        let (both, skipped) = Book::from_lines(&format!("{SHIPPED}\n{GENERATED}"));
+        assert_eq!(skipped, 0);
+        assert!(
+            both.len() >= generated.len() && both.len() > hand.len(),
+            "merged {} against {} generated and {} hand-written",
+            both.len(), generated.len(), hand.len(),
+        );
+
+        // The property that matters more than the count: the union is broader at the root. The
+        // hand-written file offers four first moves, the generated one three (Stockfish's top
+        // three), and an engine that opens four ways is harder to prepare against than one that
+        // opens three.
+        let mut both = both;
+        let start = Position::initial();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..400 {
+            if let Some(mv) = both.pick(&start) {
+                seen.insert(format!("{mv}"));
+            }
+        }
+        assert!(seen.len() >= 4, "the merged book opens only {} ways: {seen:?}", seen.len());
     }
 
     #[test]

@@ -174,28 +174,51 @@ fn allocate(divisor: u64, remaining: Duration, increment: Duration) -> Duration 
 /// names no limit. Kept separate from `main` so it can be unit-tested without
 /// spawning a process — and the budget is a field, not a constant, so tests can
 /// shorten it.
-/// Load `book.txt` from beside the executable, then from the working directory.
+/// Load every book file found, beside the executable first and then in the working directory.
+///
+/// **Two files, merged, and that is not indecision.** They have opposite strengths and the line
+/// format merges them for free — a position offered by both simply gets both continuations.
+///
+/// - `book.txt` is hand-written, twenty-seven named lines. Broader at the root (four first moves
+///   against the generated book's three, since that one follows Stockfish's top three) and, more
+///   importantly, *readable*: the tests point at lines a person can check by eye, including the
+///   London written in both move orders so the transposition property is data rather than a
+///   claim.
+/// - `book-genere.txt` is 8 700 positions produced by Stockfish to twelve plies. Far deeper, and
+///   opaque — nobody can verify one of its lines by reading it.
 ///
 /// Beside the executable first because that is where an arena finds it: `match.sh` runs
 /// `./bin/blunderbuss-x` from the harness directory, so a book living next to the source tree
 /// would be invisible exactly where it is measured. Absent means no book, silently — an engine
-/// that refused to start without one would be worse than one that plays its own openings.
+/// that refused to start without one would be worse than one playing its own openings.
 fn load_book() -> Option<Book> {
-    let beside = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("book.txt")));
-    for path in beside.into_iter().chain(Some(std::path::PathBuf::from("book.txt"))) {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            let (book, skipped) = Book::from_lines(&text);
-            if skipped > 0 {
-                // Printed rather than swallowed: a book quietly smaller than its file is the same
-                // failure as a test that passes without testing anything.
-                println!("info string book: {skipped} line(s) skipped in {}", path.display());
-            }
-            if !book.is_empty() {
-                return Some(book);
+    let mut text = String::new();
+    let dirs = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .into_iter()
+        .chain(Some(std::path::PathBuf::from(".")));
+    for dir in dirs {
+        for name in ["book.txt", "book-genere.txt"] {
+            if let Ok(t) = std::fs::read_to_string(dir.join(name)) {
+                text.push_str(&t);
+                text.push('\n');
             }
         }
+        if !text.is_empty() {
+            break;
+        }
     }
-    None
+    if text.is_empty() {
+        return None;
+    }
+    let (book, skipped) = Book::from_lines(&text);
+    if skipped > 0 {
+        // Printed rather than swallowed: a book quietly smaller than its files is the same
+        // failure as a test that passes without testing anything.
+        println!("info string book: {skipped} line(s) skipped");
+    }
+    (!book.is_empty()).then_some(book)
 }
 
 struct Uci {
