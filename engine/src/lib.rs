@@ -12,6 +12,7 @@
 //! ordering    move ordering — MVV-LVA, killer moves, history
 //! transposition  the cache of already-searched positions, keyed by Zobrist
 //! search      alpha-beta, quiescence, iterative deepening
+//! book        the opening moves played without searching
 //! ```
 //!
 //! Modules are declared here as they are written. In Rust, a module is compiled
@@ -23,3 +24,4 @@ pub mod evaluation;
 pub mod ordering;
 pub mod transposition;
 pub mod search;
+pub mod book;

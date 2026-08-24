@@ -14,6 +14,7 @@
 use crate::evaluation::{evaluate, phase};
 use crate::ordering::{is_quiet, mvv_lva, order_moves, see, KillerSlots, Killers};
 use crate::position::{Move, Piece, Position};
+use crate::book::Book;
 use crate::transposition::{Bound, Table};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -355,6 +356,14 @@ pub fn search_timed(pos: &Position, limits: Limits) -> SearchStats {
 /// pay the search cost. Playing does not care; reporting does.
 pub struct Engine {
     table: Table,
+    /// How many games this engine has been told it is starting. Seeds the book so successive
+    /// games do not follow the same line, while two runs of the same sequence still do — the
+    /// diversity is across games, not across runs, so no measurement loses its reproducibility.
+    games: u64,
+    /// The opening moves played without searching. `None` is "no book", which is not the same as
+    /// an empty one: they behave identically and mean different things, so the distinction is
+    /// kept in the type rather than in a count.
+    book: Option<Book>,
 }
 
 impl Default for Engine {
@@ -365,18 +374,42 @@ impl Default for Engine {
 
 impl Engine {
     pub fn new() -> Engine {
-        Engine { table: Table::new() }
+        Engine { table: Table::new(), games: 0, book: None }
+    }
+
+    /// Give this engine an opening book, or take it away with `None`.
+    pub fn set_book(&mut self, book: Option<Book>) {
+        self.book = book;
     }
 
     /// Forget everything learned so far. Called at the start of a **new game**, never
     /// between moves of the same one.
     pub fn new_game(&mut self) {
         self.table.clear();
+        // Reseeded per game rather than per move: within one game the book must follow a single
+        // line, across games it must not always follow the same one. A fixed value would hand an
+        // opponent free preparation, which is most of what a book costs when it has none.
+        self.games += 1;
+        let seed = self.games.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        if let Some(book) = self.book.as_mut() {
+            book.reseed(seed);
+        }
     }
 
     /// Search `pos`. Everything a caller can ask for travels in [`Request`]; what
     /// the search learns stays here, ready for the next move.
     pub fn search(&mut self, pos: &Position, request: Request) -> SearchStats {
+        // Consulted before anything, and in particular before the clock budget is read: a book
+        // move must cost nothing, which is the whole of what this brick buys.
+        if let Some(mv) = self.book.as_mut().and_then(|b| b.pick(pos)) {
+            return SearchStats {
+                best: Some((mv, 0)),
+                depth: 0,
+                nodes: 0,
+                table_key_match_rate: 0.0,
+                table_cutoff_rate: 0.0,
+            };
+        }
         let mut searcher =
             Searcher::new(MoveOrder::Full, request.limits.deadline, &mut self.table);
         deepen(pos, request, &mut searcher)
@@ -2943,6 +2976,82 @@ mod tests {
                 "precondition: the mate in `{fen}` must be found somewhere in depths 3..=8",
             );
         }
+    }
+
+    // ------------------------------------------------------------ opening book (#71)
+
+    fn booked() -> Engine {
+        let (book, skipped) = crate::book::Book::from_lines(include_str!("../../book.txt"));
+        assert_eq!(skipped, 0, "precondition: the shipped book must be legal");
+        let mut e = Engine::new();
+        e.set_book(Some(book));
+        e
+    }
+
+    #[test]
+    fn a_book_move_costs_no_nodes() {
+        // What the brick *is*, pinned by node count rather than by score. A score cannot see
+        // whether the position was searched, which is the entire claim.
+        let mut e = booked();
+        let stats = e.search(&Position::initial(), Request::new(Limits::depth(8)));
+        let (mv, _) = stats.best.expect("the book must answer the start position");
+        assert_eq!(stats.nodes, 0, "a book move searched {} nodes", stats.nodes);
+        assert!(Position::initial().legal_moves().contains(&mv), "the book answered an illegal move");
+    }
+
+    #[test]
+    fn leaving_the_book_searches_exactly_as_if_there_were_none() {
+        // The transition has to be invisible from outside: once out of book, the engine must be
+        // the engine every published measurement was taken on. Compared by node count, one
+        // position past the end of every line the book knows.
+        let mut p = Position::initial();
+        for t in ["a2a3", "a7a6"] {
+            p = p.play(p.move_from_uci(t).unwrap());
+        }
+        let mut with = booked();
+        let mut without = Engine::new();
+        for depth in 5..=7u32 {
+            let a = with.search(&p, Request::new(Limits::depth(depth)));
+            let b = without.search(&p, Request::new(Limits::depth(depth)));
+            assert!(a.nodes > 0, "precondition: this position must be outside the book");
+            assert_eq!(a.nodes, b.nodes, "d{depth}: the book changed a searched position");
+            assert_eq!(a.best.map(|(m, _)| m), b.best.map(|(m, _)| m), "d{depth}: move changed");
+        }
+    }
+
+    #[test]
+    fn switching_the_book_off_restores_the_bookless_engine() {
+        // The inert control. Without it, every measurement above could be reading an engine whose
+        // book silently never fires — which looks identical to a book that costs nothing.
+        let mut e = booked();
+        let start = Position::initial();
+        assert_eq!(
+            e.search(&start, Request::new(Limits::depth(6))).nodes,
+            0,
+            "precondition: with a book, the start position must not be searched",
+        );
+        e.set_book(None);
+        let off = e.search(&start, Request::new(Limits::depth(6)));
+        let bare = Engine::new().search(&start, Request::new(Limits::depth(6)));
+        assert!(off.nodes > 0, "the book was switched off and the position still was not searched");
+        assert_eq!(off.nodes, bare.nodes, "switching the book off did not restore the node count");
+    }
+
+    #[test]
+    fn successive_games_do_not_all_follow_one_line() {
+        // Diversity is most of what a book buys against a human: an engine that replays one line
+        // every game hands over free preparation. Measured over the start position, where the
+        // shipped book offers several first moves.
+        let mut e = booked();
+        let start = Position::initial();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..40 {
+            e.new_game();
+            if let Some((mv, _)) = e.search(&start, Request::new(Limits::depth(4))).best {
+                seen.insert(format!("{mv}"));
+            }
+        }
+        assert!(seen.len() > 1, "40 games all opened with the same move: {seen:?}");
     }
 
     #[test]

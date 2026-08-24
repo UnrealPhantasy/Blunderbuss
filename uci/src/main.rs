@@ -12,6 +12,7 @@
 //! answered by the engine's single search function — see [`parse_go`].
 
 use engine::position::{Color, Position};
+use engine::book::Book;
 use engine::search::{Engine, Limits, Progress, Request, MATE, MATE_THRESHOLD, MAX_DEPTH};
 use std::io::{self, BufRead, Write};
 use std::time::{Duration, Instant};
@@ -173,6 +174,30 @@ fn allocate(divisor: u64, remaining: Duration, increment: Duration) -> Duration 
 /// names no limit. Kept separate from `main` so it can be unit-tested without
 /// spawning a process — and the budget is a field, not a constant, so tests can
 /// shorten it.
+/// Load `book.txt` from beside the executable, then from the working directory.
+///
+/// Beside the executable first because that is where an arena finds it: `match.sh` runs
+/// `./bin/blunderbuss-x` from the harness directory, so a book living next to the source tree
+/// would be invisible exactly where it is measured. Absent means no book, silently — an engine
+/// that refused to start without one would be worse than one that plays its own openings.
+fn load_book() -> Option<Book> {
+    let beside = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("book.txt")));
+    for path in beside.into_iter().chain(Some(std::path::PathBuf::from("book.txt"))) {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let (book, skipped) = Book::from_lines(&text);
+            if skipped > 0 {
+                // Printed rather than swallowed: a book quietly smaller than its file is the same
+                // failure as a test that passes without testing anything.
+                println!("info string book: {skipped} line(s) skipped in {}", path.display());
+            }
+            if !book.is_empty() {
+                return Some(book);
+            }
+        }
+    }
+    None
+}
+
 struct Uci {
     position: Position,
     default_budget: Duration,
@@ -228,7 +253,28 @@ impl Uci {
             default_budget: Duration::from_millis(DEFAULT_BUDGET_MS),
             history: Vec::new(),
             info,
-            engine: Engine::new(),
+            engine: {
+                let mut e = Engine::new();
+                e.set_book(load_book());
+                e
+            },
+        }
+    }
+
+    /// `setoption name <name> value <value>`, the only shape the protocol uses.
+    ///
+    /// Unknown options are ignored rather than refused: the protocol expects an engine to
+    /// tolerate whatever a GUI sends, and refusing would end a session over a setting we do not
+    /// have.
+    fn set_option(&mut self, tokens: &[&str]) {
+        let name = tokens.iter().position(|t| t.eq_ignore_ascii_case("name"));
+        let value = tokens.iter().position(|t| t.eq_ignore_ascii_case("value"));
+        let (Some(n), Some(v)) = (name, value) else { return };
+        let key = tokens[n + 1..v].join(" ");
+        let Some(raw) = tokens.get(v + 1) else { return };
+        if key.eq_ignore_ascii_case("ownbook") {
+            let on = raw.eq_ignore_ascii_case("true");
+            self.engine.set_book(if on { load_book() } else { None });
         }
     }
 
@@ -240,9 +286,16 @@ impl Uci {
             Some("uci") => Response::lines(vec![
                 "id name Blunderbuss".to_string(),
                 "id author UnrealPhantasy".to_string(),
+                // Standard UCI name, so an arena that wants the book off can say so without
+                // knowing anything about this engine.
+                "option name OwnBook type check default true".to_string(),
                 "uciok".to_string(),
             ]),
             Some("isready") => Response::lines(vec!["readyok".to_string()]),
+            Some("setoption") => {
+                self.set_option(&tokens[1..]);
+                Response::none()
+            }
             Some("ucinewgame") => {
                 self.position = Position::initial();
                 self.history.clear();
