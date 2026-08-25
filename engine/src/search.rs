@@ -3539,8 +3539,6 @@ mod tests {
         //
         // The property is really enforced by the signature: the value arrives as a parameter, so
         // recomputing takes an added call rather than an omission.
-        {
-        }
     }
 
     #[test]
