@@ -1940,7 +1940,6 @@ mod tests {
             // the pair under a name that claims otherwise.
             s.allow_rfp = false;
             s.allow_ffp = false;
-        s.allow_ffp = false;
             deepen(&p, Request::new(Limits::depth(depth)), &mut s).nodes
         };
         // Swept rather than measured at one chosen depth: a threshold that holds at
