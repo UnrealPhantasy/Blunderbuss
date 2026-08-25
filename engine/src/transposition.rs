@@ -189,7 +189,7 @@ pub struct Table {
     slots: Box<[Slot]>,
     // No counters here, and that absence is measured rather than tidy. A single
     // `fetch_add` per probe puts eight cores in a fight over one cache line: with the
-    // counters in this struct, `go depth 11` took 4,01 s on eight threads and 1,01 s
+    // counters in this struct, `go depth 11` took 4.01 s on eight threads and 1.01 s
     // without them. Counting is a diagnostic, so it lives per-searcher — see
     // `Searcher::table_probes` — where it costs a plain increment on a line nobody else
     // touches.

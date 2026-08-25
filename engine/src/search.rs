@@ -674,8 +674,8 @@ struct Searcher<'a> {
     /// Probe counters, per searcher and deliberately not atomic.
     ///
     /// They used to live on the table, where a single `fetch_add` per probe put every thread in
-    /// a fight over one cache line — measured: `go depth 11` cost 4,01 s on eight threads with
-    /// them there and 1,01 s without. Counting is a diagnostic, so it belongs where it is free.
+    /// a fight over one cache line — measured: `go depth 11` cost 4.01 s on eight threads with
+    /// them there and 1.01 s without. Counting is a diagnostic, so it belongs where it is free.
     table_probes: u64,
     table_hits: u64,
     table_cutoffs: u64,
