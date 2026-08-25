@@ -11,7 +11,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 fail=0
 run() {
   printf '\n\033[1m▶ %s\033[0m\n' "$1"; shift
-  if "$@"; then printf '\033[32m  ✓\033[0m\n'; else printf '\033[31m  ✗ ÉCHEC\033[0m\n'; fail=1; fi
+  if "$@"; then printf '\033[32m  ✓\033[0m\n'; else printf '\033[31m  ✗ FAILED\033[0m\n'; fail=1; fi
 }
 
 run "tests (debug)"              cargo test
@@ -20,9 +20,9 @@ run "clippy (debug)"             cargo clippy --all-targets -- -D warnings
 run "clippy (release)"           cargo clippy --all-targets --release -- -D warnings
 # Deliberately last and announced: about 100 seconds of pseudo-random play, so a wait is not
 # mistaken for a hang.
-printf '\n\033[1m▶ balayages ignorés (~100 s, patience)\033[0m\n'
-if cargo test --release -p engine -- --ignored; then printf '\033[32m  ✓\033[0m\n'; else printf '\033[31m  ✗ ÉCHEC\033[0m\n'; fail=1; fi
+printf '\n\033[1m▶ ignored sweeps (~100 s, be patient)\033[0m\n'
+if cargo test --release -p engine -- --ignored; then printf '\033[32m  ✓\033[0m\n'; else printf '\033[31m  ✗ FAILED\033[0m\n'; fail=1; fi
 
 printf '\n%s\n' "────────────────────────────────"
-[ "$fail" -eq 0 ] && printf '\033[32mTout est vert.\033[0m\n' || printf '\033[31mAu moins une porte est rouge.\033[0m\n'
+[ "$fail" -eq 0 ] && printf '\033[32mEverything is green.\033[0m\n' || printf '\033[31mAt least one gate is red.\033[0m\n'
 exit "$fail"
