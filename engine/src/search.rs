@@ -913,6 +913,11 @@ impl<'a> Searcher<'a> {
         let (allow, max_depth, margin) = (self.allow_rfp, self.rfp_max_depth, self.rfp_margin);
         #[cfg(not(test))]
         let (allow, max_depth, margin) = (true, RFP_MAX_DEPTH, RFP_MARGIN);
+        // `depth == 0` is defensive and **no test can reach it**: `negamax_inner` hands a
+        // depth-0 node to quiescence before this function is called, so a mutation removing it
+        // leaves every test green for a reason that is not a gap in the suite. It stays because
+        // it makes the multiplication below meaningful on its own terms — a zero margin would
+        // cut on the raw evaluation — and a caller added later would not know that.
         if !allow || depth == 0 || depth > max_depth {
             return None;
         }
