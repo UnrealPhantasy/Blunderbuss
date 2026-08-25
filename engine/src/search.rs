@@ -3224,6 +3224,41 @@ mod tests {
     }
 
     #[test]
+    fn only_the_reporting_thread_reports_and_it_reports_every_depth_once() {
+        // AC#3, and neither half was asserted: `a_parallel_search_answers_once_and_answers
+        // _something` checks a legal move and a final depth, which a search reporting four
+        // times per iteration would satisfy just as well.
+        //
+        // The property holds because helpers are constructed with `progress: None` — one line,
+        // twenty lines away from here, that a later refactor could hand a `progress` to without
+        // any test noticing. What a caller would see then is a GUI drawing four evaluation
+        // lines per depth, or an arena reading a depth its own engine never announced.
+        //
+        // Swept over thread counts including one, so the single-threaded path is the control:
+        // whatever the parallel search reports, it must be exactly what searching alone does.
+        let p = Position::from_fen(NATURES[1].1).unwrap();
+        for threads in [1usize, 4, 8] {
+            let mut e = Engine::new();
+            e.set_threads(threads);
+            let mut reported = Vec::new();
+            let stats = {
+                let mut record = |pr: &Progress| reported.push(pr.depth);
+                e.search(
+                    &p,
+                    Request { progress: Some(&mut record), ..Request::new(Limits::depth(6)) },
+                )
+            };
+            assert_eq!(
+                reported,
+                (1..=stats.depth).collect::<Vec<u32>>(),
+                "{threads} threads: every completed depth must be reported exactly once and in \
+                 order — a duplicate is a helper reporting, a gap is a report lost",
+            );
+            assert_eq!(stats.depth, 6, "{threads} threads: the reporting thread must finish");
+        }
+    }
+
+    #[test]
     fn a_parallel_search_stops_on_its_deadline_and_does_not_wait_for_its_helpers() {
         // `scope` cannot return until every helper has joined, so a helper that kept searching
         // after the answer was in would hold the whole search open. What has to hold is that
