@@ -3681,29 +3681,64 @@ mod tests {
     fn the_forward_cut_loses_no_mate_and_invents_none() {
         // Deliberately not asserted: score equality with an unpruned search. A heuristic cut may
         // return a different, equally valid bound — seven criteria of that shape have been struck
-        // in this repository. The counter is the precondition that keeps this from comparing two
-        // identical searches, which is how the SEE sweep was found 93% vacuous.
-        let mut exercised = 0;
+        // in this repository.
+        //
+        // **The two signs are counted apart, and that is what this version is for.** `.abs()`
+        // folded them: a pair where the full search delivers mate and the pruned one is *being*
+        // mated satisfied every assertion. And the fold was load-bearing — measured, the three
+        // positions the first draft used never fire the cut while delivering a mate, so the one
+        // pair it exercised was a mate **suffered** at depth 8, under a test whose name promises
+        // the other sign. That is the defect #70 is open to fix on `mate_move_differs`, in this
+        // same file and the same week.
+        //
+        // Measured over the six positions below, depths 3 to 8: 18 pairs deliver a mate with the
+        // cut firing (104 to 235 moves skipped), and 1 suffers one (849 skipped).
+        let delivers = |x: i32| x > MATE_THRESHOLD;
+        let suffers = |x: i32| x < -MATE_THRESHOLD;
+        let (mut delivered, mut suffered) = (0, 0);
         for fen in [
-            "6k1/5ppp/8/8/8/8/8/R6K w - - 0 1",
+            // Mate delivered *and* the cut firing — the combination the first draft had none of.
+            // All three keep material on both sides: a crushing position never triggers the cut,
+            // because the window tracks the score, which is the same premise that made the first
+            // draft of `the_cut_fires_on_real_positions` wrong in #66.
+            "r5rk/5p1p/5R2/4B3/8/8/7P/7K w - - 0 1",
+            "2bqkbn1/2pppp2/np2N3/r3P1p1/p2N2B1/5Q2/PPPPKPP1/RNB2r2 w - - 0 1",
+            "kbK5/pp6/1P6/8/8/8/8/R7 w - - 0 1",
+            // The ladder mate: the one position here where the side to move is the one mated.
             "7k/8/8/8/8/8/1R6/R6K b - - 0 1",
+            // Mate in one from a crushing position. Kept, and kept named: they contribute no
+            // exercised pair at all, and a reader who assumes otherwise is making the mistake
+            // this version exists to undo.
+            "6k1/5ppp/8/8/8/8/8/R6K w - - 0 1",
             "3k4/8/3K4/8/8/8/8/6R1 w - - 0 1",
         ] {
             let p = Position::from_fen(fen).unwrap();
             for depth in 3..=8u32 {
                 let (_, plain, ..) = ffp(&p, depth, false);
                 let (_, cut, pruned, ..) = ffp(&p, depth, true);
-                let mated = |x: i32| x.abs() > MATE_THRESHOLD;
-                if mated(plain) {
-                    assert!(mated(cut), "{fen} d{depth}: the cut lost a mate");
-                    if pruned > 0 {
-                        exercised += 1;
-                    }
+                // The mate this engine plays *for*. Skipping the move that mates would lose it.
+                if delivers(plain) {
+                    assert!(delivers(cut), "{fen} d{depth}: the cut lost a mate, {cut} against {plain}");
+                    delivered += u32::from(pruned > 0);
                 }
-                assert!(!mated(cut) || mated(plain), "{fen} d{depth}: it invented a mate");
+                if delivers(cut) {
+                    assert!(delivers(plain), "{fen} d{depth}: it invented a mate, {cut} against {plain}");
+                }
+                // And the mate played *against* it. Skipping a defence would fabricate one;
+                // the assertion below is the one `.abs()` could not make.
+                if suffers(plain) {
+                    assert!(suffers(cut), "{fen} d{depth}: it missed a mate against it, {cut} against {plain}");
+                    suffered += u32::from(pruned > 0);
+                }
+                if suffers(cut) {
+                    assert!(suffers(plain), "{fen} d{depth}: it believed itself mated, {cut} against {plain}");
+                }
             }
         }
-        assert!(exercised > 0, "no case both found a mate and skipped a move");
+        // Two counters rather than one, because one of the two signs is what the previous version
+        // silently stopped covering.
+        assert!(delivered > 0, "no pair both delivered a mate and skipped a move");
+        assert!(suffered > 0, "no pair was both mated and skipped a move");
     }
 
     #[test]
