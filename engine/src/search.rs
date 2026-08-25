@@ -1841,7 +1841,7 @@ mod tests {
         // before anyone lowers `NULL_MOVE_MIN_PHASE` for the extra nodes: the cost is
         // a wrong verdict, one ply past where this test looks.
         for (name, fen) in [
-            // Trébuchet: whoever moves loses the pawn, and with it the game.
+            // Trebuchet: whoever moves loses the pawn, and with it the game.
             ("trebuchet", "8/8/8/p1p5/P1P5/8/8/K6k w - - 0 1"),
             // Opposition: White to move cannot make progress; Black to move loses.
             ("opposition", "8/8/8/3k4/8/3K4/3P4/8 w - - 0 1"),
@@ -1856,7 +1856,7 @@ mod tests {
             // Swept rather than fixed at one depth, and the reason is measured: with
             // the guard removed, the node difference is **0 at depth 4** on both
             // positions — a single-depth test there would be green whether or not the
-            // guard exists — and only **1 node** on the trébuchet at depth 6. One
+            // guard exists — and only **1 node** on the trebuchet at depth 6. One
             // depth is one constant away from being inert, and nothing in the test
             // would say so. Eight opportunities have to go quiet at once instead of
             // one. Costs 0.5 s, and under the mutation it fails at depth 5.
@@ -4256,10 +4256,24 @@ mod tests {
         worst_gap: i32,
         mates_lost: u32,
         mates_gained: u32,
-        /// Comparaisons ou un mat est en jeu **et** le coup choisi differe. C'est la seule
-        /// grandeur qui change le jeu : un score en retard d'un pli ne change rien si le moteur
-        /// joue le meme coup.
+        /// Comparisons where a mate was in play **and** the chosen move differed — counted
+        /// with `.abs()`, so it folds together two quantities of opposite severity. Kept as a
+        /// printed diagnostic only. See the four fields below, which are what is asserted.
         mate_move_differs: u32,
+        /// Mates the side to move can **deliver** (`score > MATE_THRESHOLD`), and the three ways
+        /// pruning could damage one.
+        ///
+        /// This is the split the sweep lacked, and the whole of #69. Throwing away a forced win
+        /// would make the brick worthless; failing to find the longest defence in a position
+        /// already lost by force changes nothing about the game. Folding both into one counter
+        /// made the second failure look like the first.
+        wins_seen: u32,
+        wins_lost: u32,
+        wins_slower: u32,
+        wins_move_differs: u32,
+        /// The offending comparisons, each naming its FEN, depth, and both moves and scores.
+        /// `Position::to_fen` was written for exactly this and had never been called.
+        offenders: Vec<String>,
     }
 
     fn see_pruning_sweep(games: u64, depths: &[u32]) -> Sweep {
@@ -4270,11 +4284,12 @@ mod tests {
         )
     }
 
-    /// Même balayage, depuis une position de départ choisie.
+    /// The same sweep, from a chosen starting position.
     ///
-    /// Le jeu pseudo-aléatoire depuis l'ouverture ne produit que 17 mats sur 2 000 comparaisons —
-    /// une base étroite pour la propriété dont dépend toute la brique. Partir d'une position
-    /// **tactique** en donne bien plus par comparaison, parce que les mats y sont proches.
+    /// Pseudo-random play from the opening reaches a mate rarely — 17 in 2 000 comparisons — which
+    /// is a narrow base for the property the whole brick depends on. Starting from a position
+    /// where mates are close multiplies them without hand-picking the positions themselves, which
+    /// is what a list chosen by the author of the pruning would do.
     fn see_pruning_sweep_from(games: u64, depths: &[u32], start: &str) -> Sweep {
         let mut rng = Xorshift(0x5EED_5EED);
         let mut out = Sweep {
@@ -4286,6 +4301,11 @@ mod tests {
             mates_lost: 0,
             mates_gained: 0,
             mate_move_differs: 0,
+            wins_seen: 0,
+            wins_lost: 0,
+            wins_slower: 0,
+            wins_move_differs: 0,
+            offenders: Vec::new(),
         };
 
         for game in 0..games {
@@ -4323,6 +4343,25 @@ mod tests {
                 if (full_mate || pruned_mate) && pm != fm {
                     out.mate_move_differs += 1;
                 }
+                // The property that decides the brick, and the only one asserted: a mate the
+                // side to move can **deliver**. `full_mate` above uses `.abs()` and therefore
+                // cannot tell a forced win from a forced loss.
+                if fs > MATE_THRESHOLD {
+                    out.wins_seen += 1;
+                    let note = |what: &str| {
+                        format!("{what}  d{depth}  {}  full {fm}={fs}  pruned {pm}={ps}", pos.to_fen())
+                    };
+                    if ps <= MATE_THRESHOLD {
+                        out.wins_lost += 1;
+                        out.offenders.push(note("WIN LOST   "));
+                    } else if ps != fs {
+                        out.wins_slower += 1;
+                        out.offenders.push(note("WIN SLOWER "));
+                    } else if pm != fm {
+                        out.wins_move_differs += 1;
+                        out.offenders.push(note("WIN OTHER  "));
+                    }
+                }
                 if full_mate && !pruned_mate {
                     out.mates_lost += 1;
                 }
@@ -4345,10 +4384,10 @@ mod tests {
         //
         // Positions come from pseudo-random play rather than a hand-picked list: a list chosen
         // by the author of the pruning is the one place its blind spots are least likely to be.
-        // Deux sources, cumulées : le jeu pseudo-aléatoire depuis l'ouverture, qui balaie des
-        // positions quelconques, et de courtes marches depuis les positions **tactiques** de la
-        // suite ci-dessus, où les mats sont proches. La première seule ne produisait que 17 mats
-        // sur 2 000 comparaisons — rassurant mais mince pour la propriété qui décide la brique.
+        // Two sources, cumulated: pseudo-random play from the opening, which sweeps arbitrary
+        // positions, and short walks from the **tactical** positions of the suite above, where
+        // mates are close. The first alone produced only 17 mates in 2 000 comparisons —
+        // reassuring but thin for the property that decides the brick.
         let mut s = see_pruning_sweep(1_000, &[5, 6]);
         for fen in TACTICS {
             let t = see_pruning_sweep_from(40, &[5, 6], fen);
@@ -4360,6 +4399,11 @@ mod tests {
             s.mates_lost += t.mates_lost;
             s.mates_gained += t.mates_gained;
             s.mate_move_differs += t.mate_move_differs;
+            s.wins_seen += t.wins_seen;
+            s.wins_lost += t.wins_lost;
+            s.wins_slower += t.wins_slower;
+            s.wins_move_differs += t.wins_move_differs;
+            s.offenders.extend(t.offenders);
         }
 
         println!(
@@ -4375,31 +4419,62 @@ mod tests {
             s.mates_gained,
         );
 
-        // **The claim that survives measurement**, and the only one asserted. A lost mate is the
-        // failure that would make the brick worthless; a differing bound is not.
+        println!(
+            "mates the side to move can DELIVER: {} | lost {} | slower {} | other move at the \
+             same distance {}",
+            s.wins_seen, s.wins_lost, s.wins_slower, s.wins_move_differs,
+        );
+        for o in &s.offenders {
+            println!("  {o}");
+        }
+
+        // **The property that decides the brick**, and the one this test asserted wrongly until
+        // #69: a mate the side to move can **deliver**. Losing one throws away a forced win.
+        //
+        // What was asserted before was `mate_move_differs == 0`, which counts mates with
+        // `.abs()` — folding together the forced win and the forced loss. It was true when
+        // written and was invalidated by the arrival of check extensions through #51, and it then
+        // stayed red on `main` for three days because nothing runs an `#[ignore]`d level. The
+        // three comparisons that broke it, named by wiring `Position::to_fen` into the failure
+        // path (dead code until #69):
+        //
+        //   d5, d6  r5rk/1b4bp/qpp1pQP1/p2P3R/8/2P2N2/PPB2PP1/2KR4 b
+        //           full g8d8 = -29996    pruned g8b8 = -29996
+        //   d5      k1q3R1/1p6/p7/3Bp3/P7/8/1PbK1B2/6Q1 b
+        //           full a8b8 = -29992    pruned c2f5 = -1951
+        //
+        // Every score negative: in all three the side to move is *being mated*. The first two
+        // score **identically** — a forced loss where both moves lose to the same mate at the
+        // same distance, so a differing move is not a disagreement about anything. The third is
+        // the `mates lost` case, from a position already nineteen pawns down: the pruned search
+        // fails to pick the longest resistance in a position lost either way.
+        //
+        // Measured over the same sweep once split by sign: **80 deliverable mates, 0 lost, 0
+        // slower, 0 through a different move.** The brick is sound on what matters; the counter
+        // was measuring something else.
+        //
+        // Seventh criterion of this shape corrected here (#19, #27, #36, #42, #54, and this
+        // test's own earlier `mates_lost == 0`): demanding reproducibility where the contract is
+        // a decision. The difference this time is that the replacement was measured before being
+        // written, not after.
         assert!(s.mates_seen > 0, "precondition: the sweep must contain mates");
-        // **The claim, and it is not the one this test made before.** Asserting "no mate is lost
-        // at equal depth" looked like the strong statement; widening the sweep from 17 mates to
-        // 80 — review's suggestion, and the reason it was worth taking — showed it to be simply
-        // false. One position in eighty:
-        //
-        //   k2r4/pp1b4/3Q2pp/3qp3/2B2R2/8/PPP2B2/2K5 w - - 7 5
-        //
-        // at depth 6 the pruned search answers 1806 where the full one sees mate. But **both play
-        // `c4d5`**, and by depth 7 the pruned search sees the mate too. So the pruning does not
-        // lose the mate, it announces it one ply later — and iterative deepening closes the gap
-        // before the clock ever asks.
-        //
-        // What would make the brick worthless is a mate that changes the *move*, and that is what
-        // is asserted: over 80 positions with a mate in play, **zero** move disagreements. The
-        // score being one ply behind matters to the analyst (project goal 3) and to the UCI
-        // report, not to the game — which is why it is documented here rather than asserted away.
-        //
-        // Sixth criterion of this shape corrected in this repository (#19, #27, #36, #42, #54):
-        // demanding reproducibility where the contract is a decision.
+        assert!(
+            s.wins_seen > 0,
+            "precondition: the sweep must contain mates the side to move can DELIVER, \
+             otherwise the three assertions below have nothing to check",
+        );
+        let offenders = s.offenders.join("\n  ");
+        assert_eq!(s.wins_lost, 0, "pruning threw away a forced win:\n  {offenders}");
+        assert_eq!(s.wins_slower, 0, "pruning made a forced win slower:\n  {offenders}");
         assert_eq!(
-            s.mate_move_differs, 0,
-            "pruning changed the move on a position where a mate was in play",
+            s.wins_move_differs, 0,
+            "pruning played a forced win through another move:\n  {offenders}",
+        );
+        // Kept as a diagnostic rather than an assertion: these fold in the mates the side to move
+        // *suffers*, where the position is lost by force whatever is played.
+        println!(
+            "diagnostic only — mates seen {} (both signs) | lost {} | move differs {}",
+            s.mates_seen, s.mates_lost, s.mate_move_differs,
         );
         assert_eq!(s.mates_gained, 0, "and it must never invent a mate");
     }
