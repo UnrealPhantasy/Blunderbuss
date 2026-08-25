@@ -492,7 +492,37 @@ impl Engine {
             // Joined rather than dropped, so the helpers' work is *visible*. `nodes` stays this
             // thread's — every published measurement is that number — and the total of the
             // others goes in its own field.
-            stats.helper_nodes = helpers.into_iter().filter_map(|h| h.join().ok()).sum();
+            //
+            // **A panicking helper is loud in debug and survivable in release**, and the
+            // asymmetry is the point. The two `debug_assert!`s in `pack` are reachable from a
+            // helper: swallowing a panic in debug would hide exactly what they exist to say,
+            // and it would do it silently, since the search still returns a normal-looking
+            // result. In release those assertions are compiled out, so a panic there is a bug
+            // we have no better answer to mid-game — and the reporting thread's search is
+            // complete and correct on its own, so the only casualty is `helper_nodes`. Killing
+            // the process would trade a wrong diagnostic count for a lost game.
+            //
+            // Rust idiom: `join` hands back `Result<u64, Box<dyn Any + Send>>`, where the error
+            // side carries the panic payload itself. `resume_unwind` re-raises *that* payload
+            // on this thread rather than a fresh panic, so the original message and location
+            // survive; it never returns, which is why the arm type-checks as an `Option`.
+            stats.helper_nodes = helpers
+                .into_iter()
+                .filter_map(|h| match h.join() {
+                    Ok(nodes) => Some(nodes),
+                    Err(panic) => {
+                        #[cfg(debug_assertions)]
+                        {
+                            std::panic::resume_unwind(panic)
+                        }
+                        #[cfg(not(debug_assertions))]
+                        {
+                            drop(panic);
+                            None
+                        }
+                    }
+                })
+                .sum();
             stats
         })
     }
