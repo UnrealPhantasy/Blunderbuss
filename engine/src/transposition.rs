@@ -84,6 +84,15 @@ use std::sync::atomic::{AtomicU64, Ordering as Atomicity};
 /// The residual risk is a false *accept*: `key_A ^ delta` coinciding with the wanted key. That
 /// needs a 64-bit coincidence between an unrelated Zobrist key and a difference of two plausible
 /// data words — negligible, though not zero, and worth stating rather than implying.
+///
+/// **Why no data race is expressible here, in the sense a race detector looks for.** Every
+/// shared access in this table goes through an `AtomicU64`, and the crate contains no `unsafe`
+/// at all, so two threads touching the same slot is defined behaviour by construction rather
+/// than by discipline: the compiler will not let it be otherwise. What remains is a torn
+/// *pair* — two well-defined writes interleaved — which is not a race and which no sanitiser
+/// would report; it is a logical hazard, and the XOR above is what makes it detectable. That
+/// is the argument standing in for a ThreadSanitizer run, which needs a nightly toolchain
+/// this machine does not have (stable 1.85 and 1.93 only).
 struct Slot {
     check: AtomicU64,
     data: AtomicU64,
