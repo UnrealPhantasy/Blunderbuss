@@ -198,6 +198,38 @@ const CHECK_EXTENSION_PLY_BUDGET: i32 = 2;
 /// nothing; `depth == 2` buys the sequence.
 const CHECK_EXTENSION_MAX_DEPTH: u32 = 2;
 
+/// Deepest remaining depth at which a node will pay for a static evaluation in order to try the
+/// reverse futility cut.
+///
+/// The ceiling is what makes the brick viable rather than a tuning detail. `evaluate` is
+/// otherwise called in **one** place in this engine — the stand-pat in quiescence — so this cut
+/// does not reuse a number lying around, it *introduces* the call. Keeping it near the leaves is
+/// what limits how many nodes pay for an evaluation they may not use.
+const RFP_MAX_DEPTH: u32 = 3;
+
+/// How far above `beta` the static evaluation must sit, per ply of remaining depth.
+///
+/// It grows with depth because the margin is a bet about what the opponent could still claw back
+/// in the subtree being skipped: one ply of slack is cheap to concede, three is not. A flat
+/// margin would either be too timid at depth 1 or reckless at depth 3.
+const RFP_MARGIN: i32 = 90;
+
+/// Deepest remaining depth at which a quiet move may be skipped without being played.
+///
+/// Shallower than the reverse cut's ceiling on purpose. Reverse futility declines to search a
+/// whole node and is wrong only about that node; this declines a *move*, and a move skipped at
+/// depth 3 hides a three-ply subtree in which the static evaluation had every chance to be wrong.
+const FFP_MAX_DEPTH: u32 = 2;
+
+/// How far below `alpha` the static evaluation must sit, per ply of remaining depth, before a
+/// quiet move is considered dead on arrival.
+///
+/// Larger than the reverse margin because the claim is stronger: the reverse cut says "this node
+/// is already good enough", which the search can still revisit at the next iteration, while this
+/// says "this move cannot reach alpha at all" and no later iteration revisits a move that was
+/// never played.
+const FFP_MARGIN: i32 = 120;
+
 /// How far / how long to search.
 pub struct Limits {
     /// Never search deeper than this.
@@ -544,6 +576,46 @@ struct Searcher<'a> {
     /// Zobrist keys along the branch currently being explored, pushed on the way
     /// down and popped on the way back up.
     path: Vec<u64>,
+    /// How many times the reverse futility cut was **taken**, and how many times it was
+    /// **considered**. **Tests only.**
+    ///
+    /// Two counters and not one, for a reason paid for on 2026-08-21: a gate that never opens
+    /// makes a brick read a node ratio of 1.0000 *exactly*, which is indistinguishable from "the
+    /// brick is free" unless something counts. `0 / 0` says the gate is shut; `1 / 166` says the
+    /// gate is open and the brick is useless — a different diagnosis entirely.
+    #[cfg(test)]
+    rfp_taken: u64,
+    #[cfg(test)]
+    rfp_considered: u64,
+    /// How many quiet moves were **skipped** without being played, and how many were
+    /// **considered**. **Tests only** — the same pair as the reverse cut, and for the same reason:
+    /// a gate that never opens makes a brick read a node ratio of 1.0000 exactly, which is
+    /// indistinguishable from a brick that costs nothing.
+    /// How many static evaluations this searcher paid for. **Tests only**, and it is the number
+    /// that says whether the forward cut is cheap: it must stay at one per node, never one per
+    /// move, or the economy #66 already paid for is spent twice.
+    #[cfg(test)]
+    evals: u64,
+    #[cfg(test)]
+    ffp_pruned: u64,
+    #[cfg(test)]
+    ffp_considered: u64,
+    #[cfg(test)]
+    allow_ffp: bool,
+    #[cfg(test)]
+    ffp_max_depth: u32,
+    #[cfg(test)]
+    ffp_margin: i32,
+    /// Whether a node may try the reverse futility cut at all, and the gate it uses.
+    ///
+    /// **Tests only**, compiled out otherwise: the comparison that decides a brick is between two
+    /// verdicts from *one* binary, since comparing two builds picks up every other difference.
+    #[cfg(test)]
+    allow_rfp: bool,
+    #[cfg(test)]
+    rfp_max_depth: u32,
+    #[cfg(test)]
+    rfp_margin: i32,
     /// The quiet moves that caused a cutoff, per ply. Like the transposition table,
     /// it lives for the whole search, so each deepening iteration starts on what the
     /// previous one learned.
@@ -680,6 +752,28 @@ impl<'a> Searcher<'a> {
             table,
             history: Vec::new(),
             path: Vec::new(),
+            #[cfg(test)]
+            evals: 0,
+            #[cfg(test)]
+            ffp_pruned: 0,
+            #[cfg(test)]
+            ffp_considered: 0,
+            #[cfg(test)]
+            allow_ffp: true,
+            #[cfg(test)]
+            ffp_max_depth: FFP_MAX_DEPTH,
+            #[cfg(test)]
+            ffp_margin: FFP_MARGIN,
+            #[cfg(test)]
+            rfp_taken: 0,
+            #[cfg(test)]
+            rfp_considered: 0,
+            #[cfg(test)]
+            allow_rfp: true,
+            #[cfg(test)]
+            rfp_max_depth: RFP_MAX_DEPTH,
+            #[cfg(test)]
+            rfp_margin: RFP_MARGIN,
             killers: Killers::new(),
             root_depth: 0,
             #[cfg(test)]
@@ -853,6 +947,127 @@ impl<'a> Searcher<'a> {
     /// measures exactly that, so the guard costs one comparison and no new concept.
     fn null_move_allowed(&self, pos: &Position, depth: u32) -> bool {
         depth > NULL_MOVE_REDUCTION + 1 && phase(pos) >= NULL_MOVE_MIN_PHASE
+    }
+
+    /// The reverse futility cut, or `None` when it does not apply.
+    ///
+    /// Returns the static evaluation — not `beta` — because that is what the node is claiming:
+    /// "this position is worth at least this much, and cheaply enough that searching would be
+    /// waste". Returning `beta` would throw away the distance, which the caller's own bound
+    /// classification then uses.
+    fn reverse_futility(&mut self, depth: u32, beta: i32, static_eval: Option<i32>) -> Option<i32> {
+        #[cfg(test)]
+        let (allow, max_depth, margin) = (self.allow_rfp, self.rfp_max_depth, self.rfp_margin);
+        #[cfg(not(test))]
+        let (allow, max_depth, margin) = (true, RFP_MAX_DEPTH, RFP_MARGIN);
+        // `depth == 0` is defensive and **no test can reach it**: `negamax_inner` hands a
+        // depth-0 node to quiescence before this function is called, so a mutation removing it
+        // leaves every test green for a reason that is not a gap in the suite. It stays because
+        // it makes the multiplication below meaningful on its own terms — a zero margin would
+        // cut on the raw evaluation — and a caller added later would not know that.
+        if !allow || depth == 0 || depth > max_depth {
+            return None;
+        }
+        // A centipawn margin means nothing against a mate score, and returning a static
+        // evaluation there would replace a proven mate distance with a guess.
+        if beta.abs() >= MATE_THRESHOLD {
+            return None;
+        }
+        // `None` means the caller declined to evaluate: the node is in check, or past the
+        // ceiling. A side in check has no quiet continuation to fall back on — its legal moves may
+        // all be forced — so a static evaluation says nothing about where the position is going.
+        // The same premise the null move guards with `phase`: a heuristic assuming a quiet
+        // alternative exists has to check that one does.
+        let eval = static_eval?;
+        #[cfg(test)]
+        {
+            self.rfp_considered += 1;
+        }
+        if eval - margin * depth as i32 >= beta {
+            #[cfg(test)]
+            {
+                self.rfp_taken += 1;
+            }
+            return Some(eval);
+        }
+        None
+    }
+
+    /// The static evaluation this node shares between its two cuts, or `None` when neither can
+    /// use one.
+    ///
+    /// **A named function rather than an expression inline**, because it owns a property that
+    /// used to belong to `reverse_futility` and moved here: a side in check has no quiet
+    /// continuation to fall back on, so a static evaluation says nothing about where the position
+    /// is going. A guard that moves without its test stops being guarded, and this one cannot be
+    /// reached through `deepen` — the root goes through `root`, not through `negamax_inner`, so
+    /// no search-driven test can isolate it.
+    fn static_eval_for(&mut self, pos: &Position, depth: u32) -> Option<i32> {
+        #[cfg(test)]
+        let ceiling = self.rfp_max_depth.max(self.ffp_max_depth);
+        #[cfg(not(test))]
+        let ceiling = if RFP_MAX_DEPTH > FFP_MAX_DEPTH { RFP_MAX_DEPTH } else { FFP_MAX_DEPTH };
+        // Past the ceiling nothing can use it, and `evaluate` walks all 64 squares — it is
+        // otherwise called only at the stand-pat in quiescence.
+        let usable = depth > 0 && depth <= ceiling && !pos.in_check();
+        #[cfg(test)]
+        if usable {
+            self.evals += 1;
+        }
+        usable.then(|| evaluate(pos))
+    }
+
+    /// Whether this quiet move can be skipped without being played.
+    ///
+    /// The opposite direction to the reverse cut, asked of the same number: where that one says
+    /// "this node is already above `beta`, do not search it", this says "this move cannot reach
+    /// `alpha`, do not play it". Both read the one static evaluation the node computed.
+    ///
+    /// `searched` is the count of moves actually searched so far, and it must be non-zero. A node
+    /// that skipped every move would return a score no move produced — the same reason the
+    /// reduction schedule exempts the first moves, and the one guard here whose absence would be
+    /// a correctness bug rather than a strength loss.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_futile(
+        &mut self,
+        pos: &Position,
+        mv: Move,
+        depth: u32,
+        alpha: i32,
+        static_eval: Option<i32>,
+        gives_check: bool,
+        searched: u32,
+    ) -> bool {
+        #[cfg(test)]
+        let (allow, max_depth, margin) = (self.allow_ffp, self.ffp_max_depth, self.ffp_margin);
+        #[cfg(not(test))]
+        let (allow, max_depth, margin) = (true, FFP_MAX_DEPTH, FFP_MARGIN);
+        if !allow || searched == 0 || depth == 0 || depth > max_depth {
+            return false;
+        }
+        // A centipawn margin means nothing against a mate score.
+        if alpha.abs() >= MATE_THRESHOLD {
+            return false;
+        }
+        // A checking move is not quiet whatever the board says about material: it forces a reply,
+        // and the premise that the position drifts slowly does not hold across a forcing move.
+        if gives_check || !is_quiet(pos, mv) {
+            return false;
+        }
+        // `None` means the node is in check or past the ceiling — see `reverse_futility`.
+        let Some(eval) = static_eval else { return false };
+        #[cfg(test)]
+        {
+            self.ffp_considered += 1;
+        }
+        if eval + margin * depth as i32 <= alpha {
+            #[cfg(test)]
+            {
+                self.ffp_pruned += 1;
+            }
+            return true;
+        }
+        false
     }
 
     /// One ply given back to a move that gives check, or zero.
@@ -1037,6 +1252,26 @@ impl<'a> Searcher<'a> {
             return score;
         }
 
+        // Reverse futility pruning, also called static null move: near the leaves, ask whether
+        // the position is *already* so far above `beta` that no quiet continuation could bring it
+        // back under. If so, return without generating a single move.
+        //
+        // The opposite profile to an extension: the cost is one evaluation and one comparison,
+        // the benefit is a whole subtree never searched. That matters here because the effective
+        // branching factor is 2.06, which is fat enough that techniques spending a fraction of a
+        // node to decide where to spend more cannot pay (see the singular extension measurement).
+        // **Computed once, used by both cuts**, and that sharing is what makes the forward cut
+        // nearly free: #66 already introduced this call at interior nodes, which was its whole
+        // cost. Recomputing it in the move loop would pay for it twice and cancel the economy.
+        //
+        // Gated so nodes that can use neither cut pay nothing: `evaluate` walks all 64 squares
+        // and is otherwise called only at the stand-pat in quiescence.
+        let static_eval = self.static_eval_for(pos, depth);
+
+        if let Some(score) = self.reverse_futility(depth, beta, static_eval) {
+            return score;
+        }
+
         // Null-move pruning: ask what happens if we simply pass.
         //
         // If the opponent — now effectively moving twice in a row — still cannot drag
@@ -1129,6 +1364,10 @@ impl<'a> Searcher<'a> {
         let alpha_before = alpha;
         let mut best = -INF;
         let mut best_move = None;
+        // Counted rather than derived from `rank`: a skipped move advances the rank without ever
+        // being searched, so a node whose first moves were all pruned would look as though it had
+        // searched them.
+        let mut searched: u32 = 0;
         self.path.push(key);
         // Idiom: `enumerate` pairs each move with its index, which is what "late" means
         // here — how far down the ordered list the move sits.
@@ -1138,6 +1377,12 @@ impl<'a> Searcher<'a> {
             // the same fact about the resulting position, so asking once serves both.
             let child = pos.play(mv);
             let gives_check = child.in_check();
+            // Asked after playing the move, because `gives_check` is the one fact the decision
+            // needs that the move alone does not carry — and the loop already computes it for the
+            // extension and the reduction guard, so asking costs nothing extra.
+            if self.forward_futile(pos, mv, depth, alpha, static_eval, gives_check, searched) {
+                continue;
+            }
             let extension = self.check_extension(gives_check, depth, ply);
             let reduction = self.late_move_reduction(pos, gives_check, mv, depth, rank, ply);
             #[cfg(test)]
@@ -1215,6 +1460,7 @@ impl<'a> Searcher<'a> {
                     return 0;
                 }
             }
+            searched += 1;
             if score > best {
                 best = score;
                 best_move = Some(mv);
@@ -1689,6 +1935,11 @@ mod tests {
             let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
             s.allow_null_move = null_move;
             s.allow_lmr = false;
+            // Off for the same reason the reductions are: the reverse futility cut declines to
+            // search the same kind of branch, so leaving it on would turn this into a test of
+            // the pair under a name that claims otherwise.
+            s.allow_rfp = false;
+            s.allow_ffp = false;
             deepen(&p, Request::new(Limits::depth(depth)), &mut s).nodes
         };
         // Swept rather than measured at one chosen depth: a threshold that holds at
@@ -2428,6 +2679,12 @@ mod tests {
         let mut table = Table::new();
         let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
         s.allow_lmr = allow;
+        // This harness isolates one brick, so the reverse futility cut is off: it prunes the
+        // same kind of branch, and leaving it on would make the measurement below read what the
+        // pair does under a name that claims otherwise — the same reasoning this file already
+        // applies to the reductions.
+        s.allow_rfp = false;
+        s.allow_ffp = false;
         let stats = deepen(pos, Request::new(Limits::depth(depth)), &mut s);
         Reduced { reductions: s.lmr_reductions, stats }
     }
@@ -2945,6 +3202,545 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------- reverse futility pruning (#66)
+
+    fn rfp(pos: &Position, depth: u32, allow: bool) -> (u64, i32, u64, u64) {
+        let mut table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        s.allow_rfp = allow;
+        let stats = deepen(pos, Request::new(Limits::depth(depth)), &mut s);
+        (stats.nodes, stats.best.map(|(_, sc)| sc).unwrap_or(0), s.rfp_taken, s.rfp_considered)
+    }
+
+    #[test]
+    fn switched_off_the_cut_changes_nothing_at_all() {
+        // The inert control, and it is the load-bearing one: it says the brick is *switched off*
+        // rather than merely quiet. Without it, every measurement below could be reading a gate
+        // that never opens — which reads as a node ratio of 1.0000 exactly and looks, to a quick
+        // eye, like a brick that costs nothing.
+        for (nature, fen) in NATURES {
+            let p = Position::from_fen(fen).unwrap();
+            for depth in 4..=7u32 {
+                let (nodes, _, taken, considered) = rfp(&p, depth, false);
+                assert_eq!(taken, 0, "{nature} d{depth}: the cut fired while disabled");
+                assert_eq!(considered, 0, "{nature} d{depth}: the evaluation was paid for anyway");
+                let (again, ..) = rfp(&p, depth, false);
+                assert_eq!(nodes, again, "{nature} d{depth}: the disabled search is not stable");
+            }
+        }
+    }
+
+    #[test]
+    fn the_cut_fires_on_real_positions_and_saves_the_subtree() {
+        // What the brick *is*, pinned by node count rather than by score. A score cannot see
+        // whether the subtree was searched — that is the whole claim — so a test asserting on
+        // the score would pass just as happily against a search that did all the work.
+        //
+        // Measured on the four natures rather than on a contrived position, because the first
+        // draft of this test used one and the premise was wrong: a materially crushing position
+        // does **not** trigger the cut. In a search that already knows it is winning, the window
+        // tracks the score, so the evaluation is not above beta. The cut fires when a position is
+        // *unexpectedly* good for the current window, which is a property of a real search and
+        // not of a FEN.
+        for (nature, fen) in NATURES {
+            let p = Position::from_fen(fen).unwrap();
+            let (with, _, taken, considered) = rfp(&p, 7, true);
+            let (without, ..) = rfp(&p, 7, false);
+            assert!(considered > 0, "{nature}: the gate was never even reached");
+            assert!(taken > 0, "{nature}: the gate opened {considered} times and never cut");
+            assert!(
+                with < without,
+                "{nature}: the cut fired {taken} times and searched {with} nodes against \
+                 {without}: it returned, but it saved nothing",
+            );
+        }
+    }
+
+    #[test]
+    fn a_node_in_check_is_never_evaluated() {
+        // The premise both cuts rest on: a side in check has no quiet continuation, so a static
+        // evaluation says nothing about where the position goes. Guarded once, in the gate that
+        // computes the value both cuts read.
+        //
+        // **Tested on the gate rather than through a search**, and that is not convenience. The
+        // first draft drove `deepen` and asserted the counters, which was vacuous in both
+        // directions: at depth 1 no node reaches the gate at all — the root goes through `root`,
+        // not `negamax_inner` — and at depth 2 the counters mix the in-check root with
+        // descendants that are not in check and evaluate perfectly legitimately.
+        let checked = Position::from_fen("4k3/8/8/8/8/8/8/3QK2r w - - 0 1").unwrap();
+        let quiet = Position::from_fen("4k3/8/8/8/8/8/8/3QK2R w K - 0 1").unwrap();
+        let table = Table::new();
+        let mut t = table;
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+
+        assert!(checked.in_check(), "precondition: the side to move must be in check");
+        assert_eq!(s.static_eval_for(&checked, 1), None, "a node in check was evaluated");
+        // The control that keeps that `None` honest: same material, no check, same depth.
+        assert!(
+            s.static_eval_for(&quiet, 1).is_some(),
+            "precondition: without the check the gate must yield a value",
+        );
+    }
+
+    #[test]
+    fn the_gate_stops_at_the_deeper_of_the_two_ceilings() {
+        // One evaluation serves both cuts, so the gate has to reach as deep as the deeper of
+        // them — and no deeper, since every node past it would pay for a value nothing reads.
+        let p = Position::from_fen("4k3/8/8/8/8/8/8/3QK2R w K - 0 1").unwrap();
+        let mut t = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+        let ceiling = s.rfp_max_depth.max(s.ffp_max_depth);
+        assert_eq!(s.static_eval_for(&p, 0), None, "depth 0 hands over to quiescence");
+        assert!(s.static_eval_for(&p, ceiling).is_some(), "the gate must reach its ceiling");
+        assert_eq!(s.static_eval_for(&p, ceiling + 1), None, "the gate reached past its ceiling");
+    }
+
+    #[test]
+    fn the_cut_never_fires_against_a_mate_bound() {
+        // A centipawn margin means nothing against a mate score: returning a static evaluation
+        // there would replace a proven mate distance with a guess about material.
+        //
+        // **The bound tested is the negative one**, and that is not an arbitrary choice: against
+        // `MATE - 5` a static evaluation can never reach the threshold anyway, so the assertion
+        // would hold with or without the guard — inert, and mutation is what showed it. Against
+        // `-(MATE - 5)` the comparison is trivially true, so only the guard stops the cut.
+        let p = Position::from_fen("4k3/8/8/8/8/8/8/3QK2R w K - 0 1").unwrap();
+        let mut table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        assert_eq!(
+            s.reverse_futility(1, -(MATE - 5), Some(evaluate(&p))),
+            None,
+            "the cut fired against a mate-magnitude beta",
+        );
+        assert!(
+            s.reverse_futility(1, 100, Some(evaluate(&p))).is_some(),
+            "precondition: with an ordinary beta this node must be cut",
+        );
+    }
+
+    #[test]
+    fn the_cut_returns_the_evaluation_and_not_beta() {
+        // The one decision in this brick that the doc comment argued at length and nothing
+        // asserted: returning `eval` rather than `beta`. Mutating the return to `Some(beta)` left
+        // the entire suite green, which is exactly the gap #39 chose to close with an honest note
+        // instead of a test. Here a test is cheap, so it is the test.
+        //
+        // The distance is not decorative. This value becomes the parent's `best`, which decides
+        // the bound class and the number written to the transposition table: returning `beta`
+        // would store "at least beta" where the node actually knows "at least eval", and eval can
+        // sit hundreds of centipawns higher.
+        let p = Position::from_fen("4k3/8/8/8/8/8/8/3QK2R w K - 0 1").unwrap();
+        let mut table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        let beta = 100;
+        let cut = s.reverse_futility(1, beta, Some(evaluate(&p))).expect("precondition: this node must be cut");
+        // The precondition is load-bearing and its absence is how two tests in this file were
+        // written inert earlier: if `eval` merely equalled `beta`, the assertion below would pass
+        // against the mutation it exists to catch.
+        assert!(
+            cut > beta + RFP_MARGIN,
+            "precondition: the evaluation must clear beta by more than the margin, otherwise \
+             `eval` and `beta` are indistinguishable here",
+        );
+        assert_eq!(
+            cut,
+            evaluate(&p),
+            "the cut must return the static evaluation, not the bound it was compared against",
+        );
+    }
+
+    #[test]
+    fn the_ceiling_is_where_the_cut_stops() {
+        // The gate that makes the brick viable rather than a detail: `evaluate` is called in one
+        // other place in this engine, so every node past the ceiling would pay for an evaluation
+        // it cannot use. Nothing protected this until mutation showed that removing the ceiling
+        // left every test green.
+        let p = Position::from_fen("4k3/8/8/8/8/8/8/3QK2R w K - 0 1").unwrap();
+        let mut table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        // Beta is set low enough that the margin — which grows with depth — cannot be what
+        // refuses the deeper call. Otherwise this would test the margin under the ceiling's name.
+        let beta = -1000;
+        assert!(
+            s.reverse_futility(RFP_MAX_DEPTH, beta, Some(evaluate(&p))).is_some(),
+            "precondition: at the ceiling the cut must still fire",
+        );
+        assert_eq!(
+            s.reverse_futility(RFP_MAX_DEPTH + 1, beta, Some(evaluate(&p))),
+            None,
+            "the cut fired one ply past its ceiling",
+        );
+    }
+
+    #[test]
+    fn the_margin_grows_with_the_depth_it_covers() {
+        // The margin is multiplied by the remaining depth, and `RFP_MARGIN` argues that growth at
+        // length: it is a bet about what the opponent could claw back in the subtree being
+        // skipped, and one ply of slack is cheap to concede where three is not. Nothing asserted
+        // it. Mutating `margin * depth` to `margin` left the entire suite green — every other
+        // unit test here calls the cut at depth 1, where the two expressions coincide, and the
+        // one call at the ceiling deliberately sets beta low so the margin cannot interfere.
+        //
+        // The mutation is not cosmetic: it moves 4% to 23% of the tree, and on the quiet
+        // middlegame at depth 9 it changes the score the search returns.
+        let p = Position::from_fen("4k3/8/8/8/8/8/8/3QK2R w K - 0 1").unwrap();
+        let mut table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        let eval = evaluate(&p);
+        // The growth itself, as one fact about one beta: the deepest cut must refuse what the
+        // shallowest cut takes. A flat margin makes these two calls agree, which is precisely
+        // what no other test in this file can see.
+        let between = eval - RFP_MARGIN * RFP_MAX_DEPTH as i32 + 1;
+        assert!(
+            s.reverse_futility(1, between, Some(eval)).is_some(),
+            "at depth 1 the cut refused a beta {} below the evaluation",
+            eval - between,
+        );
+        assert_eq!(
+            s.reverse_futility(RFP_MAX_DEPTH, between, Some(eval)),
+            None,
+            "the same beta was cut at depth {RFP_MAX_DEPTH}: the margin is not growing",
+        );
+        // And the slope, pinned at its boundary at every depth rather than at one chosen depth —
+        // a single sample cannot tell a slope from a coincidence, and an off-by-one in the
+        // multiplier would clear the pair above at three depths out of three.
+        for depth in 1..=RFP_MAX_DEPTH {
+            // The lowest beta this depth may no longer cut against is one centipawn above the
+            // boundary, since the comparison is `eval - margin * depth >= beta`.
+            let boundary = eval - RFP_MARGIN * depth as i32;
+            assert!(
+                boundary.abs() < MATE_THRESHOLD,
+                "precondition: beta must stay out of mate range at depth {depth}, otherwise the \
+                 mate guard is what returns `None` and this test reads the wrong guard",
+            );
+            assert!(
+                s.reverse_futility(depth, boundary, Some(eval)).is_some(),
+                "at depth {depth} the cut refused a beta exactly {} below the evaluation",
+                RFP_MARGIN * depth as i32,
+            );
+            assert_eq!(
+                s.reverse_futility(depth, boundary + 1, Some(eval)),
+                None,
+                "at depth {depth} the cut fired against a beta one centipawn past its margin",
+            );
+        }
+    }
+
+    #[test]
+    fn no_mate_is_lost_and_none_is_invented() {
+        // Deliberately **not** asserted: that the score matches an unpruned search. A heuristic
+        // cut legitimately returns a different and equally valid bound, exactly as alpha-beta
+        // always could — six criteria of that shape have been struck from earlier issues in this
+        // repository after being measured false. What survives and is worth asserting is that
+        // the *move played* does not change on a mate.
+        // Counts the pairs where a mate was found **and** the cut actually fired, which is the
+        // only configuration that says anything about a mate surviving pruning. Measured: 3 of
+        // 21, all on the ladder mate at depths 7 to 9 (73 to 137 firings). The other two
+        // positions never trigger the cut at any depth in this range, and the reason is the same
+        // one that made the first draft of `the_cut_fires_on_real_positions` rest on a false
+        // premise: they are so lopsided that the window tracks the score, so the evaluation never
+        // clears beta by the margin. Without this counter the test compared two identical
+        // searches in 18 of 21 cases and proved nothing at all.
+        let mut exercised = 0;
+        for fen in [
+            "6k1/5ppp/8/8/8/8/8/R6K w - - 0 1",
+            "7k/8/8/8/8/8/1R6/R6K b - - 0 1",
+            "3k4/8/3K4/8/8/8/8/6R1 w - - 0 1",
+        ] {
+            let p = Position::from_fen(fen).unwrap();
+            for depth in 3..=9u32 {
+                let mut t1 = Table::new();
+                let mut a = Searcher::new(MoveOrder::Full, None, &mut t1);
+                a.allow_rfp = false;
+                let plain = deepen(&p, Request::new(Limits::depth(depth)), &mut a).best;
+                let mut t2 = Table::new();
+                let mut b = Searcher::new(MoveOrder::Full, None, &mut t2);
+                let cut = deepen(&p, Request::new(Limits::depth(depth)), &mut b).best;
+                // The precondition that makes the comparison mean something: the cut has to have
+                // *fired* in this search. Without it the test would happily pass on a position
+                // the brick never touched, which proves nothing about mates surviving pruning —
+                // it only proves that two identical searches agree.
+                let mated = |x: Option<(Move, i32)>| x.is_some_and(|(_, sc)| sc.abs() > MATE_THRESHOLD);
+                if mated(plain) && b.rfp_taken > 0 {
+                    exercised += 1;
+                }
+                if mated(plain) {
+                    assert!(mated(cut), "{fen} d{depth}: the cut lost a mate the search had");
+                    assert_eq!(
+                        plain.map(|(mv, _)| mv),
+                        cut.map(|(mv, _)| mv),
+                        "{fen} d{depth}: the mating move changed",
+                    );
+                }
+                assert!(
+                    !mated(cut) || mated(plain),
+                    "{fen} d{depth}: the cut invented a mate the search did not see",
+                );
+            }
+        }
+        // Asserted as a precondition rather than pinned to the measured 3: a constant would be
+        // hostage to anything that shifts where the cut fires, and would then pass while testing
+        // nothing — which is the failure mode this whole assertion exists to close.
+        assert!(
+            exercised > 0,
+            "no case both found a mate and fired the cut, so this test compared identical \
+             searches throughout and says nothing about mates surviving pruning",
+        );
+    }
+
+    // ------------------------------------------- forward futility pruning (#68)
+
+    fn ffp(pos: &Position, depth: u32, allow: bool) -> (u64, i32, u64, u64, u64) {
+        let mut t = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+        s.allow_ffp = allow;
+        let st = deepen(pos, Request::new(Limits::depth(depth)), &mut s);
+        (st.nodes, st.best.map(|(_, x)| x).unwrap_or(0), s.ffp_pruned, s.ffp_considered, s.evals)
+    }
+
+    #[test]
+    fn the_forward_cut_skips_moves_and_saves_the_subtree() {
+        // What the brick is, pinned by node count: a score cannot see whether a move was played.
+        for (nature, fen) in NATURES {
+            let p = Position::from_fen(fen).unwrap();
+            let (with, _, pruned, considered, _) = ffp(&p, 7, true);
+            let (without, ..) = ffp(&p, 7, false);
+            assert!(considered > 0, "{nature}: the gate was never reached");
+            assert!(pruned > 0, "{nature}: {considered} moves considered, none skipped");
+            assert!(with < without, "{nature}: {with} nodes against {without}, nothing saved");
+        }
+    }
+
+    #[test]
+    fn one_evaluation_per_node_and_never_one_per_move() {
+        // **The economy that makes this brick nearly free**, measured rather than argued. #66
+        // introduced `evaluate` at interior nodes; this cut asks a different question of the same
+        // value. If it recomputed, it would pay for that introduction a second time and the
+        // whole case for taking it next would collapse.
+        //
+        // The signature of sharing is that far more moves are *considered* than evaluations are
+        // paid for — one node offers many quiet moves to the gate.
+        for (nature, fen) in NATURES {
+            let p = Position::from_fen(fen).unwrap();
+            let (nodes, _, _, considered, evals) = ffp(&p, 7, true);
+            assert!(evals <= nodes, "{nature}: {evals} evaluations for {nodes} nodes");
+            assert!(
+                considered > evals,
+                "{nature}: {considered} moves considered against {evals} evaluations — the value \
+                 is being recomputed per move rather than shared per node",
+            );
+        }
+        // **Honest note on what this test does and does not catch.** `evals` counts passes
+        // through the gate, so what is asserted above is the *shape* of sharing: one node offers
+        // many quiet moves to one evaluation. Mutating `forward_futile` to call `evaluate` itself
+        // is not seen by this counter — it is caught by
+        // `the_forward_cut_refuses_checks_captures_and_mate_bounds`, whose `None` case a
+        // self-computing version would ignore. Verified by running that mutation, not assumed.
+        //
+        // The property is really enforced by the signature: the value arrives as a parameter, so
+        // recomputing takes an added call rather than an omission.
+    }
+
+    #[test]
+    fn the_forward_ceiling_is_where_the_cut_stops() {
+        // Nothing protected this until mutation said so — removing the ceiling left every test
+        // green, exactly as it did for the reverse cut in #66. The ceiling is not a tuning knob:
+        // a move skipped one ply deeper hides a subtree one ply larger in which the static
+        // evaluation had that much more chance to be wrong.
+        let p = Position::from_fen(NATURES[3].1).unwrap();
+        let mut t = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+        let mv = *p.legal_moves().iter().find(|&&m| is_quiet(&p, m)).expect("a quiet move");
+        // Alpha as high and the evaluation as low as they go, so the margin — which grows with
+        // depth — cannot be what refuses the deeper call. Otherwise this would test the margin
+        // under the ceiling's name.
+        let (alpha, eval) = (10_000, Some(-10_000));
+        let ceiling = s.ffp_max_depth;
+        assert!(
+            s.forward_futile(&p, mv, ceiling, alpha, eval, false, 1),
+            "precondition: at the ceiling the cut must still fire",
+        );
+        assert!(
+            !s.forward_futile(&p, mv, ceiling + 1, alpha, eval, false, 1),
+            "the cut fired one ply past its ceiling",
+        );
+    }
+
+    #[test]
+    fn the_forward_margin_grows_with_the_depth_it_covers() {
+        // `FFP_MARGIN` argues the growth at length — a move skipped at depth 2 hides a subtree
+        // one ply larger, so the static evaluation is given that much more room to be wrong —
+        // and nothing asserted it. Mutating `margin * depth` to `margin` left the whole suite
+        // green: every other call here passes depth 1, where the two expressions coincide, and
+        // the one call at the ceiling sets alpha as high and the evaluation as low as they go
+        // precisely so the margin cannot interfere.
+        //
+        // Measured, the mutation skips about ten percent more moves and changes what the quiet
+        // middlegame is worth at depth 9. Same shape, same silence, as the reverse cut in #66.
+        let p = Position::from_fen(NATURES[3].1).unwrap();
+        let mut t = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+        let mv = *p.legal_moves().iter().find(|&&m| is_quiet(&p, m)).expect("a quiet move");
+        let (margin, ceiling) = (s.ffp_margin, s.ffp_max_depth);
+        assert!(
+            ceiling >= 2,
+            "precondition: with a ceiling of one ply there is no second depth to compare against, \
+             and this test would silently stop testing anything",
+        );
+        // The evaluation is a parameter of this cut rather than something it computes, so it can
+        // be pinned at zero and alpha read straight off as "how far below alpha this node sits".
+        let eval = Some(0);
+        // The growth as one fact about one alpha: what depth 1 declines to search, the ceiling
+        // must search. A flat margin makes these two calls agree.
+        let between = margin * ceiling as i32 - 1;
+        assert!(
+            s.forward_futile(&p, mv, 1, between, eval, false, 1),
+            "at depth 1 the cut searched a move sitting {between} below alpha",
+        );
+        assert!(
+            !s.forward_futile(&p, mv, ceiling, between, eval, false, 1),
+            "the same move was skipped at depth {ceiling}: the margin is not growing",
+        );
+        // And the slope, pinned at its boundary at every depth rather than at one chosen depth:
+        // an off-by-one in the multiplier would clear the pair above at every depth it has.
+        for depth in 1..=ceiling {
+            // The lowest alpha this depth may still skip against, since the comparison is
+            // `eval + margin * depth <= alpha`.
+            let boundary = margin * depth as i32;
+            assert!(
+                boundary.abs() < MATE_THRESHOLD,
+                "precondition: alpha must stay out of mate range at depth {depth}, otherwise the \
+                 mate guard is what refuses the cut and this test reads the wrong guard",
+            );
+            assert!(
+                s.forward_futile(&p, mv, depth, boundary, eval, false, 1),
+                "at depth {depth} the cut searched a move exactly {boundary} below alpha",
+            );
+            assert!(
+                !s.forward_futile(&p, mv, depth, boundary - 1, eval, false, 1),
+                "at depth {depth} the cut skipped a move one centipawn short of its margin",
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_move_is_never_skipped() {
+        // The one guard whose absence is a correctness bug rather than a strength loss: a node
+        // that skipped every move would return a score no move produced. Same reason the
+        // reduction schedule exempts the first moves.
+        let p = Position::from_fen(NATURES[3].1).unwrap();
+        let mut t = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+        let mv = p.legal_moves()[0];
+        // `searched == 0` is the state at the first move of every node, and the evaluation is set
+        // as low as it can go so nothing but that guard can refuse.
+        assert!(
+            !s.forward_futile(&p, mv, 1, 10_000, Some(-10_000), false, 0),
+            "the first move of a node was skipped",
+        );
+        assert!(
+            s.forward_futile(&p, mv, 1, 10_000, Some(-10_000), false, 1),
+            "precondition: with one move already searched, this one must be skippable",
+        );
+    }
+
+    #[test]
+    fn the_forward_cut_refuses_checks_captures_and_mate_bounds() {
+        let p = Position::from_fen(NATURES[2].1).unwrap();
+        let mut t = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+        let quiet = *p.legal_moves().iter().find(|&&m| is_quiet(&p, m)).expect("a quiet move");
+        let capture = *p.legal_moves().iter().find(|&&m| !is_quiet(&p, m)).expect("a capture");
+        let low = Some(-10_000);
+        assert!(s.forward_futile(&p, quiet, 1, 10_000, low, false, 1), "precondition: it must fire");
+        assert!(!s.forward_futile(&p, quiet, 1, 10_000, low, true, 1), "a checking move was skipped");
+        assert!(!s.forward_futile(&p, capture, 1, 10_000, low, false, 1), "a capture was skipped");
+        assert!(
+            !s.forward_futile(&p, quiet, 1, MATE - 5, low, false, 1),
+            "a move was skipped against a mate-magnitude alpha",
+        );
+        assert!(!s.forward_futile(&p, quiet, 1, 10_000, None, false, 1), "no evaluation, no cut");
+    }
+
+    #[test]
+    fn switched_off_the_forward_cut_changes_nothing() {
+        // The inert control: it says the brick is switched off rather than merely quiet.
+        for (nature, fen) in NATURES {
+            let p = Position::from_fen(fen).unwrap();
+            for depth in 4..=7u32 {
+                let (nodes, _, pruned, considered, _) = ffp(&p, depth, false);
+                assert_eq!(pruned, 0, "{nature} d{depth}: it fired while disabled");
+                assert_eq!(considered, 0, "{nature} d{depth}: the gate ran anyway");
+                let (again, ..) = ffp(&p, depth, false);
+                assert_eq!(nodes, again, "{nature} d{depth}: the disabled search is not stable");
+            }
+        }
+    }
+
+    #[test]
+    fn the_forward_cut_loses_no_mate_and_invents_none() {
+        // Deliberately not asserted: score equality with an unpruned search. A heuristic cut may
+        // return a different, equally valid bound — seven criteria of that shape have been struck
+        // in this repository.
+        //
+        // **The two signs are counted apart, and that is what this version is for.** `.abs()`
+        // folded them: a pair where the full search delivers mate and the pruned one is *being*
+        // mated satisfied every assertion. And the fold was load-bearing — measured, the three
+        // positions the first draft used never fire the cut while delivering a mate, so the one
+        // pair it exercised was a mate **suffered** at depth 8, under a test whose name promises
+        // the other sign. That is the defect #70 is open to fix on `mate_move_differs`, in this
+        // same file and the same week.
+        //
+        // Measured over the six positions below, depths 3 to 8: 18 pairs deliver a mate with the
+        // cut firing (104 to 235 moves skipped), and 1 suffers one (849 skipped).
+        let delivers = |x: i32| x > MATE_THRESHOLD;
+        let suffers = |x: i32| x < -MATE_THRESHOLD;
+        let (mut delivered, mut suffered) = (0, 0);
+        for fen in [
+            // Mate delivered *and* the cut firing — the combination the first draft had none of.
+            // All three keep material on both sides: a crushing position never triggers the cut,
+            // because the window tracks the score, which is the same premise that made the first
+            // draft of `the_cut_fires_on_real_positions` wrong in #66.
+            "r5rk/5p1p/5R2/4B3/8/8/7P/7K w - - 0 1",
+            "2bqkbn1/2pppp2/np2N3/r3P1p1/p2N2B1/5Q2/PPPPKPP1/RNB2r2 w - - 0 1",
+            "kbK5/pp6/1P6/8/8/8/8/R7 w - - 0 1",
+            // The ladder mate: the one position here where the side to move is the one mated.
+            "7k/8/8/8/8/8/1R6/R6K b - - 0 1",
+            // Mate in one from a crushing position. Kept, and kept named: they contribute no
+            // exercised pair at all, and a reader who assumes otherwise is making the mistake
+            // this version exists to undo.
+            "6k1/5ppp/8/8/8/8/8/R6K w - - 0 1",
+            "3k4/8/3K4/8/8/8/8/6R1 w - - 0 1",
+        ] {
+            let p = Position::from_fen(fen).unwrap();
+            for depth in 3..=8u32 {
+                let (_, plain, ..) = ffp(&p, depth, false);
+                let (_, cut, pruned, ..) = ffp(&p, depth, true);
+                // The mate this engine plays *for*. Skipping the move that mates would lose it.
+                if delivers(plain) {
+                    assert!(delivers(cut), "{fen} d{depth}: the cut lost a mate, {cut} against {plain}");
+                    delivered += u32::from(pruned > 0);
+                }
+                if delivers(cut) {
+                    assert!(delivers(plain), "{fen} d{depth}: it invented a mate, {cut} against {plain}");
+                }
+                // And the mate played *against* it. Skipping a defence would fabricate one;
+                // the assertion below is the one `.abs()` could not make.
+                if suffers(plain) {
+                    assert!(suffers(cut), "{fen} d{depth}: it missed a mate against it, {cut} against {plain}");
+                    suffered += u32::from(pruned > 0);
+                }
+                if suffers(cut) {
+                    assert!(suffers(plain), "{fen} d{depth}: it believed itself mated, {cut} against {plain}");
+                }
+            }
+        }
+        // Two counters rather than one, because one of the two signs is what the previous version
+        // silently stopped covering.
+        assert!(delivered > 0, "no pair both delivered a mate and skipped a move");
+        assert!(suffered > 0, "no pair was both mated and skipped a move");
+    }
+
     #[test]
     fn nothing_is_reduced_without_move_ordering() {
         // "Late" is a statement about the ordering: in generator order, index 7 says
@@ -3141,6 +3937,12 @@ mod tests {
         let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
         s.allow_extensions = scope.is_some();
         s.ext_max_depth = scope.unwrap_or(0);
+        // This harness isolates one brick, so the reverse futility cut is off: it prunes the
+        // same kind of branch, and leaving it on would make the measurement below read what the
+        // pair does under a name that claims otherwise — the same reasoning this file already
+        // applies to the reductions.
+        s.allow_rfp = false;
+        s.allow_ffp = false;
         let stats = deepen(pos, Request::new(Limits::depth(depth)), &mut s);
         Extended {
             stats,
