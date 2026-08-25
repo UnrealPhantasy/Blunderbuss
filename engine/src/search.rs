@@ -3294,21 +3294,24 @@ mod tests {
             stats.helper_nodes > 0,
             "precondition: the helpers must have searched, or the assertions below are vacuous",
         );
-        assert!(
-            stats.helpers_aborted >= 1,
-            "all three helpers ran to completion: nothing stopped them, and the search only \
-             returned because they happened to finish",
-        );
+        // **`helpers_aborted >= 1` was tried here and removed: it is a race, not a property.**
+        // `deepen` leaves its loop two ways — `aborted` from inside an iteration, or a plain
+        // `break` when the deadline has passed *between* two of them — and the second never
+        // touches the flag. A helper that finishes an iteration just as the deadline lands
+        // stops perfectly correctly with `aborted == false`. Measured: red once in seven
+        // release runs, green in every debug run, which is how a test like this gets merged.
+        // The counter stays because it is worth reading in the message below.
         // An order-of-magnitude bound rather than a tight one, since three helpers racing a
         // shared table are not reproducible run to run. Measured: helpers do 3.0 to 3.2 times
         // the reporting thread's nodes in debug and about 5 times in release, against the 3
         // extra threads. Twenty times would mean a helper searching long after the answer.
         assert!(
             stats.helper_nodes < 20 * stats.nodes.max(1),
-            "helpers searched {} nodes against the reporting thread's {}: one of them kept \
-             going after the answer was in",
+            "helpers searched {} nodes against the reporting thread's {} ({} of them ended \
+             aborted): one kept going after the answer was in",
             stats.helper_nodes,
             stats.nodes,
+            stats.helpers_aborted,
         );
     }
 
