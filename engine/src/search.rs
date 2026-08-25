@@ -960,6 +960,11 @@ impl<'a> Searcher<'a> {
         let (allow, max_depth, margin) = (self.allow_rfp, self.rfp_max_depth, self.rfp_margin);
         #[cfg(not(test))]
         let (allow, max_depth, margin) = (true, RFP_MAX_DEPTH, RFP_MARGIN);
+        // `depth == 0` is defensive and **no test can reach it**: `negamax_inner` hands a
+        // depth-0 node to quiescence before this function is called, so a mutation removing it
+        // leaves every test green for a reason that is not a gap in the suite. It stays because
+        // it makes the multiplication below meaningful on its own terms — a zero margin would
+        // cut on the raw evaluation — and a caller added later would not know that.
         if !allow || depth == 0 || depth > max_depth {
             return None;
         }
@@ -3366,6 +3371,60 @@ mod tests {
             None,
             "the cut fired one ply past its ceiling",
         );
+    }
+
+    #[test]
+    fn the_margin_grows_with_the_depth_it_covers() {
+        // The margin is multiplied by the remaining depth, and `RFP_MARGIN` argues that growth at
+        // length: it is a bet about what the opponent could claw back in the subtree being
+        // skipped, and one ply of slack is cheap to concede where three is not. Nothing asserted
+        // it. Mutating `margin * depth` to `margin` left the entire suite green — every other
+        // unit test here calls the cut at depth 1, where the two expressions coincide, and the
+        // one call at the ceiling deliberately sets beta low so the margin cannot interfere.
+        //
+        // The mutation is not cosmetic: it moves 4% to 23% of the tree, and on the quiet
+        // middlegame at depth 9 it changes the score the search returns.
+        let p = Position::from_fen("4k3/8/8/8/8/8/8/3QK2R w K - 0 1").unwrap();
+        let mut table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        let eval = evaluate(&p);
+        // The growth itself, as one fact about one beta: the deepest cut must refuse what the
+        // shallowest cut takes. A flat margin makes these two calls agree, which is precisely
+        // what no other test in this file can see.
+        let between = eval - RFP_MARGIN * RFP_MAX_DEPTH as i32 + 1;
+        assert!(
+            s.reverse_futility(&p, 1, between).is_some(),
+            "at depth 1 the cut refused a beta {} below the evaluation",
+            eval - between,
+        );
+        assert_eq!(
+            s.reverse_futility(&p, RFP_MAX_DEPTH, between),
+            None,
+            "the same beta was cut at depth {RFP_MAX_DEPTH}: the margin is not growing",
+        );
+        // And the slope, pinned at its boundary at every depth rather than at one chosen depth —
+        // a single sample cannot tell a slope from a coincidence, and an off-by-one in the
+        // multiplier would clear the pair above at three depths out of three.
+        for depth in 1..=RFP_MAX_DEPTH {
+            // The lowest beta this depth may no longer cut against is one centipawn above the
+            // boundary, since the comparison is `eval - margin * depth >= beta`.
+            let boundary = eval - RFP_MARGIN * depth as i32;
+            assert!(
+                boundary.abs() < MATE_THRESHOLD,
+                "precondition: beta must stay out of mate range at depth {depth}, otherwise the \
+                 mate guard is what returns `None` and this test reads the wrong guard",
+            );
+            assert!(
+                s.reverse_futility(&p, depth, boundary).is_some(),
+                "at depth {depth} the cut refused a beta exactly {} below the evaluation",
+                RFP_MARGIN * depth as i32,
+            );
+            assert_eq!(
+                s.reverse_futility(&p, depth, boundary + 1),
+                None,
+                "at depth {depth} the cut fired against a beta one centipawn past its margin",
+            );
+        }
     }
 
     #[test]
