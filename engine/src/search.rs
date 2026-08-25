@@ -291,6 +291,14 @@ pub struct SearchStats {
     /// every published measurement in this project refers to, and merging the two would
     /// reprice all of them. This field is how a caller sees that the helpers ran at all.
     pub helper_nodes: u64,
+    /// How many helpers ended by **abandoning** their search rather than by finishing it.
+    ///
+    /// The instrument for "no helper kept working after the answer was in", and the reason it
+    /// is a counter rather than a stopwatch: the property is about what a thread *did*, and a
+    /// wall-clock bound on a shared machine reports a bug that is not there. Test-only — the
+    /// increment happens once per helper, at the join, never on a search path.
+    #[cfg(test)]
+    pub helpers_aborted: usize,
 }
 
 /// Whether `mv` promotes a pawn to a queen.
@@ -446,11 +454,15 @@ impl Engine {
         let history = request.history;
         let table = &self.table;
         let stop = AtomicBool::new(false);
+        #[cfg(test)]
+        let aborted_helpers = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|scope| {
             // Rust idiom: `move` closures move *everything* they name, so the flag is bound to a
             // reference first. Copying a `&AtomicBool` into each closure is what shares it;
             // naming `stop` directly would move the flag into the first helper.
             let stop = &stop;
+            #[cfg(test)]
+            let aborted_helpers = &aborted_helpers;
             let mut helpers = Vec::with_capacity(self.threads - 1);
             for id in 1..self.threads {
                 helpers.push(scope.spawn(move || {
@@ -471,7 +483,12 @@ impl Engine {
                     };
                     // A helper reports nothing. Its whole contribution is what it leaves in
                     // the table.
-                    deepen(pos, helper, &mut s).nodes
+                    let nodes = deepen(pos, helper, &mut s).nodes;
+                    #[cfg(test)]
+                    if s.aborted {
+                        aborted_helpers.fetch_add(1, Atomicity::Relaxed);
+                    }
+                    nodes
                 }));
             }
             let mut searcher = Searcher::new(MoveOrder::Full, deadline, table);
@@ -523,6 +540,10 @@ impl Engine {
                     }
                 })
                 .sum();
+            #[cfg(test)]
+            {
+                stats.helpers_aborted = aborted_helpers.load(Atomicity::Relaxed);
+            }
             stats
         })
     }
@@ -622,6 +643,9 @@ fn deepen(pos: &Position, mut request: Request, searcher: &mut Searcher) -> Sear
         table_key_match_rate: searcher.rate(searcher.table_hits),
         table_cutoff_rate: searcher.rate(searcher.table_cutoffs),
         helper_nodes: 0,
+        // A search with no helpers has none to abandon; `search_parallel` overwrites it.
+        #[cfg(test)]
+        helpers_aborted: 0,
     }
 }
 
@@ -1592,6 +1616,8 @@ mod tests {
             table_key_match_rate: searcher.rate(searcher.table_hits),
             table_cutoff_rate: searcher.rate(searcher.table_cutoffs),
             helper_nodes: 0,
+            #[cfg(test)]
+            helpers_aborted: 0,
         }
     }
 
@@ -3199,10 +3225,26 @@ mod tests {
 
     #[test]
     fn a_parallel_search_stops_on_its_deadline_and_does_not_wait_for_its_helpers() {
-        // Two things at once, and the second is the one worth having: `scope` cannot return
-        // until every helper has joined, so a helper that ignored the stop flag would make the
-        // whole search hang until the deadline *it* was given. Pinned by wall clock rather than
-        // by score, because a score cannot see whether a thread was still running.
+        // `scope` cannot return until every helper has joined, so a helper that kept searching
+        // after the answer was in would hold the whole search open. What has to hold is that
+        // none of them does.
+        //
+        // **Pinned by counter, and the previous version was worse than machine-dependent.** It
+        // asserted `spent < budget * 6` — a wall clock on a shared machine, the shape #18 was
+        // merged to remove. Measured, it was also inert: commenting out `stop.store(true, …)`
+        // left it green, because the bound is six times a budget the search never approaches.
+        //
+        // What this asserts instead is what the helpers *did*: each ended by abandoning its
+        // search rather than by finishing it, which is a fact about the thread and not about
+        // the machine it ran on.
+        //
+        // Honest note on what it does **not** separate: at the deadline the stop flag and the
+        // helpers' own deadline become true at the same instant — they share `deadline` — so
+        // this cannot say which of the two stopped them. And at fixed depth the flag stops
+        // nobody at all: over twelve parallel searches at depths 8 to 12, no helper ever ended
+        // aborted, because they always finish their iterations before the reporting thread
+        // posts the flag. The flag is cheap insurance against a helper that is late, not a
+        // mechanism this suite has been able to catch doing anything.
         let p = Position::from_fen(NATURES[2].1).unwrap();
         let mut e = Engine::new();
         e.set_threads(4);
@@ -3212,13 +3254,26 @@ mod tests {
             &p,
             Request::new(Limits { max_depth: MAX_DEPTH, deadline: Some(started + budget) }),
         );
-        let spent = started.elapsed();
         assert!(stats.best.is_some(), "an interrupted parallel search must still have a move");
-        // Generous by design: this asserts "it returns", not a latency. A helper that never
-        // noticed the flag would overshoot by whole seconds at this depth, not by milliseconds.
         assert!(
-            spent < budget * 6,
-            "the search took {spent:?} for a budget of {budget:?}: a helper ignored the stop flag",
+            stats.helper_nodes > 0,
+            "precondition: the helpers must have searched, or the assertions below are vacuous",
+        );
+        assert!(
+            stats.helpers_aborted >= 1,
+            "all three helpers ran to completion: nothing stopped them, and the search only \
+             returned because they happened to finish",
+        );
+        // An order-of-magnitude bound rather than a tight one, since three helpers racing a
+        // shared table are not reproducible run to run. Measured: helpers do 3.0 to 3.2 times
+        // the reporting thread's nodes in debug and about 5 times in release, against the 3
+        // extra threads. Twenty times would mean a helper searching long after the answer.
+        assert!(
+            stats.helper_nodes < 20 * stats.nodes.max(1),
+            "helpers searched {} nodes against the reporting thread's {}: one of them kept \
+             going after the answer was in",
+            stats.helper_nodes,
+            stats.nodes,
         );
     }
 
