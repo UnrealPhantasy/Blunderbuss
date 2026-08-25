@@ -12,6 +12,7 @@
 //! answered by the engine's single search function — see [`parse_go`].
 
 use engine::position::{Color, Position};
+use engine::book::Book;
 use engine::search::{Engine, Limits, Progress, Request, MATE, MATE_THRESHOLD, MAX_DEPTH};
 use std::io::{self, BufRead, Write};
 use std::time::{Duration, Instant};
@@ -173,6 +174,61 @@ fn allocate(divisor: u64, remaining: Duration, increment: Duration) -> Duration 
 /// names no limit. Kept separate from `main` so it can be unit-tested without
 /// spawning a process — and the budget is a field, not a constant, so tests can
 /// shorten it.
+/// Load every book file found, beside the executable first and then in the working directory.
+///
+/// **Two files, merged, and that is not indecision.** They have opposite strengths and the line
+/// format merges them for free — a position offered by both simply gets both continuations.
+///
+/// - `book.txt` is hand-written, twenty-seven named lines. Broader at the root (four first moves
+///   against the generated book's three, since that one follows Stockfish's top three) and, more
+///   importantly, *readable*: the tests point at lines a person can check by eye, including the
+///   London written in both move orders so the transposition property is data rather than a
+///   claim.
+/// - `book-generated.txt` is 8 700 positions produced by Stockfish to twelve plies. Far deeper, and
+///   opaque — nobody can verify one of its lines by reading it.
+///
+/// Beside the executable first because that is where an arena finds it: `match.sh` runs
+/// `./bin/blunderbuss-x` from the harness directory, so a book living next to the source tree
+/// would be invisible exactly where it is measured. Absent means no book, silently — an engine
+/// that refused to start without one would be worse than one playing its own openings.
+fn load_book() -> (Option<Book>, Option<String>) {
+    let mut text = String::new();
+    let dirs = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .into_iter()
+        .chain(Some(std::path::PathBuf::from(".")));
+    for dir in dirs {
+        for name in ["book.txt", "book-generated.txt"] {
+            if let Ok(t) = std::fs::read_to_string(dir.join(name)) {
+                text.push_str(&t);
+                text.push('\n');
+            }
+        }
+        if !text.is_empty() {
+            break;
+        }
+    }
+    if text.is_empty() {
+        // **Announced rather than silent, and this is the case that most needed it.** The two
+        // files are looked up beside the executable and in the working directory, so a binary
+        // copied somewhere to be measured — which is exactly what this project does with every
+        // release build — runs with no book while still announcing `OwnBook default true`. An
+        // arena on such a binary reports that the book changes nothing: correct about the
+        // binary, wrong about the brick, and indistinguishable from a real zero.
+        //
+        // The `skipped` path below already had this treatment for a *partly* missing book. A
+        // book that is missing entirely is the same failure in full.
+        return (None, Some("info string book: none found".to_string()));
+    }
+    let (book, skipped) = Book::from_lines(&text);
+    let note = (skipped > 0).then(|| format!("info string book: {skipped} line(s) skipped"));
+    if book.is_empty() {
+        return (None, Some("info string book: loaded but empty".to_string()));
+    }
+    (Some(book), note)
+}
+
 struct Uci {
     position: Position,
     default_budget: Duration,
@@ -188,6 +244,10 @@ struct Uci {
     /// each one, while a test collects them into a vector and can assert on what was
     /// said and in which order.
     info: Box<dyn FnMut(String)>,
+    /// What `load_book` had to say, reported with the option list rather than at startup.
+    ///
+    /// `None` when the book loaded cleanly — the ordinary case says nothing, as it should.
+    book_note: Option<String>,
     /// What the engine has learned and keeps between moves — the transposition table.
     ///
     /// It lives here, at the protocol layer, because this is the only level that knows
@@ -223,31 +283,53 @@ impl Uci {
     }
 
     fn with_info(info: Box<dyn FnMut(String)>) -> Uci {
+        // The note is **kept, not emitted here**. Saying anything before the GUI has sent `uci`
+        // is out of turn — the protocol has no slot for it, and a strict front end is entitled
+        // to be confused by a line it did not ask for. It is answered with the option list
+        // instead, which is precisely where a GUI learns what this engine has.
+        let (book, book_note) = load_book();
+        let mut engine = Engine::new();
+        engine.set_book(book);
         Uci {
             position: Position::initial(),
             default_budget: Duration::from_millis(DEFAULT_BUDGET_MS),
             history: Vec::new(),
             info,
-            engine: Engine::new(),
+            engine,
+            book_note,
         }
     }
 
     /// `setoption name <name> value <value>`, the only shape the protocol uses.
     ///
     /// Unknown options are ignored rather than refused: the protocol expects an engine to
-    /// tolerate whatever a GUI sends, and refusing would break a session over a setting we do
-    /// not have.
+    /// tolerate whatever a GUI sends, and refusing would end a session over a setting we do not
+    /// have.
     fn set_option(&mut self, tokens: &[&str]) {
         let name = tokens.iter().position(|t| t.eq_ignore_ascii_case("name"));
         let value = tokens.iter().position(|t| t.eq_ignore_ascii_case("value"));
         let (Some(n), Some(v)) = (name, value) else { return };
         // `get` rather than indexing: `name` and `value` are located independently, so a line
-        // that puts them the wrong way round — `setoption value 4 name Threads` — inverts the
-        // range. Indexing panics there, and a panic in `handle` takes the process down, which
-        // during a game is a lost game rather than a rejected command. That is the opposite of
-        // what the comment above promises.
+        // that puts them the wrong way round — `setoption value false name OwnBook` — inverts
+        // the range. Indexing panics there, and a panic in `handle` takes the process down,
+        // which during a game is a lost game rather than a rejected command. That is the
+        // opposite of what the comment above promises. Same defect and same fix as #65, which
+        // introduced `set_option` independently and inherited it.
         let Some(key) = tokens.get(n + 1..v).map(|k| k.join(" ")) else { return };
         let Some(raw) = tokens.get(v + 1) else { return };
+        if key.eq_ignore_ascii_case("ownbook") {
+            if raw.eq_ignore_ascii_case("true") {
+                // Same note on the same channel: a GUI that switches the book back on and gets
+                // no book deserves to be told, not left to infer it from the engine searching.
+                let (book, note) = load_book();
+                if let Some(note) = note {
+                    (self.info)(note);
+                }
+                self.engine.set_book(book);
+            } else {
+                self.engine.set_book(None);
+            }
+        }
         if key.eq_ignore_ascii_case("threads") {
             if let Ok(threads) = raw.parse::<usize>() {
                 self.engine.set_threads(threads);
@@ -260,14 +342,24 @@ impl Uci {
     fn handle(&mut self, line: &str) -> Response {
         let tokens: Vec<&str> = line.split_whitespace().collect();
         match tokens.first().copied() {
-            Some("uci") => Response::lines(vec![
-                "id name Blunderbuss".to_string(),
-                "id author UnrealPhantasy".to_string(),
-                // Announced with `default 1` on purpose: a GUI that never touches the option
-                // gets the engine every published measurement was taken on.
-                "option name Threads type spin default 1 min 1 max 64".to_string(),
-                "uciok".to_string(),
-            ]),
+            Some("uci") => {
+                let mut lines = vec![
+                    "id name Blunderbuss".to_string(),
+                    "id author UnrealPhantasy".to_string(),
+                    // Announced with `default 1` on purpose: a GUI that never touches the option
+                    // gets the engine every published measurement was taken on.
+                    "option name Threads type spin default 1 min 1 max 64".to_string(),
+                    // Standard UCI name, so an arena that wants the book off can say so without
+                    // knowing anything about this engine.
+                    "option name OwnBook type check default true".to_string(),
+                ];
+                // Beside the option that claims the book is on, and before `uciok` so a GUI has
+                // it before it can act on the option. Announcing `default true` while the files
+                // were nowhere to be found is the contradiction this line resolves.
+                lines.extend(self.book_note.clone());
+                lines.push("uciok".to_string());
+                Response::lines(lines)
+            }
             Some("isready") => Response::lines(vec!["readyok".to_string()]),
             Some("setoption") => {
                 self.set_option(&tokens[1..]);
@@ -447,19 +539,89 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_book_is_announced_rather_than_left_silent() {
+        // The failure this catches is not a lost game, it is a lost measurement. The two book
+        // files are looked up beside the executable and in the working directory; a release
+        // binary copied into a measurement directory finds neither, and runs with no book while
+        // `uci` still announces `OwnBook type check default true`. An arena on that binary
+        // reports that the book changes nothing — correct about the binary, wrong about the
+        // brick, and indistinguishable from a real zero.
+        //
+        // A test can assert this precisely *because* it reproduces the condition by accident:
+        // cargo runs tests from the crate root, where neither file exists, so every `Uci` built
+        // here has no book. That is why the note has to travel on the `info` channel rather than
+        // through `println!` — the same sink the rest of the protocol uses, and the only one a
+        // test can read.
+        let out = quick_uci().handle("uci");
+        let at = out.lines.iter().position(|l| l == "info string book: none found");
+        assert!(at.is_some(), "no book was found and nothing said so: {:?}", out.lines);
+        let uciok = out.lines.iter().position(|l| l == "uciok").expect("uciok");
+        assert!(at.unwrap() < uciok, "the note came after uciok: {:?}", out.lines);
+        // The contradiction it resolves, asserted alongside so the two cannot drift apart: the
+        // option list claims the book is on in the very same breath.
+        assert!(
+            out.lines.iter().any(|l| l.starts_with("option name OwnBook") && l.contains("default true")),
+            "precondition: the option must still claim the book is on",
+        );
+    }
+
+    #[test]
+    fn switching_the_book_back_on_says_so_when_there_is_none() {
+        // The same note on the same channel for the other entry point. A GUI that sends
+        // `setoption name OwnBook value true` and gets no book should be told, rather than left
+        // to infer it from the engine searching a position it was supposed to answer.
+        let (mut uci, log) = uci_with_log();
+        log.borrow_mut().clear();
+        uci.handle("setoption name OwnBook value true");
+        assert!(
+            log.borrow().iter().any(|l| l == "info string book: none found"),
+            "switching the book on found nothing and said nothing: {:?}",
+            log.borrow(),
+        );
+        // Switching it *off* has nothing to report: there is no book to fail to find.
+        log.borrow_mut().clear();
+        uci.handle("setoption name OwnBook value false");
+        assert!(
+            log.borrow().is_empty(),
+            "turning the book off should be silent, said {:?}",
+            log.borrow(),
+        );
+    }
+
+    #[test]
     fn a_malformed_setoption_is_ignored_rather_than_fatal() {
-        // `setoption value 4 name Threads` **panicked** before this test existed: `name` and
-        // `value` are located independently, so the reversed order inverts the slice range and
-        // indexing it aborts the process. A panic in `handle` is a lost game rather than a
+        // Both options are swept in one test rather than two: #64 and #71 introduced
+        // `set_option` independently and inherited the same defect, so a merge keeping
+        // either version alone would silently drop one of the two closing assertions.
+        // `setoption value false name OwnBook` **panicked** before this test existed: `name`
+        // and `value` are located independently, so the reversed order inverts the slice range
+        // and indexing it aborts the process. A panic in `handle` is a lost game rather than a
         // rejected command, which is the opposite of what the protocol asks of an engine.
-        let mut uci = quick_uci();
+        //
+        // #65 introduced `set_option` independently and inherited the same defect; the fix and
+        // this test are deliberately the same shape there, so that whichever of the two lands
+        // second conflicts visibly on this function rather than silently keeping the unguarded
+        // version.
+        let (mut uci, log) = uci_with_log();
+        // **The book is planted rather than loaded, and before the malformed lines rather than
+        // after.** Planted, because `load_book` reads `book.txt` from the executable's directory
+        // and from `.`, and a test's working directory is the crate root — in a test it finds
+        // nothing and returns `None`, so a test relying on it would pass on an empty book.
+        // Before, because what is asserted below is that a malformed line leaves the option
+        // *where it was*: planting afterwards would restore whatever the line had destroyed,
+        // and the test would stay green against a `set_option` that wiped the book on any
+        // input. Found by mutation, not by reading.
+        uci.engine.set_book(Some(Book::from_lines(include_str!("../../book.txt")).0));
         for line in [
             "setoption",
             "setoption name",
+            "setoption name OwnBook",
+            "setoption name OwnBook value",
+            "setoption value false name OwnBook",
+            "setoption value name",
             "setoption name Threads",
             "setoption name Threads value",
             "setoption value 4 name Threads",
-            "setoption value name",
             "setoption name Threads value not-a-number",
         ] {
             let out = uci.handle(line);
@@ -467,6 +629,29 @@ mod tests {
             assert!(!out.quit, "{line}: a malformed option ended the session");
         }
         assert_eq!(uci.engine.threads(), 1, "a malformed option changed the thread count");
+
+        // And the option is still where it was. Observable without a getter: with the book on,
+        // the start position is answered *from the book*, so the search never runs and not one
+        // `info` line is emitted.
+        uci.handle("position startpos");
+        log.borrow_mut().clear();
+        let out = uci.handle("go");
+        assert!(
+            log.borrow().is_empty(),
+            "the book was turned off by a malformed line: the search ran and said {:?}",
+            log.borrow(),
+        );
+        assert!(out.lines[0].starts_with("bestmove "), "no move came back: {:?}", out.lines);
+        // The control that keeps the assertion above from being vacuous: switched off, the same
+        // `go` does report. Without it, an `info` line that was never logged would pass too.
+        uci.handle("setoption name OwnBook value false");
+        log.borrow_mut().clear();
+        uci.handle("go");
+        assert!(
+            !log.borrow().is_empty(),
+            "precondition: with the book off the search must report, or the emptiness above \
+             proves nothing about the book",
+        );
     }
 
     #[test]
