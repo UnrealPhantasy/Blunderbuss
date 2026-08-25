@@ -232,6 +232,34 @@ const FFP_MAX_DEPTH: u32 = 2;
 /// never played.
 const FFP_MARGIN: i32 = 120;
 
+/// Deepest remaining depth at which a quiet move may be skipped on its **rank** alone.
+///
+/// The rank is what the ordering already decided: how far down the sorted list a move sits, after
+/// the table's suggestion, the captures and the killers have taken the top. Late move *reductions*
+/// bet that such a move is probably irrelevant and search it shallower; this makes the stronger
+/// bet and does not search it at all, so it is confined to the depths where being wrong costs
+/// least — a move skipped at depth 3 hides a three-ply subtree.
+const LMP_MAX_DEPTH: u32 = 3;
+
+// **Measured, this ceiling cannot currently be raised past 3, and the reason is not in this
+// constant.** The cut reads `static_eval` only to learn whether the node is in check, and
+// `static_eval_for` refuses to compute one past `max(RFP_MAX_DEPTH, FFP_MAX_DEPTH)` — which is 3.
+// Above that the value is `None` for a reason that has nothing to do with check, and this cut
+// declines. The sweep confirms it: ceiling 4 and ceiling 3 produce identical node counts on all
+// four natures. Raising it means giving this cut its own `in_check`, which is a separate change
+// with its own cost per move; noted rather than done here.
+
+/// How many moves a node searches before rank alone may skip one, before the depth term.
+///
+/// The threshold is `LMP_BASE + depth * depth`, so 4 at depth 1, 7 at depth 2, 12 at depth 3.
+///
+/// **It grows with depth for the same reason the futility margins do**: the deeper the subtree
+/// being skipped, the more the ordering's verdict has to be trusted, and the ordering is a
+/// heuristic. A flat threshold would either skip too little near the leaves — where the subtree
+/// is one ply and the bet nearly free — or too much at the ceiling, where a skipped move takes a
+/// whole subtree with it and no later iteration revisits a move that was never played.
+const LMP_BASE: usize = 3;
+
 /// How far / how long to search.
 pub struct Limits {
     /// Never search deeper than this.
@@ -422,6 +450,16 @@ pub struct Engine {
     /// single-threaded path, and a default that went through the parallel one would silently
     /// reprice all of them.
     threads: usize,
+    /// Whether the searches this engine runs may skip a quiet move on its rank.
+    ///
+    /// **Tests only.** It exists because one property of this type — that a table carried from
+    /// one move to the next saves work — is measured through `Engine` and nowhere else, so it
+    /// cannot reach a `Searcher` flag. A brick that shrinks the tree changes how much there is
+    /// left for the table to save, and the test has to be able to hold that constant to measure
+    /// what it is about. See the note on `LMP_MAX_DEPTH` for the measurement that made this
+    /// necessary rather than convenient.
+    #[cfg(test)]
+    allow_lmp: bool,
 }
 
 impl Default for Engine {
@@ -432,7 +470,7 @@ impl Default for Engine {
 
 impl Engine {
     pub fn new() -> Engine {
-        Engine { table: Table::new(), games: 0, book: None, threads: 1 }
+        Engine { table: Table::new(), games: 0, book: None, threads: 1 , #[cfg(test)] allow_lmp: true }
     }
 
     /// Give this engine an opening book, or take it away with `None`.
@@ -505,6 +543,10 @@ impl Engine {
             // every published measurement was taken on, and it allocates nothing.
             let mut searcher =
                 Searcher::new(MoveOrder::Full, request.limits.deadline, &self.table);
+            #[cfg(test)]
+            {
+                searcher.allow_lmp = self.allow_lmp;
+            }
             return deepen(pos, request, &mut searcher);
         }
         self.search_parallel(pos, request)
@@ -837,6 +879,26 @@ struct Searcher<'a> {
     ffp_max_depth: u32,
     #[cfg(test)]
     ffp_margin: i32,
+    /// How many quiet moves were **skipped on rank**, and how many reached the rank test.
+    ///
+    /// **Tests only**, and two counters rather than one for the reason the reverse cut paid for
+    /// on 2026-08-21: a gate that never opens makes a brick read a node ratio of 1.0000 exactly,
+    /// which is indistinguishable from a brick that costs nothing. `0 / 0` says the gate is shut;
+    /// `1 / 900` says it is open and useless — a different diagnosis.
+    #[cfg(test)]
+    lmp_pruned: u64,
+    #[cfg(test)]
+    lmp_considered: u64,
+    /// Whether a node may skip a move on rank at all, and the two knobs the sweep moves.
+    ///
+    /// **Tests only**, compiled out otherwise: the comparison that decides a brick is between two
+    /// verdicts of *one* binary, since comparing two builds picks up every other difference.
+    #[cfg(test)]
+    allow_lmp: bool,
+    #[cfg(test)]
+    lmp_max_depth: u32,
+    #[cfg(test)]
+    lmp_base: usize,
     /// Whether a node may try the reverse futility cut at all, and the gate it uses.
     ///
     /// **Tests only**, compiled out otherwise: the comparison that decides a brick is between two
@@ -1000,6 +1062,16 @@ impl<'a> Searcher<'a> {
             ffp_max_depth: FFP_MAX_DEPTH,
             #[cfg(test)]
             ffp_margin: FFP_MARGIN,
+            #[cfg(test)]
+            lmp_pruned: 0,
+            #[cfg(test)]
+            lmp_considered: 0,
+            #[cfg(test)]
+            allow_lmp: true,
+            #[cfg(test)]
+            lmp_max_depth: LMP_MAX_DEPTH,
+            #[cfg(test)]
+            lmp_base: LMP_BASE,
             #[cfg(test)]
             rfp_taken: 0,
             #[cfg(test)]
@@ -1467,6 +1539,86 @@ impl<'a> Searcher<'a> {
         reduction.min(reduction_ceiling(depth))
     }
 
+    /// Whether this quiet move is late enough, and this node shallow enough, to be skipped
+    /// without being searched at all.
+    ///
+    /// # What it bets, and how it differs from the futility cuts
+    ///
+    /// The two futility cuts read the **board**: they ask whether a static evaluation plus a
+    /// margin can reach the window. This reads the **move list**: it asks whether the ordering
+    /// has already placed this move so far down that searching it is unlikely to repay the
+    /// subtree it costs. The two predicates are independent — either can fire where the other
+    /// does not — and this one costs no evaluation at all, which is why it is asked first.
+    ///
+    /// # The guards, each closing a different way the bet fails
+    ///
+    /// **The first move is never skipped.** A node that skipped every move would return a score
+    /// no move produced. `searched` counts moves actually searched rather than reusing `rank`,
+    /// because a rank advances whether or not the move was played — a node whose earlier moves
+    /// were all pruned would otherwise look as though it had searched them.
+    ///
+    /// **A checking move is not quiet whatever the board says**, and neither is a capture or a
+    /// promotion: they force the reply, and the premise that the position drifts slowly does not
+    /// hold across a forcing move.
+    ///
+    /// **A node in check has no quiet continuation to fall back on** — its legal moves may all be
+    /// forced, so "this move is unpromising" says nothing about whether it must be played. The
+    /// same premise the null move guards with `phase` and the futility cuts guard with `None`.
+    ///
+    /// **A mate-magnitude alpha makes a rank threshold meaningless.** Against a proven mate
+    /// distance, the ordering's opinion of a quiet move is not a reason to discard it, exactly as
+    /// a centipawn margin is not.
+    #[allow(clippy::too_many_arguments)]
+    fn late_move_pruning(
+        &mut self,
+        pos: &Position,
+        mv: Move,
+        depth: u32,
+        alpha: i32,
+        static_eval: Option<i32>,
+        rank: usize,
+        gives_check: bool,
+        searched: u32,
+    ) -> bool {
+        #[cfg(test)]
+        let (allow, max_depth, base) = (self.allow_lmp, self.lmp_max_depth, self.lmp_base);
+        #[cfg(not(test))]
+        let (allow, max_depth, base) = (true, LMP_MAX_DEPTH, LMP_BASE);
+        if !allow || searched == 0 || depth == 0 || depth > max_depth {
+            return false;
+        }
+        if alpha.abs() >= MATE_THRESHOLD {
+            return false;
+        }
+        if gives_check || !is_quiet(pos, mv) {
+            return false;
+        }
+        // **`None` means the node is in check** — the same signal the futility cuts read, and
+        // reading it costs nothing where `pos.in_check()` per move would. The equivalence holds
+        // only while this cut's ceiling stays at or below the ceiling `static_eval_for` uses,
+        // since past that ceiling `None` means "not computed" instead. That is a relationship
+        // between two constants sitting far apart in this file, so a test asserts it rather than
+        // leaving it to be noticed — the same treatment `reduction_ceiling` gets.
+        if static_eval.is_none() {
+            return false;
+        }
+        #[cfg(test)]
+        {
+            self.lmp_considered += 1;
+        }
+        // Idiom: `depth` is unsigned, so the square cannot go negative; the cast is to `usize`
+        // because a rank is an index into the move list.
+        let threshold = base + (depth * depth) as usize;
+        if rank >= threshold {
+            #[cfg(test)]
+            {
+                self.lmp_pruned += 1;
+            }
+            return true;
+        }
+        false
+    }
+
     fn negamax_inner(
         &mut self,
         pos: &Position,
@@ -1643,6 +1795,17 @@ impl<'a> Searcher<'a> {
             // needs that the move alone does not carry — and the loop already computes it for the
             // extension and the reduction guard, so asking costs nothing extra.
             if self.forward_futile(pos, mv, depth, alpha, static_eval, gives_check, searched) {
+                continue;
+            }
+            // **After the futility cut, and the order was measured rather than assumed.** The
+            // first draft asked this first, on the theory that reading a rank is cheaper than
+            // reading an evaluation. It is not: the evaluation is computed once per *node*
+            // before this loop, so both predicates cost the same handful of tests per move.
+            // What asking first did do is take candidates away from `forward_futile`, which
+            // reddened `one_evaluation_per_node_and_never_one_per_move` — a test that measures
+            // sharing through the moves that cut considers. Changing an order for no measured
+            // gain, and breaking a neighbouring brick's instrument to do it, is a bad trade.
+            if self.late_move_pruning(pos, mv, depth, alpha, static_eval, rank, gives_check, searched) {
                 continue;
             }
             let extension = self.check_extension(gives_check, depth, ply);
@@ -1870,6 +2033,14 @@ mod tests {
         let table = Table::new();
         let mut searcher = Searcher::new(MoveOrder::Full, None, &table);
         searcher.node_limit = Some(node_ceiling);
+        // The rank cut is off, and this is the guard that keeps a node ceiling meaningful. A
+        // ceiling counts nodes, so **any** brick that changes the size of the tree moves where it
+        // falls — the scenario these tests set up (two complete iterations, then an interruption
+        // part-way through the third) simply happens somewhere else. That is how #35 quietly
+        // stopped exercising the rescue it was written for, and recalibrating the constant only
+        // defers the next time. What is under test here is what survives an interruption, which
+        // is a property of the deepening loop and not of the pruning around it.
+        searcher.allow_lmp = false;
         let mut reported = Vec::new();
         let mut report = |p: &Progress| reported.push(p.depth);
         let stats = deepen(
@@ -1975,7 +2146,17 @@ mod tests {
             Some(("c1d1".to_string(), 445)),
             "the complete depth-2 result must stand",
         );
-        assert_eq!(best_move(&p, 2).map(|(mv, sc)| (p.move_to_uci(mv), sc)), Some(("c1d1".to_string(), 445)));
+        // The precondition that gives the assertion above its meaning — and it goes through the
+        // **same harness**, uninterrupted, rather than through `best_move`. Reading the reference
+        // from a different path means reading it under different pruning: with the rank cut on in
+        // one and off in the other, the two disagreed by 5 centipawns and the test failed for a
+        // reason that had nothing to do with what it tests.
+        let (complete, _) = search_cut_at(&p, 2, u64::MAX);
+        assert_eq!(
+            complete.best.map(|(mv, sc)| (p.move_to_uci(mv), sc)),
+            Some(("c1d1".to_string(), 445)),
+            "precondition: the complete depth-2 search must be the value asserted above",
+        );
     }
 
     #[test]
@@ -2205,6 +2386,7 @@ mod tests {
             // the pair under a name that claims otherwise.
             s.allow_rfp = false;
             s.allow_ffp = false;
+            s.allow_lmp = false;
             deepen(&p, Request::new(Limits::depth(depth)), &mut s).nodes
         };
         // Swept rather than measured at one chosen depth: a threshold that holds at
@@ -2561,11 +2743,22 @@ mod tests {
         let (mut carried_nodes, mut fresh_nodes) = (0u64, 0u64);
         for mv in start.legal_moves().into_iter().take(8) {
             let next = start.play(mv);
+            // **The rank cut is held off on both sides**, and holding it is what this test now
+            // needs to mean anything. What is measured here is how much a carried table saves,
+            // and a brick that shrinks the tree leaves less to save: measured over these eight
+            // continuations, carried/fresh goes from 0.92-0.95 with the cut off to 1.00-1.19
+            // with it on — the saving does not merely shrink, it reverses. That is a real
+            // interaction and it is reported on the pull request; it is not what this test is
+            // about, and letting it in would turn a statement about the table into a statement
+            // about the pair.
             let mut engine = Engine::new();
+            engine.allow_lmp = false;
             engine.search(&start, Request::new(Limits::depth(6)));
             let before = engine.search(&next, Request::new(Limits::depth(6)));
             carried_nodes += before.nodes;
-            fresh_nodes += Engine::new().search(&next, Request::new(Limits::depth(6))).nodes;
+            let mut plain = Engine::new();
+            plain.allow_lmp = false;
+            fresh_nodes += plain.search(&next, Request::new(Limits::depth(6))).nodes;
         }
         let (carried, fresh) = (carried_nodes, fresh_nodes);
 
@@ -2950,6 +3143,7 @@ mod tests {
         // applies to the reductions.
         s.allow_rfp = false;
         s.allow_ffp = false;
+        s.allow_lmp = false;
         let stats = deepen(pos, Request::new(Limits::depth(depth)), &mut s);
         Reduced { reductions: s.lmr_reductions, stats }
     }
@@ -4033,6 +4227,216 @@ mod tests {
 
     // ------------------------------------------- forward futility pruning (#68)
 
+    // ------------------------------------------------------- late move pruning (#74)
+
+    fn lmp(pos: &Position, depth: u32, allow: bool) -> (u64, i32, u64, u64) {
+        let t = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &t);
+        s.allow_lmp = allow;
+        let st = deepen(pos, Request::new(Limits::depth(depth)), &mut s);
+        (st.nodes, st.best.map(|(_, x)| x).unwrap_or(0), s.lmp_pruned, s.lmp_considered)
+    }
+
+    // One call of the predicate, on the first quiet move of a position, with everything the
+    // caller normally supplies. Returns the searcher too, so a test can read the counters.
+    fn lmp_call(fen: &str, depth: u32, alpha: i32, rank: usize) -> bool {
+        let p = Position::from_fen(fen).unwrap();
+        let mv = *p.legal_moves().iter().find(|&&m| is_quiet(&p, m)).expect("a quiet move");
+        let t = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &t);
+        let eval = if p.in_check() { None } else { Some(evaluate(&p)) };
+        s.late_move_pruning(&p, mv, depth, alpha, eval, rank, false, 1)
+    }
+
+    #[test]
+    fn switched_off_the_rank_cut_changes_nothing_at_all() {
+        // The inert control at unit level: it says the brick is *switched off* rather than
+        // merely quiet. A gate that never opens reads as a node ratio of 1.0000 exactly, which
+        // to a quick eye looks like a brick that costs nothing.
+        for (nature, fen) in NATURES {
+            let p = Position::from_fen(fen).unwrap();
+            for depth in 4..=7u32 {
+                let (nodes, _, pruned, considered) = lmp(&p, depth, false);
+                assert_eq!(pruned, 0, "{nature} d{depth}: the cut fired while disabled");
+                assert_eq!(considered, 0, "{nature} d{depth}: the gate was reached anyway");
+                let (again, ..) = lmp(&p, depth, false);
+                assert_eq!(nodes, again, "{nature} d{depth}: the disabled search is not stable");
+            }
+        }
+    }
+
+    #[test]
+    fn the_rank_cut_skips_moves_and_saves_the_subtree() {
+        // What the brick *is*, pinned by node count rather than by score: a score cannot see
+        // whether a subtree was visited, which is the entire claim.
+        for (nature, fen) in NATURES {
+            let p = Position::from_fen(fen).unwrap();
+            let (with, _, pruned, considered) = lmp(&p, 8, true);
+            let (without, ..) = lmp(&p, 8, false);
+            assert!(considered > 0, "{nature}: the gate was never reached");
+            assert!(pruned > 0, "{nature}: the gate opened {considered} times and never cut");
+            assert!(
+                with < without,
+                "{nature}: the cut skipped {pruned} moves and searched {with} nodes against \
+                 {without}: it fired, but it saved nothing",
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_move_is_never_skipped_on_rank() {
+        // A node that skipped every move would return a score no move produced. The guard reads
+        // `searched`, not `rank`, and the difference is the whole point: a rank advances whether
+        // or not the move was played, so a node whose earlier moves were all pruned would look
+        // as though it had searched them.
+        let p = Position::from_fen(NATURES[1].1).unwrap();
+        let mv = *p.legal_moves().iter().find(|&&m| is_quiet(&p, m)).expect("a quiet move");
+        let t = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &t);
+        let eval = Some(evaluate(&p));
+        // A rank far past any threshold, so only the `searched` guard can refuse.
+        assert!(
+            !s.late_move_pruning(&p, mv, 1, 0, eval, 60, false, 0),
+            "the first move of a node was skipped",
+        );
+        assert!(
+            s.late_move_pruning(&p, mv, 1, 0, eval, 60, false, 1),
+            "precondition: with one move searched the same call must cut, or the assertion \
+             above passes for the wrong reason",
+        );
+    }
+
+    #[test]
+    fn the_rank_cut_refuses_checks_captures_and_mate_bounds() {
+        // Four guards, each closing a different way the bet fails, and each checked against a
+        // control that fires — a `false` proves nothing on its own.
+        let p = Position::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1").unwrap();
+        let t = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &t);
+        let eval = Some(evaluate(&p));
+        let quiet = *p.legal_moves().iter().find(|&&m| is_quiet(&p, m)).expect("a quiet move");
+        let capture = *p.legal_moves().iter().find(|&&m| !is_quiet(&p, m)).expect("a capture");
+        assert!(
+            s.late_move_pruning(&p, quiet, 1, 0, eval, 60, false, 1),
+            "precondition: this move must be skipped, or none of the refusals prove anything",
+        );
+        assert!(!s.late_move_pruning(&p, quiet, 1, 0, eval, 60, true, 1), "a checking move was skipped");
+        assert!(!s.late_move_pruning(&p, capture, 1, 0, eval, 60, false, 1), "a capture was skipped");
+        assert!(
+            !s.late_move_pruning(&p, quiet, 1, MATE - 5, eval, 60, false, 1),
+            "the cut fired against a mate-magnitude alpha",
+        );
+        // `None` is how a node in check reaches this predicate — see the comment on the guard.
+        assert!(!s.late_move_pruning(&p, quiet, 1, 0, None, 60, false, 1), "no evaluation, no cut");
+    }
+
+    #[test]
+    fn the_rank_threshold_grows_with_the_depth_it_covers() {
+        // `LMP_BASE` argues the growth: the deeper the subtree being skipped, the more the
+        // ordering's verdict has to be trusted. On the two previous bricks of this family that
+        // argument shipped with no assertion behind it, and mutating the growth away left the
+        // whole suite green both times. Not a third time.
+        let fen = NATURES[1].1;
+        // The growth as one fact about one rank: what the shallowest depth skips, the ceiling
+        // must search. A flat threshold makes these two calls agree.
+        let between = LMP_BASE + (LMP_MAX_DEPTH * LMP_MAX_DEPTH) as usize - 1;
+        assert!(
+            lmp_call(fen, 1, 0, between),
+            "at depth 1 a move at rank {between} was searched",
+        );
+        assert!(
+            !lmp_call(fen, LMP_MAX_DEPTH, 0, between),
+            "the same rank was skipped at depth {LMP_MAX_DEPTH}: the threshold is not growing",
+        );
+        // And the boundary at every depth, since an off-by-one in the square would clear the
+        // pair above at every depth it has.
+        for depth in 1..=LMP_MAX_DEPTH {
+            let threshold = LMP_BASE + (depth * depth) as usize;
+            assert!(
+                lmp_call(fen, depth, 0, threshold),
+                "at depth {depth} a move exactly at the threshold {threshold} was searched",
+            );
+            assert!(
+                !lmp_call(fen, depth, 0, threshold - 1),
+                "at depth {depth} a move one rank short of {threshold} was skipped",
+            );
+        }
+    }
+
+    #[test]
+    fn the_rank_ceiling_is_where_the_cut_stops() {
+        // The gate that keeps the bet cheap: a move skipped one ply deeper hides a subtree one
+        // ply larger. The rank is set far past any threshold so that the threshold cannot be
+        // what refuses the deeper call — otherwise this would test the growth under the
+        // ceiling's name.
+        let fen = NATURES[1].1;
+        assert!(
+            lmp_call(fen, LMP_MAX_DEPTH, 0, 60),
+            "precondition: at the ceiling the cut must still fire",
+        );
+        assert!(
+            !lmp_call(fen, LMP_MAX_DEPTH + 1, 0, 60),
+            "the cut fired one ply past its ceiling",
+        );
+    }
+
+    #[test]
+    fn the_ceiling_stays_within_reach_of_the_evaluation_gate() {
+        // **A relationship between two constants sitting far apart**, and the sweep found it the
+        // hard way: raising this cut's ceiling to 4 changed nothing at all, because it reads
+        // `static_eval` to learn whether the node is in check and `static_eval_for` returns
+        // `None` past `max(RFP_MAX_DEPTH, FFP_MAX_DEPTH)`. Past that, `None` means "not
+        // computed" rather than "in check", and this cut declines for the wrong reason.
+        //
+        // Asserted rather than commented, because a later change raising either futility ceiling
+        // would silently extend this brick's reach — and lowering one would silently shorten it.
+        let evaluation_ceiling = RFP_MAX_DEPTH.max(FFP_MAX_DEPTH);
+        assert!(
+            LMP_MAX_DEPTH <= evaluation_ceiling,
+            "LMP_MAX_DEPTH is {LMP_MAX_DEPTH} but the evaluation gate stops at \
+             {evaluation_ceiling}: every node between the two refuses the cut because it has no \
+             evaluation, not because it is in check",
+        );
+    }
+
+    #[test]
+    fn the_rank_cut_loses_no_mate_and_invents_none() {
+        // The two signs counted apart. Folding them with `.abs()` made this test vacuous twice
+        // in this file: a pair going from a mate delivered to one suffered satisfied every
+        // assertion, and on one brick the fold was the only thing keeping the counter non-zero.
+        let delivers = |x: i32| x > MATE_THRESHOLD;
+        let suffers = |x: i32| x < -MATE_THRESHOLD;
+        let (mut delivered, mut suffered) = (0u32, 0u32);
+        for fen in [
+            "r5rk/5p1p/5R2/4B3/8/8/7P/7K w - - 0 1",
+            "2bqkbn1/2pppp2/np2N3/r3P1p1/p2N2B1/5Q2/PPPPKPP1/RNB2r2 w - - 0 1",
+            "kbK5/pp6/1P6/8/8/8/8/R7 w - - 0 1",
+            "7k/8/8/8/8/8/1R6/R6K b - - 0 1",
+        ] {
+            let p = Position::from_fen(fen).unwrap();
+            for depth in 3..=8u32 {
+                let (_, plain, ..) = lmp(&p, depth, false);
+                let (_, cut, pruned, _) = lmp(&p, depth, true);
+                if delivers(plain) {
+                    assert!(delivers(cut), "{fen} d{depth}: the cut lost a mate, {cut} vs {plain}");
+                    delivered += u32::from(pruned > 0);
+                }
+                if delivers(cut) {
+                    assert!(delivers(plain), "{fen} d{depth}: it invented a mate, {cut} vs {plain}");
+                }
+                if suffers(plain) {
+                    assert!(suffers(cut), "{fen} d{depth}: it missed a mate against it, {cut} vs {plain}");
+                    suffered += u32::from(pruned > 0);
+                }
+                if suffers(cut) {
+                    assert!(suffers(plain), "{fen} d{depth}: it believed itself mated, {cut} vs {plain}");
+                }
+            }
+        }
+        assert!(delivered > 0, "no pair both delivered a mate and skipped a move");
+        assert!(suffered > 0, "no pair was both mated and skipped a move");
+    }
+
     fn ffp(pos: &Position, depth: u32, allow: bool) -> (u64, i32, u64, u64, u64) {
         let t = Table::new();
         let mut s = Searcher::new(MoveOrder::Full, None, &t);
@@ -4486,6 +4890,7 @@ mod tests {
         // applies to the reductions.
         s.allow_rfp = false;
         s.allow_ffp = false;
+        s.allow_lmp = false;
         let stats = deepen(pos, Request::new(Limits::depth(depth)), &mut s);
         Extended {
             stats,
@@ -4681,6 +5086,11 @@ mod tests {
         let table = Table::new();
         let mut s = Searcher::new(MoveOrder::Full, None, &table);
         s.allow_see_pruning = prune;
+        // This harness isolates one brick, so the rank cut is off. Left on, it skips quiet moves
+        // on both sides of the comparison and the equality below reads what the *pair* does under
+        // a name that claims otherwise — the reasoning `search_reducing` already applies to the
+        // futility cuts. Measured: with it on, kiwipete at depth 6 scores -60 against -55.
+        s.allow_lmp = false;
         let stats = deepen(pos, Request::new(Limits::depth(depth)), &mut s);
         (stats.best, stats.nodes)
     }
