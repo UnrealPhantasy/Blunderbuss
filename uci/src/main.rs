@@ -305,6 +305,11 @@ impl Uci {
             let on = raw.eq_ignore_ascii_case("true");
             self.engine.set_book(if on { load_book() } else { None });
         }
+        if key.eq_ignore_ascii_case("threads") {
+            if let Ok(threads) = raw.parse::<usize>() {
+                self.engine.set_threads(threads);
+            }
+        }
     }
 
     /// Handle one UCI command line and return what to print (and whether to quit).
@@ -315,6 +320,9 @@ impl Uci {
             Some("uci") => Response::lines(vec![
                 "id name Blunderbuss".to_string(),
                 "id author UnrealPhantasy".to_string(),
+                // Announced with `default 1` on purpose: a GUI that never touches the option
+                // gets the engine every published measurement was taken on.
+                "option name Threads type spin default 1 min 1 max 64".to_string(),
                 // Standard UCI name, so an arena that wants the book off can say so without
                 // knowing anything about this engine.
                 "option name OwnBook type check default true".to_string(),
@@ -460,7 +468,49 @@ mod tests {
     }
 
     #[test]
+    fn uci_announces_the_threads_option() {
+        // The exact line, not merely "a line mentioning Threads": a GUI parses `type spin` and
+        // the three bounds, and `default 1` is the load-bearing token — it is what makes a GUI
+        // that never touches the option get the engine every published figure was measured on.
+        let out = Uci::new().handle("uci");
+        assert!(
+            out.lines.iter().any(|l| l == "option name Threads type spin default 1 min 1 max 64"),
+            "the Threads option was not announced verbatim: {:?}",
+            out.lines,
+        );
+    }
+
+    #[test]
+    fn setoption_threads_reaches_the_engine() {
+        // The +25 lines this brick adds to `uci/` had no test at all: the behaviour was there
+        // and verified by hand, which is not the same as a suite that would notice it leaving.
+        let mut uci = quick_uci();
+        assert_eq!(uci.engine.threads(), 1, "precondition: the default must be one");
+        uci.handle("setoption name Threads value 4");
+        assert_eq!(uci.engine.threads(), 4, "the option did not reach the engine");
+        // The keywords and the option name are matched case-insensitively, since a GUI is free
+        // to send `Name`/`Value`/`Threads` in any case. The *command* is not, here as for every
+        // other command in this file — the protocol writes them lowercase and no GUI varies it.
+        uci.handle("setoption NAME threads VALUE 2");
+        assert_eq!(uci.engine.threads(), 2, "the keywords are matched case-sensitively");
+    }
+
+    #[test]
+    fn an_unknown_option_leaves_the_engine_alone() {
+        // Ignored rather than refused, and the assertion is that nothing else moved either:
+        // refusing would break a session over a setting we do not have.
+        let mut uci = quick_uci();
+        uci.handle("setoption name Threads value 4");
+        uci.handle("setoption name Hash value 128");
+        assert_eq!(uci.engine.threads(), 4, "an unknown option disturbed a known one");
+        assert!(!uci.handle("setoption name Hash value 128").quit, "an unknown option quit");
+    }
+
+    #[test]
     fn a_malformed_setoption_is_ignored_rather_than_fatal() {
+        // Both options are swept in one test rather than two: #64 and #71 introduced
+        // `set_option` independently and inherited the same defect, so a merge keeping
+        // either version alone would silently drop one of the two closing assertions.
         // `setoption value false name OwnBook` **panicked** before this test existed: `name`
         // and `value` are located independently, so the reversed order inverts the slice range
         // and indexing it aborts the process. A panic in `handle` is a lost game rather than a
@@ -487,11 +537,17 @@ mod tests {
             "setoption name OwnBook value",
             "setoption value false name OwnBook",
             "setoption value name",
+            "setoption name Threads",
+            "setoption name Threads value",
+            "setoption value 4 name Threads",
+            "setoption name Threads value not-a-number",
         ] {
             let out = uci.handle(line);
             assert!(out.lines.is_empty(), "{line}: a malformed option answered {:?}", out.lines);
             assert!(!out.quit, "{line}: a malformed option ended the session");
         }
+        assert_eq!(uci.engine.threads(), 1, "a malformed option changed the thread count");
+
         // And the option is still where it was. Observable without a getter: with the book on,
         // the start position is answered *from the book*, so the search never runs and not one
         // `info` line is emitted.
