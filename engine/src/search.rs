@@ -386,6 +386,15 @@ impl Engine {
         self.threads = threads.max(1);
     }
 
+    /// How many searchers this engine runs at once.
+    ///
+    /// Exists so that [`set_threads`](Engine::set_threads) is *observable*: a UCI option that
+    /// nothing can read back is an option no test can assert reached the engine, and this one
+    /// arrived with none.
+    pub fn threads(&self) -> usize {
+        self.threads
+    }
+
     /// Forget everything learned so far. Called at the start of a **new game**, never
     /// between moves of the same one.
     pub fn new_game(&mut self) {
