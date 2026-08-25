@@ -232,6 +232,29 @@ impl Uci {
         }
     }
 
+    /// `setoption name <name> value <value>`, the only shape the protocol uses.
+    ///
+    /// Unknown options are ignored rather than refused: the protocol expects an engine to
+    /// tolerate whatever a GUI sends, and refusing would break a session over a setting we do
+    /// not have.
+    fn set_option(&mut self, tokens: &[&str]) {
+        let name = tokens.iter().position(|t| t.eq_ignore_ascii_case("name"));
+        let value = tokens.iter().position(|t| t.eq_ignore_ascii_case("value"));
+        let (Some(n), Some(v)) = (name, value) else { return };
+        // `get` rather than indexing: `name` and `value` are located independently, so a line
+        // that puts them the wrong way round — `setoption value 4 name Threads` — inverts the
+        // range. Indexing panics there, and a panic in `handle` takes the process down, which
+        // during a game is a lost game rather than a rejected command. That is the opposite of
+        // what the comment above promises.
+        let Some(key) = tokens.get(n + 1..v).map(|k| k.join(" ")) else { return };
+        let Some(raw) = tokens.get(v + 1) else { return };
+        if key.eq_ignore_ascii_case("threads") {
+            if let Ok(threads) = raw.parse::<usize>() {
+                self.engine.set_threads(threads);
+            }
+        }
+    }
+
     /// Handle one UCI command line and return what to print (and whether to quit).
     /// Unknown or empty commands are ignored, as the protocol requires.
     fn handle(&mut self, line: &str) -> Response {
@@ -240,9 +263,16 @@ impl Uci {
             Some("uci") => Response::lines(vec![
                 "id name Blunderbuss".to_string(),
                 "id author UnrealPhantasy".to_string(),
+                // Announced with `default 1` on purpose: a GUI that never touches the option
+                // gets the engine every published measurement was taken on.
+                "option name Threads type spin default 1 min 1 max 64".to_string(),
                 "uciok".to_string(),
             ]),
             Some("isready") => Response::lines(vec!["readyok".to_string()]),
+            Some("setoption") => {
+                self.set_option(&tokens[1..]);
+                Response::none()
+            }
             Some("ucinewgame") => {
                 self.position = Position::initial();
                 self.history.clear();
@@ -375,6 +405,68 @@ mod tests {
         assert!(out.lines.iter().any(|l| l.starts_with("id name")));
         assert!(out.lines.iter().any(|l| l.starts_with("id author")));
         assert!(!out.quit);
+    }
+
+    #[test]
+    fn uci_announces_the_threads_option() {
+        // The exact line, not merely "a line mentioning Threads": a GUI parses `type spin` and
+        // the three bounds, and `default 1` is the load-bearing token — it is what makes a GUI
+        // that never touches the option get the engine every published figure was measured on.
+        let out = Uci::new().handle("uci");
+        assert!(
+            out.lines.iter().any(|l| l == "option name Threads type spin default 1 min 1 max 64"),
+            "the Threads option was not announced verbatim: {:?}",
+            out.lines,
+        );
+    }
+
+    #[test]
+    fn setoption_threads_reaches_the_engine() {
+        // The +25 lines this brick adds to `uci/` had no test at all: the behaviour was there
+        // and verified by hand, which is not the same as a suite that would notice it leaving.
+        let mut uci = quick_uci();
+        assert_eq!(uci.engine.threads(), 1, "precondition: the default must be one");
+        uci.handle("setoption name Threads value 4");
+        assert_eq!(uci.engine.threads(), 4, "the option did not reach the engine");
+        // The keywords and the option name are matched case-insensitively, since a GUI is free
+        // to send `Name`/`Value`/`Threads` in any case. The *command* is not, here as for every
+        // other command in this file — the protocol writes them lowercase and no GUI varies it.
+        uci.handle("setoption NAME threads VALUE 2");
+        assert_eq!(uci.engine.threads(), 2, "the keywords are matched case-sensitively");
+    }
+
+    #[test]
+    fn an_unknown_option_leaves_the_engine_alone() {
+        // Ignored rather than refused, and the assertion is that nothing else moved either:
+        // refusing would break a session over a setting we do not have.
+        let mut uci = quick_uci();
+        uci.handle("setoption name Threads value 4");
+        uci.handle("setoption name Hash value 128");
+        assert_eq!(uci.engine.threads(), 4, "an unknown option disturbed a known one");
+        assert!(!uci.handle("setoption name Hash value 128").quit, "an unknown option quit");
+    }
+
+    #[test]
+    fn a_malformed_setoption_is_ignored_rather_than_fatal() {
+        // `setoption value 4 name Threads` **panicked** before this test existed: `name` and
+        // `value` are located independently, so the reversed order inverts the slice range and
+        // indexing it aborts the process. A panic in `handle` is a lost game rather than a
+        // rejected command, which is the opposite of what the protocol asks of an engine.
+        let mut uci = quick_uci();
+        for line in [
+            "setoption",
+            "setoption name",
+            "setoption name Threads",
+            "setoption name Threads value",
+            "setoption value 4 name Threads",
+            "setoption value name",
+            "setoption name Threads value not-a-number",
+        ] {
+            let out = uci.handle(line);
+            assert!(out.lines.is_empty(), "{line}: a malformed option answered {:?}", out.lines);
+            assert!(!out.quit, "{line}: a malformed option ended the session");
+        }
+        assert_eq!(uci.engine.threads(), 1, "a malformed option changed the thread count");
     }
 
     #[test]

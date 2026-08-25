@@ -15,6 +15,7 @@ use crate::evaluation::{evaluate, phase};
 use crate::ordering::{is_quiet, mvv_lva, order_moves, see, KillerSlots, Killers};
 use crate::position::{Move, Piece, Position};
 use crate::transposition::{Bound, Table};
+use std::sync::atomic::{AtomicBool, Ordering as Atomicity};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
@@ -316,6 +317,20 @@ pub struct SearchStats {
     /// the lower of the two: about half of the matches are too shallow to cut off
     /// and contribute move ordering only.
     pub table_cutoff_rate: f64,
+    /// Nodes searched by the **other** threads, zero when searching alone.
+    ///
+    /// Kept apart from `nodes` on purpose: `nodes` is the reporting thread's, which is what
+    /// every published measurement in this project refers to, and merging the two would
+    /// reprice all of them. This field is how a caller sees that the helpers ran at all.
+    pub helper_nodes: u64,
+    /// How many helpers ended by **abandoning** their search rather than by finishing it.
+    ///
+    /// The instrument for "no helper kept working after the answer was in", and the reason it
+    /// is a counter rather than a stopwatch: the property is about what a thread *did*, and a
+    /// wall-clock bound on a shared machine reports a bug that is not there. Test-only — the
+    /// increment happens once per helper, at the join, never on a search path.
+    #[cfg(test)]
+    pub helpers_aborted: usize,
 }
 
 /// Whether `mv` promotes a pawn to a queen.
@@ -387,6 +402,11 @@ pub fn search_timed(pos: &Position, limits: Limits) -> SearchStats {
 /// pay the search cost. Playing does not care; reporting does.
 pub struct Engine {
     table: Table,
+    /// How many searchers run at once. **One by default**, and that default is load-bearing:
+    /// every Elo figure and every node count this project has published was taken on the
+    /// single-threaded path, and a default that went through the parallel one would silently
+    /// reprice all of them.
+    threads: usize,
 }
 
 impl Default for Engine {
@@ -397,7 +417,36 @@ impl Default for Engine {
 
 impl Engine {
     pub fn new() -> Engine {
-        Engine { table: Table::new() }
+        Engine { table: Table::new(), threads: 1 }
+    }
+
+    /// How many searchers to run at once. Clamped to at least one — a request for zero
+    /// threads is a caller mistake, not an instruction to do nothing.
+    ///
+    /// **What changes at more than one, and it is not only speed.** The single-threaded path
+    /// is deterministic: the same position at the same depth searches the same nodes, every
+    /// run. That is not a detail of this engine, it is the foundation every measurement
+    /// instrument in this project stands on — `banc.sh` sorts bricks by node count at fixed
+    /// depth, `cpu-cost.sh` divides CPU time by nodes, and the oracle protocol compares
+    /// evaluations position by position. All of them are published from the default path.
+    ///
+    /// Above one thread, none of that holds: helpers race for the shared table, so node
+    /// counts, `helper_nodes` and the table hit rates all vary run to run on the same input.
+    /// The results stay *correct* — the moves are legal and the scores are real — but they
+    /// stop being **reproducible**, and an instrument that is not reproducible is not an
+    /// instrument. Set this above one to play faster on a machine with cores to spare; never
+    /// to take a measurement.
+    pub fn set_threads(&mut self, threads: usize) {
+        self.threads = threads.max(1);
+    }
+
+    /// How many searchers this engine runs at once.
+    ///
+    /// Exists so that [`set_threads`](Engine::set_threads) is *observable*: a UCI option that
+    /// nothing can read back is an option no test can assert reached the engine, and this one
+    /// arrived with none.
+    pub fn threads(&self) -> usize {
+        self.threads
     }
 
     /// Forget everything learned so far. Called at the start of a **new game**, never
@@ -409,9 +458,126 @@ impl Engine {
     /// Search `pos`. Everything a caller can ask for travels in [`Request`]; what
     /// the search learns stays here, ready for the next move.
     pub fn search(&mut self, pos: &Position, request: Request) -> SearchStats {
-        let mut searcher =
-            Searcher::new(MoveOrder::Full, request.limits.deadline, &mut self.table);
-        deepen(pos, request, &mut searcher)
+        if self.threads == 1 {
+            // Kept as a distinct path rather than emulated by a pool of one: it is the path
+            // every published measurement was taken on, and it allocates nothing.
+            let mut searcher =
+                Searcher::new(MoveOrder::Full, request.limits.deadline, &self.table);
+            return deepen(pos, request, &mut searcher);
+        }
+        self.search_parallel(pos, request)
+    }
+
+    /// Lazy SMP: N searchers on one position, sharing nothing but the transposition table.
+    ///
+    /// There is no work splitting and no tree synchronisation. The threads diverge because the
+    /// table they read differs from moment to moment, and each one's misses are the other's
+    /// hits — a helper that happens to search a subtree first leaves its conclusion behind,
+    /// and the reporting thread finds it already answered. That is the entire mechanism, and
+    /// it is why the simple version turned out to be competitive with the complicated ones.
+    ///
+    /// Rust idiom: `std::thread::scope` gives threads that may **borrow** from this stack
+    /// frame — `pos`, the table, the stop flag — because the scope cannot return until they
+    /// have all been joined. Without it, sharing anything not `'static` would need an `Arc`
+    /// and an allocation per search.
+    fn search_parallel(&self, pos: &Position, request: Request) -> SearchStats {
+        let deadline = request.limits.deadline;
+        let max_depth = request.limits.max_depth;
+        let history = request.history;
+        let table = &self.table;
+        let stop = AtomicBool::new(false);
+        #[cfg(test)]
+        let aborted_helpers = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            // Rust idiom: `move` closures move *everything* they name, so the flag is bound to a
+            // reference first. Copying a `&AtomicBool` into each closure is what shares it;
+            // naming `stop` directly would move the flag into the first helper.
+            let stop = &stop;
+            #[cfg(test)]
+            let aborted_helpers = &aborted_helpers;
+            let mut helpers = Vec::with_capacity(self.threads - 1);
+            for id in 1..self.threads {
+                helpers.push(scope.spawn(move || {
+                    let mut s = Searcher::new(MoveOrder::Full, deadline, table);
+                    s.stop = Some(stop);
+                    // **Depth diversification, and it is not cosmetic.** With every thread
+                    // running the identical loop from depth 1, they explore the same tree at the
+                    // same moment: they duplicate each other's work and fight over the same
+                    // slots. Measured, that made eight threads *slower* than one. Starting each
+                    // helper deeper spreads them out in time, so a helper is usually working on a
+                    // region the reporting thread has not reached yet — which is the whole point,
+                    // since what it leaves behind is only useful if it got there first.
+                    s.start_depth = 1 + (id as u32 % 3);
+                    let helper = Request {
+                        limits: Limits { max_depth, deadline },
+                        history,
+                        progress: None,
+                    };
+                    // A helper reports nothing. Its whole contribution is what it leaves in
+                    // the table.
+                    let nodes = deepen(pos, helper, &mut s).nodes;
+                    #[cfg(test)]
+                    if s.aborted {
+                        aborted_helpers.fetch_add(1, Atomicity::Relaxed);
+                    }
+                    nodes
+                }));
+            }
+            let mut searcher = Searcher::new(MoveOrder::Full, deadline, table);
+            searcher.stop = Some(stop);
+            let mut stats = deepen(pos, request, &mut searcher);
+            // The answer is in. Everything still running is now working on a question that has
+            // been answered, and `scope` cannot return until they notice.
+            stop.store(true, Atomicity::Relaxed);
+
+            // **The answer is this thread's, and deliberately so.** Taking the deepest thread's
+            // result instead was tried and reverted: it makes the engine announce a `bestmove`
+            // at a depth no `info` line ever reported, which is not a cosmetic problem here —
+            // every depth measurement in this project reads those lines out of the PGN, so the
+            // instruments would under-read the engine's own depth. That trade would be worth
+            // making for a real speedup. There is none to pay for it (see the PR), so the
+            // consistent version is the one that ships.
+            //
+            // Joined rather than dropped, so the helpers' work is *visible*. `nodes` stays this
+            // thread's — every published measurement is that number — and the total of the
+            // others goes in its own field.
+            //
+            // **A panicking helper is loud in debug and survivable in release**, and the
+            // asymmetry is the point. The two `debug_assert!`s in `pack` are reachable from a
+            // helper: swallowing a panic in debug would hide exactly what they exist to say,
+            // and it would do it silently, since the search still returns a normal-looking
+            // result. In release those assertions are compiled out, so a panic there is a bug
+            // we have no better answer to mid-game — and the reporting thread's search is
+            // complete and correct on its own, so the only casualty is `helper_nodes`. Killing
+            // the process would trade a wrong diagnostic count for a lost game.
+            //
+            // Rust idiom: `join` hands back `Result<u64, Box<dyn Any + Send>>`, where the error
+            // side carries the panic payload itself. `resume_unwind` re-raises *that* payload
+            // on this thread rather than a fresh panic, so the original message and location
+            // survive; it never returns, which is why the arm type-checks as an `Option`.
+            stats.helper_nodes = helpers
+                .into_iter()
+                .filter_map(|h| match h.join() {
+                    Ok(nodes) => Some(nodes),
+                    Err(panic) => {
+                        #[cfg(debug_assertions)]
+                        {
+                            std::panic::resume_unwind(panic)
+                        }
+                        #[cfg(not(debug_assertions))]
+                        {
+                            drop(panic);
+                            None
+                        }
+                    }
+                })
+                .sum();
+            #[cfg(test)]
+            {
+                stats.helpers_aborted = aborted_helpers.load(Atomicity::Relaxed);
+            }
+            stats
+        })
     }
 }
 
@@ -443,7 +609,7 @@ fn deepen(pos: &Position, mut request: Request, searcher: &mut Searcher) -> Sear
 
     let mut best: Option<(Move, i32)> = None;
     let mut completed = 0;
-    for depth in 1..=max_depth {
+    for depth in searcher.start_depth.min(max_depth)..=max_depth {
         // Order the previous iteration's best move first — the whole point of
         // deepening, since a good first move causes early cutoffs below.
         let pv = best.map(|(mv, _)| mv);
@@ -506,8 +672,12 @@ fn deepen(pos: &Position, mut request: Request, searcher: &mut Searcher) -> Sear
         best,
         depth: completed,
         nodes: searcher.nodes,
-        table_key_match_rate: searcher.table.key_match_rate(),
-        table_cutoff_rate: searcher.table.cutoff_rate(),
+        table_key_match_rate: searcher.rate(searcher.table_hits),
+        table_cutoff_rate: searcher.rate(searcher.table_cutoffs),
+        helper_nodes: 0,
+        // A search with no helpers has none to abandon; `search_parallel` overwrites it.
+        #[cfg(test)]
+        helpers_aborted: 0,
     }
 }
 
@@ -565,10 +735,11 @@ struct Searcher<'a> {
     /// reuses what iteration N learned, and the *next move* reuses what this whole
     /// search learned.
     ///
-    /// Idiom: `&'a mut` rather than an owned `Table` — the searcher works on the
-    /// caller's table for the duration of the search and gives it back. The lifetime
-    /// `'a` is what tells the compiler the table must outlive the searcher.
-    table: &'a mut Table,
+    /// Idiom: `&'a` and not `&'a mut`. A shared reference is what lets **several searchers
+    /// work on one table at the same time**, which is the whole of Lazy SMP; the table's own
+    /// methods take `&self` and do their synchronising internally, per slot. The lifetime `'a`
+    /// still says the table must outlive the searcher.
+    table: &'a Table,
     /// Zobrist keys of the positions played *before* the search started. A draw by
     /// repetition depends on the game, not on the board alone, so the search cannot
     /// see one without being told what came before.
@@ -576,6 +747,24 @@ struct Searcher<'a> {
     /// Zobrist keys along the branch currently being explored, pushed on the way
     /// down and popped on the way back up.
     path: Vec<u64>,
+    /// Set by whichever searcher finishes first, watched by all of them.
+    ///
+    /// Needed because the searchers do not all stop for the same reason: the reporting one can
+    /// finish early — a mate found, the depth cap reached — and without this the helpers would
+    /// keep going to the deadline, so `scope` would block and the engine would spend its whole
+    /// budget on a move it had already decided. `None` when searching alone.
+    stop: Option<&'a AtomicBool>,
+    /// The first depth this searcher's deepening loop asks for. One for the thread that
+    /// reports; deeper for helpers, so they spread out instead of duplicating.
+    start_depth: u32,
+    /// Probe counters, per searcher and deliberately not atomic.
+    ///
+    /// They used to live on the table, where a single `fetch_add` per probe put every thread in
+    /// a fight over one cache line — measured: `go depth 11` cost 4.01 s on eight threads with
+    /// them there and 1.01 s without. Counting is a diagnostic, so it belongs where it is free.
+    table_probes: u64,
+    table_hits: u64,
+    table_cutoffs: u64,
     /// How many times the reverse futility cut was **taken**, and how many times it was
     /// **considered**. **Tests only.**
     ///
@@ -743,13 +932,18 @@ struct Searcher<'a> {
 }
 
 impl<'a> Searcher<'a> {
-    fn new(order: MoveOrder, deadline: Option<Instant>, table: &'a mut Table) -> Searcher<'a> {
+    fn new(order: MoveOrder, deadline: Option<Instant>, table: &'a Table) -> Searcher<'a> {
         Searcher {
             nodes: 0,
             order,
             deadline,
             aborted: false,
             table,
+            stop: None,
+            start_depth: 1,
+            table_probes: 0,
+            table_hits: 0,
+            table_cutoffs: 0,
             history: Vec::new(),
             path: Vec::new(),
             #[cfg(test)]
@@ -811,6 +1005,20 @@ impl<'a> Searcher<'a> {
         }
     }
 
+    /// A count as a fraction of the probes made, or zero when nothing was probed.
+    ///
+    /// Note what these rates now are and were not before: **this searcher's** view. Under Lazy
+    /// SMP each thread sees its own hit rate, and the reporting thread's is the one that ends up
+    /// in [`SearchStats`] — which is the honest reading, since it is also the thread whose node
+    /// count is reported.
+    fn rate(&self, count: u64) -> f64 {
+        if self.table_probes == 0 {
+            0.0
+        } else {
+            count as f64 / self.table_probes as f64
+        }
+    }
+
     /// The killers that apply to a node at `ply` — none unless the full ordering is on.
     fn killers_at(&self, ply: i32) -> KillerSlots {
         if self.order == MoveOrder::Full {
@@ -858,6 +1066,15 @@ impl<'a> Searcher<'a> {
             }
         }
         if self.nodes % 2048 == 0 {
+            // Checked before the clock: a searcher told to stop should not first pay for a
+            // `Instant::now()`, and more importantly a helper whose reporting thread has already
+            // answered has nothing left to contribute.
+            if let Some(stop) = self.stop {
+                if stop.load(Atomicity::Relaxed) {
+                    self.aborted = true;
+                    return;
+                }
+            }
             if let Some(deadline) = self.deadline {
                 if Instant::now() >= deadline {
                     self.aborted = true;
@@ -1248,6 +1465,9 @@ impl<'a> Searcher<'a> {
 
         // Have we been here before, by another move order or in an earlier iteration?
         let hit = self.table.probe(key, depth, alpha, beta, ply);
+        self.table_probes += 1;
+        self.table_hits += u64::from(hit.matched);
+        self.table_cutoffs += u64::from(hit.cutoff.is_some());
         if let Some(score) = hit.cutoff {
             return score;
         }
@@ -1605,8 +1825,8 @@ mod tests {
     // different move depending on how busy the machine is — the test would be measuring
     // the machine. A node count cuts at exactly the same place every run.
     fn search_cut_at(pos: &Position, max_depth: u32, node_ceiling: u64) -> (SearchStats, Vec<u32>) {
-        let mut table = Table::new();
-        let mut searcher = Searcher::new(MoveOrder::Full, None, &mut table);
+        let table = Table::new();
+        let mut searcher = Searcher::new(MoveOrder::Full, None, &table);
         searcher.node_limit = Some(node_ceiling);
         let mut reported = Vec::new();
         let mut report = |p: &Progress| reported.push(p.depth);
@@ -1631,16 +1851,19 @@ mod tests {
     // reductions is what `Engine::search` and `search_timed` give; this is the oracle,
     // and an oracle holds everything else still.
     fn search_fixed(pos: &Position, depth: u32, order: MoveOrder) -> SearchStats {
-        let mut table = Table::new();
-        let mut searcher = Searcher::new(order, None, &mut table);
+        let table = Table::new();
+        let mut searcher = Searcher::new(order, None, &table);
         searcher.allow_lmr = false;
         let best = searcher.root(pos, depth, None).best;
         SearchStats {
             best,
             depth,
             nodes: searcher.nodes,
-            table_key_match_rate: searcher.table.key_match_rate(),
-            table_cutoff_rate: searcher.table.cutoff_rate(),
+            table_key_match_rate: searcher.rate(searcher.table_hits),
+            table_cutoff_rate: searcher.rate(searcher.table_cutoffs),
+            helper_nodes: 0,
+            #[cfg(test)]
+            helpers_aborted: 0,
         }
     }
 
@@ -1654,13 +1877,13 @@ mod tests {
         let best = p.move_from_uci("d1d5").unwrap();
         let mediocre = p.move_from_uci("e1f1").unwrap();
 
-        let mut t1 = Table::new();
-        let overtaken = Searcher::new(MoveOrder::Full, None, &mut t1).root(&p, 3, Some(mediocre));
+        let t1 = Table::new();
+        let overtaken = Searcher::new(MoveOrder::Full, None, &t1).root(&p, 3, Some(mediocre));
         assert!(overtaken.improved, "Rxd5 must overtake the move tried first");
         assert_eq!(overtaken.best.map(|(mv, _)| mv), Some(best));
 
-        let mut t2 = Table::new();
-        let already_best = Searcher::new(MoveOrder::Full, None, &mut t2).root(&p, 3, Some(best));
+        let t2 = Table::new();
+        let already_best = Searcher::new(MoveOrder::Full, None, &t2).root(&p, 3, Some(best));
         assert!(!already_best.improved, "nothing can overtake the best move");
         assert_eq!(already_best.best.map(|(mv, _)| mv), Some(best));
     }
@@ -1812,8 +2035,8 @@ mod tests {
             "precondition: this must be endgame material, phase {}",
             phase(&endgame),
         );
-        let mut table = Table::new();
-        let searcher = Searcher::new(MoveOrder::Full, None, &mut table);
+        let table = Table::new();
+        let searcher = Searcher::new(MoveOrder::Full, None, &table);
         assert!(!searcher.null_move_allowed(&endgame, 7), "no pass in an endgame");
 
         // And a middlegame must allow it, or the guard would be vacuous.
@@ -1861,12 +2084,12 @@ mod tests {
             // would say so. Eight opportunities have to go quiet at once instead of
             // one. Costs 0.5 s, and under the mutation it fails at depth 5.
             for depth in 5..=8 {
-                let mut t1 = Table::new();
-                let mut with = Searcher::new(MoveOrder::Full, None, &mut t1);
+                let t1 = Table::new();
+                let mut with = Searcher::new(MoveOrder::Full, None, &t1);
                 let a = with.root(&p, depth, None);
 
-                let mut t2 = Table::new();
-                let mut without = Searcher::new(MoveOrder::Full, None, &mut t2);
+                let t2 = Table::new();
+                let mut without = Searcher::new(MoveOrder::Full, None, &t2);
                 without.allow_null_move = false;
                 let b = without.root(&p, depth, None);
 
@@ -1888,8 +2111,8 @@ mod tests {
         // Below `1 + R` there is no subtree left to prune, so the pass costs more than
         // it saves.
         let p = Position::initial();
-        let mut table = Table::new();
-        let searcher = Searcher::new(MoveOrder::Full, None, &mut table);
+        let table = Table::new();
+        let searcher = Searcher::new(MoveOrder::Full, None, &table);
         for depth in 0..=NULL_MOVE_REDUCTION + 1 {
             assert!(!searcher.null_move_allowed(&p, depth), "depth {depth} is too shallow");
         }
@@ -1931,8 +2154,8 @@ mod tests {
         )
         .unwrap();
         let nodes = |null_move: bool, depth: u32| {
-            let mut table = Table::new();
-            let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+            let table = Table::new();
+            let mut s = Searcher::new(MoveOrder::Full, None, &table);
             s.allow_null_move = null_move;
             s.allow_lmr = false;
             // Off for the same reason the reductions are: the reverse futility cut declines to
@@ -2007,8 +2230,8 @@ mod tests {
         // `false` handed to the recursive call, invisible from outside, so the nesting
         // is counted instead of assumed.
         let p = Position::initial();
-        let mut table = Table::new();
-        let mut searcher = Searcher::new(MoveOrder::Full, None, &mut table);
+        let table = Table::new();
+        let mut searcher = Searcher::new(MoveOrder::Full, None, &table);
         // Two settings that both matter, and both were wrong in earlier drafts.
         //
         // **Depth 8**, because a pass reduces by `1 + R`: at depth 6 it runs at 3 and
@@ -2219,8 +2442,8 @@ mod tests {
     fn the_path_needs_one_occurrence_and_the_history_needs_two() {
         // The asymmetry itself, on the mechanism — constructing a forced in-tree
         // repetition on the board is fragile, and this is the property that matters.
-        let mut table = Table::new();
-        let mut searcher = Searcher::new(MoveOrder::Full, None, &mut table);
+        let table = Table::new();
+        let mut searcher = Searcher::new(MoveOrder::Full, None, &table);
         assert!(!searcher.is_repetition(42), "an unseen key is not a repetition");
 
         // In the tree: one is enough, because both sides are choosing moves here and
@@ -2245,8 +2468,8 @@ mod tests {
         let p = Position::from_fen(LOST_KING).unwrap();
         let after_ke2 = p.play(p.move_from_uci("e1e2").unwrap());
 
-        let mut table = Table::new();
-        let mut searcher = Searcher::new(MoveOrder::Full, None, &mut table);
+        let table = Table::new();
+        let mut searcher = Searcher::new(MoveOrder::Full, None, &table);
         // Two occurrences, so the position genuinely is scored 0 as a repetition.
         // Asserting that first is the point: with one, this test would pass while
         // exercising nothing — which is exactly what happened when the history
@@ -2365,8 +2588,8 @@ mod tests {
         // questions the first one answered, so almost all of it should come out of the
         // table rather than the tree.
         let p = Position::initial();
-        let mut table = Table::new();
-        let mut searcher = Searcher::new(MoveOrder::Full, None, &mut table);
+        let table = Table::new();
+        let mut searcher = Searcher::new(MoveOrder::Full, None, &table);
         searcher.root(&p, 5, None);
         let first = searcher.nodes;
         searcher.nodes = 0;
@@ -2439,8 +2662,8 @@ mod tests {
         ] {
             let p = Position::from_fen(fen).unwrap();
             let deep = {
-                let mut table = Table::new();
-                let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+                let table = Table::new();
+                let mut s = Searcher::new(MoveOrder::Full, None, &table);
                 s.allow_lmr = false;
                 deepen(&p, Request::new(Limits::depth(4)), &mut s)
             };
@@ -2489,8 +2712,8 @@ mod tests {
 
     // Quiescence from `pos`, on a full window — what a leaf of the main search gets.
     fn quiesce(pos: &Position) -> i32 {
-        let mut table = Table::new();
-        Searcher::new(MoveOrder::Full, None, &mut table).quiescence(pos, -INF, INF, 0)
+        let table = Table::new();
+        Searcher::new(MoveOrder::Full, None, &table).quiescence(pos, -INF, INF, 0)
     }
 
     #[test]
@@ -2676,8 +2899,8 @@ mod tests {
     }
 
     fn search_reducing(pos: &Position, depth: u32, allow: bool) -> Reduced {
-        let mut table = Table::new();
-        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
         s.allow_lmr = allow;
         // This harness isolates one brick, so the reverse futility cut is off: it prunes the
         // same kind of branch, and leaving it on would make the measurement below read what the
@@ -2798,8 +3021,8 @@ mod tests {
         // hand rather than by calling `Engine::search` because asserting on
         // `lmr_reductions` means still holding it afterwards — which is why `deepen`
         // borrows its searcher instead of consuming it.
-        let mut table = Table::new();
-        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
         let stats = deepen(
             &Position::initial(),
             Request::new(Limits::depth(6)),
@@ -2833,8 +3056,8 @@ mod tests {
         killer: Option<Move>,
     ) -> u32 {
         const PLY: i32 = 1;
-        let mut table = Table::new();
-        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
         if let Some(k) = killer {
             s.killers.record(pos, PLY as usize, k);
         }
@@ -3062,8 +3285,8 @@ mod tests {
         let p = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
         let mv = p.move_from_uci("a1a7").unwrap();
         let child = p.play(mv);
-        let mut table = Table::new();
-        let searcher = Searcher::new(MoveOrder::Full, None, &mut table);
+        let table = Table::new();
+        let searcher = Searcher::new(MoveOrder::Full, None, &table);
         // The table's own promise first, over **every** cell — including the low ones the
         // guards make unreachable today. `ln(1)` is zero, so those cells would hold a
         // reduction of zero without the floor, and a later change to `LMR_MIN_DEPTH` or
@@ -3101,8 +3324,8 @@ mod tests {
         let p = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
         let mv = p.move_from_uci("a1a7").unwrap();
         let child = p.play(mv);
-        let mut table = Table::new();
-        let searcher = Searcher::new(MoveOrder::Full, None, &mut table);
+        let table = Table::new();
+        let searcher = Searcher::new(MoveOrder::Full, None, &table);
         for (depth, rank) in [
             (MAX_DEPTH, LMR_TABLE_RANKS),          // exactly one past the rank axis
             (MAX_DEPTH, 218),                      // the most moves a legal position can offer
@@ -3131,8 +3354,8 @@ mod tests {
             // the curve comes closest to costing nodes.
             for depth in 5..=5 {
                 let nodes = |growing: bool| {
-                    let mut t = Table::new();
-                    let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+                    let t = Table::new();
+                    let mut s = Searcher::new(MoveOrder::Full, None, &t);
                     s.lmr_growing = growing;
                     deepen(&p, Request::new(Limits::depth(depth)), &mut s).nodes
                 };
@@ -3202,11 +3425,176 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------------------------ Lazy SMP (#64)
+
+    #[test]
+    fn one_thread_is_the_default_and_searches_exactly_as_before() {
+        // The load-bearing control. Every Elo figure and every node count in this repository
+        // was taken on the single-threaded path; if the default were anything else, they would
+        // all quietly refer to a different engine.
+        let mut engine = Engine::new();
+        assert_eq!(engine.threads, 1, "the default must be one thread");
+        for (nature, fen) in NATURES {
+            let p = Position::from_fen(fen).unwrap();
+            let alone = engine.search(&p, Request::new(Limits::depth(6)));
+            let mut fresh = Engine::new();
+            let reference = fresh.search(&p, Request::new(Limits::depth(6)));
+            assert_eq!(
+                alone.nodes, reference.nodes,
+                "{nature}: the default path must be the one the measurements were taken on",
+            );
+            engine.new_game();
+        }
+    }
+
+    #[test]
+    fn the_helpers_really_search() {
+        // A build that silently ran one thread would pass every other test here, so this is
+        // the one that says the work is distributed. `nodes` stays the reporting thread's, so
+        // the proof is `helper_nodes` — what the other threads searched, joined rather than
+        // dropped precisely so it can be asserted on.
+        let p = Position::from_fen(NATURES[2].1).unwrap();
+        let helper_nodes = |threads: usize| {
+            let mut e = Engine::new();
+            e.set_threads(threads);
+            e.search(&p, Request::new(Limits::depth(7))).helper_nodes
+        };
+        assert_eq!(helper_nodes(1), 0, "searching alone, there is nobody to help");
+        assert!(
+            helper_nodes(4) > 0,
+            "four threads searched no helper nodes at all: the helpers did not run",
+        );
+    }
+
+    #[test]
+    fn a_parallel_search_answers_once_and_answers_something() {
+        let p = Position::from_fen(NATURES[1].1).unwrap();
+        let mut e = Engine::new();
+        e.set_threads(4);
+        let stats = e.search(&p, Request::new(Limits::depth(6)));
+        let (mv, _) = stats.best.expect("a parallel search must still return a move");
+        assert!(
+            p.legal_moves().contains(&mv),
+            "the reported move must be legal in the position asked about",
+        );
+        assert_eq!(stats.depth, 6, "the reporting thread must finish its iterations");
+    }
+
+    #[test]
+    fn only_the_reporting_thread_reports_and_it_reports_every_depth_once() {
+        // AC#3, and neither half was asserted: `a_parallel_search_answers_once_and_answers
+        // _something` checks a legal move and a final depth, which a search reporting four
+        // times per iteration would satisfy just as well.
+        //
+        // The property holds because helpers are constructed with `progress: None` — one line,
+        // twenty lines away from here, that a later refactor could hand a `progress` to without
+        // any test noticing. What a caller would see then is a GUI drawing four evaluation
+        // lines per depth, or an arena reading a depth its own engine never announced.
+        //
+        // Swept over thread counts including one, so the single-threaded path is the control:
+        // whatever the parallel search reports, it must be exactly what searching alone does.
+        let p = Position::from_fen(NATURES[1].1).unwrap();
+        for threads in [1usize, 4, 8] {
+            let mut e = Engine::new();
+            e.set_threads(threads);
+            let mut reported = Vec::new();
+            let stats = {
+                let mut record = |pr: &Progress| reported.push(pr.depth);
+                e.search(
+                    &p,
+                    Request { progress: Some(&mut record), ..Request::new(Limits::depth(6)) },
+                )
+            };
+            assert_eq!(
+                reported,
+                (1..=stats.depth).collect::<Vec<u32>>(),
+                "{threads} threads: every completed depth must be reported exactly once and in \
+                 order — a duplicate is a helper reporting, a gap is a report lost",
+            );
+            assert_eq!(stats.depth, 6, "{threads} threads: the reporting thread must finish");
+        }
+    }
+
+    #[test]
+    fn a_parallel_search_stops_on_its_deadline_and_does_not_wait_for_its_helpers() {
+        // `scope` cannot return until every helper has joined, so a helper that kept searching
+        // after the answer was in would hold the whole search open. What has to hold is that
+        // none of them does.
+        //
+        // **Pinned by counter, and the previous version was worse than machine-dependent.** It
+        // asserted `spent < budget * 6` — a wall clock on a shared machine, the shape #18 was
+        // merged to remove. Measured, it was also inert: commenting out `stop.store(true, …)`
+        // left it green, because the bound is six times a budget the search never approaches.
+        //
+        // What this asserts instead is what the helpers *did*: each ended by abandoning its
+        // search rather than by finishing it, which is a fact about the thread and not about
+        // the machine it ran on.
+        //
+        // Honest note on what it does **not** separate: at the deadline the stop flag and the
+        // helpers' own deadline become true at the same instant — they share `deadline` — so
+        // this cannot say which of the two stopped them. And at fixed depth the flag stops
+        // nobody at all: over twelve parallel searches at depths 8 to 12, no helper ever ended
+        // aborted, because they always finish their iterations before the reporting thread
+        // posts the flag. The flag is cheap insurance against a helper that is late, not a
+        // mechanism this suite has been able to catch doing anything.
+        let p = Position::from_fen(NATURES[2].1).unwrap();
+        let mut e = Engine::new();
+        e.set_threads(4);
+        let budget = Duration::from_millis(150);
+        let started = Instant::now();
+        let stats = e.search(
+            &p,
+            Request::new(Limits { max_depth: MAX_DEPTH, deadline: Some(started + budget) }),
+        );
+        assert!(stats.best.is_some(), "an interrupted parallel search must still have a move");
+        assert!(
+            stats.helper_nodes > 0,
+            "precondition: the helpers must have searched, or the assertions below are vacuous",
+        );
+        // **`helpers_aborted >= 1` was tried here and removed: it is a race, not a property.**
+        // `deepen` leaves its loop two ways — `aborted` from inside an iteration, or a plain
+        // `break` when the deadline has passed *between* two of them — and the second never
+        // touches the flag. A helper that finishes an iteration just as the deadline lands
+        // stops perfectly correctly with `aborted == false`. Measured: red once in seven
+        // release runs, green in every debug run, which is how a test like this gets merged.
+        // The counter stays because it is worth reading in the message below.
+        // An order-of-magnitude bound rather than a tight one, since three helpers racing a
+        // shared table are not reproducible run to run. Measured: helpers do 3.0 to 3.2 times
+        // the reporting thread's nodes in debug and about 5 times in release, against the 3
+        // extra threads. Twenty times would mean a helper searching long after the answer.
+        assert!(
+            stats.helper_nodes < 20 * stats.nodes.max(1),
+            "helpers searched {} nodes against the reporting thread's {} ({} of them ended \
+             aborted): one kept going after the answer was in",
+            stats.helper_nodes,
+            stats.nodes,
+            stats.helpers_aborted,
+        );
+    }
+
+    #[test]
+    fn the_stop_flag_ends_a_search_that_had_time_left() {
+        // The flag's own contract, separated from the deadline: a searcher watching a flag that
+        // is already set must abort without needing a clock at all.
+        let p = Position::from_fen(NATURES[0].1).unwrap();
+        let table = Table::new();
+        let stop = AtomicBool::new(true);
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
+        s.stop = Some(&stop);
+        let stats = deepen(&p, Request::new(Limits::depth(8)), &mut s);
+        assert!(s.aborted, "a searcher whose stop flag is set must abort");
+        assert!(
+            stats.nodes < 100_000,
+            "aborted after {} nodes: the flag was not being watched",
+            stats.nodes,
+        );
+    }
+
     // ------------------------------------------------- reverse futility pruning (#66)
 
     fn rfp(pos: &Position, depth: u32, allow: bool) -> (u64, i32, u64, u64) {
-        let mut table = Table::new();
-        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
         s.allow_rfp = allow;
         let stats = deepen(pos, Request::new(Limits::depth(depth)), &mut s);
         (stats.nodes, stats.best.map(|(_, sc)| sc).unwrap_or(0), s.rfp_taken, s.rfp_considered)
@@ -3270,8 +3658,8 @@ mod tests {
         let checked = Position::from_fen("4k3/8/8/8/8/8/8/3QK2r w - - 0 1").unwrap();
         let quiet = Position::from_fen("4k3/8/8/8/8/8/8/3QK2R w K - 0 1").unwrap();
         let table = Table::new();
-        let mut t = table;
-        let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+        let t = table;
+        let mut s = Searcher::new(MoveOrder::Full, None, &t);
 
         assert!(checked.in_check(), "precondition: the side to move must be in check");
         assert_eq!(s.static_eval_for(&checked, 1), None, "a node in check was evaluated");
@@ -3287,8 +3675,8 @@ mod tests {
         // One evaluation serves both cuts, so the gate has to reach as deep as the deeper of
         // them — and no deeper, since every node past it would pay for a value nothing reads.
         let p = Position::from_fen("4k3/8/8/8/8/8/8/3QK2R w K - 0 1").unwrap();
-        let mut t = Table::new();
-        let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+        let t = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &t);
         let ceiling = s.rfp_max_depth.max(s.ffp_max_depth);
         assert_eq!(s.static_eval_for(&p, 0), None, "depth 0 hands over to quiescence");
         assert!(s.static_eval_for(&p, ceiling).is_some(), "the gate must reach its ceiling");
@@ -3305,8 +3693,8 @@ mod tests {
         // would hold with or without the guard — inert, and mutation is what showed it. Against
         // `-(MATE - 5)` the comparison is trivially true, so only the guard stops the cut.
         let p = Position::from_fen("4k3/8/8/8/8/8/8/3QK2R w K - 0 1").unwrap();
-        let mut table = Table::new();
-        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
         assert_eq!(
             s.reverse_futility(1, -(MATE - 5), Some(evaluate(&p))),
             None,
@@ -3330,8 +3718,8 @@ mod tests {
         // would store "at least beta" where the node actually knows "at least eval", and eval can
         // sit hundreds of centipawns higher.
         let p = Position::from_fen("4k3/8/8/8/8/8/8/3QK2R w K - 0 1").unwrap();
-        let mut table = Table::new();
-        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
         let beta = 100;
         let cut = s.reverse_futility(1, beta, Some(evaluate(&p))).expect("precondition: this node must be cut");
         // The precondition is load-bearing and its absence is how two tests in this file were
@@ -3356,8 +3744,8 @@ mod tests {
         // it cannot use. Nothing protected this until mutation showed that removing the ceiling
         // left every test green.
         let p = Position::from_fen("4k3/8/8/8/8/8/8/3QK2R w K - 0 1").unwrap();
-        let mut table = Table::new();
-        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
         // Beta is set low enough that the margin — which grows with depth — cannot be what
         // refuses the deeper call. Otherwise this would test the margin under the ceiling's name.
         let beta = -1000;
@@ -3384,8 +3772,8 @@ mod tests {
         // The mutation is not cosmetic: it moves 4% to 23% of the tree, and on the quiet
         // middlegame at depth 9 it changes the score the search returns.
         let p = Position::from_fen("4k3/8/8/8/8/8/8/3QK2R w K - 0 1").unwrap();
-        let mut table = Table::new();
-        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
         let eval = evaluate(&p);
         // The growth itself, as one fact about one beta: the deepest cut must refuse what the
         // shallowest cut takes. A flat margin makes these two calls agree, which is precisely
@@ -3449,12 +3837,12 @@ mod tests {
         ] {
             let p = Position::from_fen(fen).unwrap();
             for depth in 3..=9u32 {
-                let mut t1 = Table::new();
-                let mut a = Searcher::new(MoveOrder::Full, None, &mut t1);
+                let t1 = Table::new();
+                let mut a = Searcher::new(MoveOrder::Full, None, &t1);
                 a.allow_rfp = false;
                 let plain = deepen(&p, Request::new(Limits::depth(depth)), &mut a).best;
-                let mut t2 = Table::new();
-                let mut b = Searcher::new(MoveOrder::Full, None, &mut t2);
+                let t2 = Table::new();
+                let mut b = Searcher::new(MoveOrder::Full, None, &t2);
                 let cut = deepen(&p, Request::new(Limits::depth(depth)), &mut b).best;
                 // The precondition that makes the comparison mean something: the cut has to have
                 // *fired* in this search. Without it the test would happily pass on a position
@@ -3491,8 +3879,8 @@ mod tests {
     // ------------------------------------------- forward futility pruning (#68)
 
     fn ffp(pos: &Position, depth: u32, allow: bool) -> (u64, i32, u64, u64, u64) {
-        let mut t = Table::new();
-        let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+        let t = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &t);
         s.allow_ffp = allow;
         let st = deepen(pos, Request::new(Limits::depth(depth)), &mut s);
         (st.nodes, st.best.map(|(_, x)| x).unwrap_or(0), s.ffp_pruned, s.ffp_considered, s.evals)
@@ -3548,8 +3936,8 @@ mod tests {
         // a move skipped one ply deeper hides a subtree one ply larger in which the static
         // evaluation had that much more chance to be wrong.
         let p = Position::from_fen(NATURES[3].1).unwrap();
-        let mut t = Table::new();
-        let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+        let t = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &t);
         let mv = *p.legal_moves().iter().find(|&&m| is_quiet(&p, m)).expect("a quiet move");
         // Alpha as high and the evaluation as low as they go, so the margin — which grows with
         // depth — cannot be what refuses the deeper call. Otherwise this would test the margin
@@ -3578,8 +3966,8 @@ mod tests {
         // Measured, the mutation skips about ten percent more moves and changes what the quiet
         // middlegame is worth at depth 9. Same shape, same silence, as the reverse cut in #66.
         let p = Position::from_fen(NATURES[3].1).unwrap();
-        let mut t = Table::new();
-        let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+        let t = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &t);
         let mv = *p.legal_moves().iter().find(|&&m| is_quiet(&p, m)).expect("a quiet move");
         let (margin, ceiling) = (s.ffp_margin, s.ffp_max_depth);
         assert!(
@@ -3629,8 +4017,8 @@ mod tests {
         // that skipped every move would return a score no move produced. Same reason the
         // reduction schedule exempts the first moves.
         let p = Position::from_fen(NATURES[3].1).unwrap();
-        let mut t = Table::new();
-        let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+        let t = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &t);
         let mv = p.legal_moves()[0];
         // `searched == 0` is the state at the first move of every node, and the evaluation is set
         // as low as it can go so nothing but that guard can refuse.
@@ -3647,8 +4035,8 @@ mod tests {
     #[test]
     fn the_forward_cut_refuses_checks_captures_and_mate_bounds() {
         let p = Position::from_fen(NATURES[2].1).unwrap();
-        let mut t = Table::new();
-        let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+        let t = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &t);
         let quiet = *p.legal_moves().iter().find(|&&m| is_quiet(&p, m)).expect("a quiet move");
         let capture = *p.legal_moves().iter().find(|&&m| !is_quiet(&p, m)).expect("a capture");
         let low = Some(-10_000);
@@ -3751,8 +4139,8 @@ mod tests {
         // all disable reductions for their own reasons.
         let p = Position::from_fen(NATURES[0].1).unwrap();
         for order in [MoveOrder::None, MoveOrder::Captures] {
-            let mut table = Table::new();
-            let mut s = Searcher::new(order, None, &mut table);
+            let table = Table::new();
+            let mut s = Searcher::new(order, None, &table);
             s.allow_lmr = true;
             deepen(&p, Request::new(Limits::depth(5)), &mut s);
             assert_eq!(
@@ -3762,8 +4150,8 @@ mod tests {
         }
         // Control: the same search, ordered, does reduce — so the assertion above is about
         // the ordering and not about the position being unreducible.
-        let mut table = Table::new();
-        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
         deepen(&p, Request::new(Limits::depth(5)), &mut s);
         assert!(s.lmr_reductions > 0, "precondition: ordered, this position reduces");
     }
@@ -3786,8 +4174,8 @@ mod tests {
         let differs = NATURES.iter().any(|(_, fen)| {
             let p = Position::from_fen(fen).unwrap();
             let score = |research: bool, depth: u32| {
-                let mut table = Table::new();
-                let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+                let table = Table::new();
+                let mut s = Searcher::new(MoveOrder::Full, None, &table);
                 s.allow_lmr_research = research;
                 deepen(&p, Request::new(Limits::depth(depth)), &mut s).best.map(|(_, sc)| sc)
             };
@@ -3827,8 +4215,8 @@ mod tests {
     // ---------------------------------------------------------------- check extensions (#50)
 
     fn extension_for(pos: &Position, mv: Move, depth: u32, ply: i32, root_depth: u32) -> u32 {
-        let mut table = Table::new();
-        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
         s.root_depth = root_depth;
         s.check_extension(pos.play(mv).in_check(), depth, ply)
     }
@@ -3933,8 +4321,8 @@ mod tests {
     }
 
     fn extended(pos: &Position, depth: u32, scope: Option<u32>) -> Extended {
-        let mut table = Table::new();
-        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
         s.allow_extensions = scope.is_some();
         s.ext_max_depth = scope.unwrap_or(0);
         // This harness isolates one brick, so the reverse futility cut is off: it prunes the
@@ -4135,8 +4523,8 @@ mod tests {
     // ---------------------------------------- SEE pruning in quiescence
 
     fn quiescence_pruned(pos: &Position, depth: u32, prune: bool) -> (Option<(Move, i32)>, u64) {
-        let mut table = Table::new();
-        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
         s.allow_see_pruning = prune;
         let stats = deepen(pos, Request::new(Limits::depth(depth)), &mut s);
         (stats.best, stats.nodes)
@@ -4201,8 +4589,8 @@ mod tests {
     /// a full search spends nodes everywhere, and the effect under test is local to a single
     /// in-check position.
     fn quiescence_only(pos: &Position, prune: bool) -> (i32, u64) {
-        let mut table = Table::new();
-        let mut s = Searcher::new(MoveOrder::Full, None, &mut table);
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
         s.allow_see_pruning = prune;
         let score = s.quiescence(pos, -INF, INF, 0);
         (score, s.nodes)
