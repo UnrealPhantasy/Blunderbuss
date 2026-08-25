@@ -293,7 +293,13 @@ impl Uci {
         let name = tokens.iter().position(|t| t.eq_ignore_ascii_case("name"));
         let value = tokens.iter().position(|t| t.eq_ignore_ascii_case("value"));
         let (Some(n), Some(v)) = (name, value) else { return };
-        let key = tokens[n + 1..v].join(" ");
+        // `get` rather than indexing: `name` and `value` are located independently, so a line
+        // that puts them the wrong way round — `setoption value false name OwnBook` — inverts
+        // the range. Indexing panics there, and a panic in `handle` takes the process down,
+        // which during a game is a lost game rather than a rejected command. That is the
+        // opposite of what the comment above promises. Same defect and same fix as #65, which
+        // introduced `set_option` independently and inherited it.
+        let Some(key) = tokens.get(n + 1..v).map(|k| k.join(" ")) else { return };
         let Some(raw) = tokens.get(v + 1) else { return };
         if key.eq_ignore_ascii_case("ownbook") {
             let on = raw.eq_ignore_ascii_case("true");
@@ -451,6 +457,63 @@ mod tests {
         assert!(out.lines.iter().any(|l| l.starts_with("id name")));
         assert!(out.lines.iter().any(|l| l.starts_with("id author")));
         assert!(!out.quit);
+    }
+
+    #[test]
+    fn a_malformed_setoption_is_ignored_rather_than_fatal() {
+        // `setoption value false name OwnBook` **panicked** before this test existed: `name`
+        // and `value` are located independently, so the reversed order inverts the slice range
+        // and indexing it aborts the process. A panic in `handle` is a lost game rather than a
+        // rejected command, which is the opposite of what the protocol asks of an engine.
+        //
+        // #65 introduced `set_option` independently and inherited the same defect; the fix and
+        // this test are deliberately the same shape there, so that whichever of the two lands
+        // second conflicts visibly on this function rather than silently keeping the unguarded
+        // version.
+        let (mut uci, log) = uci_with_log();
+        // **The book is planted rather than loaded, and before the malformed lines rather than
+        // after.** Planted, because `load_book` reads `book.txt` from the executable's directory
+        // and from `.`, and a test's working directory is the crate root — in a test it finds
+        // nothing and returns `None`, so a test relying on it would pass on an empty book.
+        // Before, because what is asserted below is that a malformed line leaves the option
+        // *where it was*: planting afterwards would restore whatever the line had destroyed,
+        // and the test would stay green against a `set_option` that wiped the book on any
+        // input. Found by mutation, not by reading.
+        uci.engine.set_book(Some(Book::from_lines(include_str!("../../book.txt")).0));
+        for line in [
+            "setoption",
+            "setoption name",
+            "setoption name OwnBook",
+            "setoption name OwnBook value",
+            "setoption value false name OwnBook",
+            "setoption value name",
+        ] {
+            let out = uci.handle(line);
+            assert!(out.lines.is_empty(), "{line}: a malformed option answered {:?}", out.lines);
+            assert!(!out.quit, "{line}: a malformed option ended the session");
+        }
+        // And the option is still where it was. Observable without a getter: with the book on,
+        // the start position is answered *from the book*, so the search never runs and not one
+        // `info` line is emitted.
+        uci.handle("position startpos");
+        log.borrow_mut().clear();
+        let out = uci.handle("go");
+        assert!(
+            log.borrow().is_empty(),
+            "the book was turned off by a malformed line: the search ran and said {:?}",
+            log.borrow(),
+        );
+        assert!(out.lines[0].starts_with("bestmove "), "no move came back: {:?}", out.lines);
+        // The control that keeps the assertion above from being vacuous: switched off, the same
+        // `go` does report. Without it, an `info` line that was never logged would pass too.
+        uci.handle("setoption name OwnBook value false");
+        log.borrow_mut().clear();
+        uci.handle("go");
+        assert!(
+            !log.borrow().is_empty(),
+            "precondition: with the book off the search must report, or the emptiness above \
+             proves nothing about the book",
+        );
     }
 
     #[test]
