@@ -191,7 +191,7 @@ fn allocate(divisor: u64, remaining: Duration, increment: Duration) -> Duration 
 /// `./bin/blunderbuss-x` from the harness directory, so a book living next to the source tree
 /// would be invisible exactly where it is measured. Absent means no book, silently — an engine
 /// that refused to start without one would be worse than one playing its own openings.
-fn load_book() -> Option<Book> {
+fn load_book() -> (Option<Book>, Option<String>) {
     let mut text = String::new();
     let dirs = std::env::current_exe()
         .ok()
@@ -210,15 +210,23 @@ fn load_book() -> Option<Book> {
         }
     }
     if text.is_empty() {
-        return None;
+        // **Announced rather than silent, and this is the case that most needed it.** The two
+        // files are looked up beside the executable and in the working directory, so a binary
+        // copied somewhere to be measured — which is exactly what this project does with every
+        // release build — runs with no book while still announcing `OwnBook default true`. An
+        // arena on such a binary reports that the book changes nothing: correct about the
+        // binary, wrong about the brick, and indistinguishable from a real zero.
+        //
+        // The `skipped` path below already had this treatment for a *partly* missing book. A
+        // book that is missing entirely is the same failure in full.
+        return (None, Some("info string book: none found".to_string()));
     }
     let (book, skipped) = Book::from_lines(&text);
-    if skipped > 0 {
-        // Printed rather than swallowed: a book quietly smaller than its files is the same
-        // failure as a test that passes without testing anything.
-        println!("info string book: {skipped} line(s) skipped");
+    let note = (skipped > 0).then(|| format!("info string book: {skipped} line(s) skipped"));
+    if book.is_empty() {
+        return (None, Some("info string book: loaded but empty".to_string()));
     }
-    (!book.is_empty()).then_some(book)
+    (Some(book), note)
 }
 
 struct Uci {
@@ -236,6 +244,10 @@ struct Uci {
     /// each one, while a test collects them into a vector and can assert on what was
     /// said and in which order.
     info: Box<dyn FnMut(String)>,
+    /// What `load_book` had to say, reported with the option list rather than at startup.
+    ///
+    /// `None` when the book loaded cleanly — the ordinary case says nothing, as it should.
+    book_note: Option<String>,
     /// What the engine has learned and keeps between moves — the transposition table.
     ///
     /// It lives here, at the protocol layer, because this is the only level that knows
@@ -271,16 +283,20 @@ impl Uci {
     }
 
     fn with_info(info: Box<dyn FnMut(String)>) -> Uci {
+        // The note is **kept, not emitted here**. Saying anything before the GUI has sent `uci`
+        // is out of turn — the protocol has no slot for it, and a strict front end is entitled
+        // to be confused by a line it did not ask for. It is answered with the option list
+        // instead, which is precisely where a GUI learns what this engine has.
+        let (book, book_note) = load_book();
+        let mut engine = Engine::new();
+        engine.set_book(book);
         Uci {
             position: Position::initial(),
             default_budget: Duration::from_millis(DEFAULT_BUDGET_MS),
             history: Vec::new(),
             info,
-            engine: {
-                let mut e = Engine::new();
-                e.set_book(load_book());
-                e
-            },
+            engine,
+            book_note,
         }
     }
 
@@ -302,8 +318,17 @@ impl Uci {
         let Some(key) = tokens.get(n + 1..v).map(|k| k.join(" ")) else { return };
         let Some(raw) = tokens.get(v + 1) else { return };
         if key.eq_ignore_ascii_case("ownbook") {
-            let on = raw.eq_ignore_ascii_case("true");
-            self.engine.set_book(if on { load_book() } else { None });
+            if raw.eq_ignore_ascii_case("true") {
+                // Same note on the same channel: a GUI that switches the book back on and gets
+                // no book deserves to be told, not left to infer it from the engine searching.
+                let (book, note) = load_book();
+                if let Some(note) = note {
+                    (self.info)(note);
+                }
+                self.engine.set_book(book);
+            } else {
+                self.engine.set_book(None);
+            }
         }
         if key.eq_ignore_ascii_case("threads") {
             if let Ok(threads) = raw.parse::<usize>() {
@@ -317,17 +342,24 @@ impl Uci {
     fn handle(&mut self, line: &str) -> Response {
         let tokens: Vec<&str> = line.split_whitespace().collect();
         match tokens.first().copied() {
-            Some("uci") => Response::lines(vec![
-                "id name Blunderbuss".to_string(),
-                "id author UnrealPhantasy".to_string(),
-                // Announced with `default 1` on purpose: a GUI that never touches the option
-                // gets the engine every published measurement was taken on.
-                "option name Threads type spin default 1 min 1 max 64".to_string(),
-                // Standard UCI name, so an arena that wants the book off can say so without
-                // knowing anything about this engine.
-                "option name OwnBook type check default true".to_string(),
-                "uciok".to_string(),
-            ]),
+            Some("uci") => {
+                let mut lines = vec![
+                    "id name Blunderbuss".to_string(),
+                    "id author UnrealPhantasy".to_string(),
+                    // Announced with `default 1` on purpose: a GUI that never touches the option
+                    // gets the engine every published measurement was taken on.
+                    "option name Threads type spin default 1 min 1 max 64".to_string(),
+                    // Standard UCI name, so an arena that wants the book off can say so without
+                    // knowing anything about this engine.
+                    "option name OwnBook type check default true".to_string(),
+                ];
+                // Beside the option that claims the book is on, and before `uciok` so a GUI has
+                // it before it can act on the option. Announcing `default true` while the files
+                // were nowhere to be found is the contradiction this line resolves.
+                lines.extend(self.book_note.clone());
+                lines.push("uciok".to_string());
+                Response::lines(lines)
+            }
             Some("isready") => Response::lines(vec!["readyok".to_string()]),
             Some("setoption") => {
                 self.set_option(&tokens[1..]);
@@ -504,6 +536,56 @@ mod tests {
         uci.handle("setoption name Hash value 128");
         assert_eq!(uci.engine.threads(), 4, "an unknown option disturbed a known one");
         assert!(!uci.handle("setoption name Hash value 128").quit, "an unknown option quit");
+    }
+
+    #[test]
+    fn a_missing_book_is_announced_rather_than_left_silent() {
+        // The failure this catches is not a lost game, it is a lost measurement. The two book
+        // files are looked up beside the executable and in the working directory; a release
+        // binary copied into a measurement directory finds neither, and runs with no book while
+        // `uci` still announces `OwnBook type check default true`. An arena on that binary
+        // reports that the book changes nothing — correct about the binary, wrong about the
+        // brick, and indistinguishable from a real zero.
+        //
+        // A test can assert this precisely *because* it reproduces the condition by accident:
+        // cargo runs tests from the crate root, where neither file exists, so every `Uci` built
+        // here has no book. That is why the note has to travel on the `info` channel rather than
+        // through `println!` — the same sink the rest of the protocol uses, and the only one a
+        // test can read.
+        let out = quick_uci().handle("uci");
+        let at = out.lines.iter().position(|l| l == "info string book: none found");
+        assert!(at.is_some(), "no book was found and nothing said so: {:?}", out.lines);
+        let uciok = out.lines.iter().position(|l| l == "uciok").expect("uciok");
+        assert!(at.unwrap() < uciok, "the note came after uciok: {:?}", out.lines);
+        // The contradiction it resolves, asserted alongside so the two cannot drift apart: the
+        // option list claims the book is on in the very same breath.
+        assert!(
+            out.lines.iter().any(|l| l.starts_with("option name OwnBook") && l.contains("default true")),
+            "precondition: the option must still claim the book is on",
+        );
+    }
+
+    #[test]
+    fn switching_the_book_back_on_says_so_when_there_is_none() {
+        // The same note on the same channel for the other entry point. A GUI that sends
+        // `setoption name OwnBook value true` and gets no book should be told, rather than left
+        // to infer it from the engine searching a position it was supposed to answer.
+        let (mut uci, log) = uci_with_log();
+        log.borrow_mut().clear();
+        uci.handle("setoption name OwnBook value true");
+        assert!(
+            log.borrow().iter().any(|l| l == "info string book: none found"),
+            "switching the book on found nothing and said nothing: {:?}",
+            log.borrow(),
+        );
+        // Switching it *off* has nothing to report: there is no book to fail to find.
+        log.borrow_mut().clear();
+        uci.handle("setoption name OwnBook value false");
+        assert!(
+            log.borrow().is_empty(),
+            "turning the book off should be silent, said {:?}",
+            log.borrow(),
+        );
     }
 
     #[test]
