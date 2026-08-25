@@ -3393,12 +3393,12 @@ mod tests {
         // what no other test in this file can see.
         let between = eval - RFP_MARGIN * RFP_MAX_DEPTH as i32 + 1;
         assert!(
-            s.reverse_futility(&p, 1, between).is_some(),
+            s.reverse_futility(1, between, Some(eval)).is_some(),
             "at depth 1 the cut refused a beta {} below the evaluation",
             eval - between,
         );
         assert_eq!(
-            s.reverse_futility(&p, RFP_MAX_DEPTH, between),
+            s.reverse_futility(RFP_MAX_DEPTH, between, Some(eval)),
             None,
             "the same beta was cut at depth {RFP_MAX_DEPTH}: the margin is not growing",
         );
@@ -3415,12 +3415,12 @@ mod tests {
                  mate guard is what returns `None` and this test reads the wrong guard",
             );
             assert!(
-                s.reverse_futility(&p, depth, boundary).is_some(),
+                s.reverse_futility(depth, boundary, Some(eval)).is_some(),
                 "at depth {depth} the cut refused a beta exactly {} below the evaluation",
                 RFP_MARGIN * depth as i32,
             );
             assert_eq!(
-                s.reverse_futility(&p, depth, boundary + 1),
+                s.reverse_futility(depth, boundary + 1, Some(eval)),
                 None,
                 "at depth {depth} the cut fired against a beta one centipawn past its margin",
             );
