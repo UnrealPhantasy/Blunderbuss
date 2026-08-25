@@ -382,6 +382,20 @@ impl Engine {
 
     /// How many searchers to run at once. Clamped to at least one — a request for zero
     /// threads is a caller mistake, not an instruction to do nothing.
+    ///
+    /// **What changes at more than one, and it is not only speed.** The single-threaded path
+    /// is deterministic: the same position at the same depth searches the same nodes, every
+    /// run. That is not a detail of this engine, it is the foundation every measurement
+    /// instrument in this project stands on — `banc.sh` sorts bricks by node count at fixed
+    /// depth, `cpu-cost.sh` divides CPU time by nodes, and the oracle protocol compares
+    /// evaluations position by position. All of them are published from the default path.
+    ///
+    /// Above one thread, none of that holds: helpers race for the shared table, so node
+    /// counts, `helper_nodes` and the table hit rates all vary run to run on the same input.
+    /// The results stay *correct* — the moves are legal and the scores are real — but they
+    /// stop being **reproducible**, and an instrument that is not reproducible is not an
+    /// instrument. Set this above one to play faster on a machine with cores to spare; never
+    /// to take a measurement.
     pub fn set_threads(&mut self, threads: usize) {
         self.threads = threads.max(1);
     }
