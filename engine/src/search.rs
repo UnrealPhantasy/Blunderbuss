@@ -3530,6 +3530,33 @@ mod tests {
     }
 
     #[test]
+    fn the_book_answers_whatever_the_thread_count() {
+        // The one thing this merge had to decide, and nothing else asserts it. #64 gave
+        // `Engine::search` a `threads == 1` / `search_parallel` branch and #71 gave it a book
+        // lookup; putting the lookup *inside* either arm compiles, passes every other test here,
+        // and silently stops a multi-threaded session from opening out of book — the arena runs
+        // at one thread, so no measurement would ever have shown it.
+        //
+        // Pinned by node count, which is what says the position was not searched. A score cannot.
+        let start = Position::initial();
+        for threads in [1usize, 2, 4] {
+            let mut e = booked();
+            e.set_threads(threads);
+            let stats = e.search(&start, Request::new(Limits::depth(8)));
+            assert_eq!(
+                stats.nodes, 0,
+                "{threads} threads: the book was skipped and the position searched for {} nodes",
+                stats.nodes,
+            );
+            assert_eq!(stats.helper_nodes, 0, "{threads} threads: helpers ran on a book move");
+            assert!(
+                stats.best.is_some_and(|(mv, _)| start.legal_moves().contains(&mv)),
+                "{threads} threads: no legal book move came back",
+            );
+        }
+    }
+
+    #[test]
     fn switching_the_book_off_restores_the_bookless_engine() {
         // The inert control. Without it, every measurement above could be reading an engine whose
         // book silently never fires — which looks identical to a book that costs nothing.
