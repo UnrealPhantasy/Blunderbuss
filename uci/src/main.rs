@@ -241,7 +241,12 @@ impl Uci {
         let name = tokens.iter().position(|t| t.eq_ignore_ascii_case("name"));
         let value = tokens.iter().position(|t| t.eq_ignore_ascii_case("value"));
         let (Some(n), Some(v)) = (name, value) else { return };
-        let key = tokens[n + 1..v].join(" ");
+        // `get` rather than indexing: `name` and `value` are located independently, so a line
+        // that puts them the wrong way round — `setoption value 4 name Threads` — inverts the
+        // range. Indexing panics there, and a panic in `handle` takes the process down, which
+        // during a game is a lost game rather than a rejected command. That is the opposite of
+        // what the comment above promises.
+        let Some(key) = tokens.get(n + 1..v).map(|k| k.join(" ")) else { return };
         let Some(raw) = tokens.get(v + 1) else { return };
         if key.eq_ignore_ascii_case("threads") {
             if let Ok(threads) = raw.parse::<usize>() {
@@ -400,6 +405,29 @@ mod tests {
         assert!(out.lines.iter().any(|l| l.starts_with("id name")));
         assert!(out.lines.iter().any(|l| l.starts_with("id author")));
         assert!(!out.quit);
+    }
+
+    #[test]
+    fn a_malformed_setoption_is_ignored_rather_than_fatal() {
+        // `setoption value 4 name Threads` **panicked** before this test existed: `name` and
+        // `value` are located independently, so the reversed order inverts the slice range and
+        // indexing it aborts the process. A panic in `handle` is a lost game rather than a
+        // rejected command, which is the opposite of what the protocol asks of an engine.
+        let mut uci = quick_uci();
+        for line in [
+            "setoption",
+            "setoption name",
+            "setoption name Threads",
+            "setoption name Threads value",
+            "setoption value 4 name Threads",
+            "setoption value name",
+            "setoption name Threads value not-a-number",
+        ] {
+            let out = uci.handle(line);
+            assert!(out.lines.is_empty(), "{line}: a malformed option answered {:?}", out.lines);
+            assert!(!out.quit, "{line}: a malformed option ended the session");
+        }
+        assert_eq!(uci.engine.threads(), 1, "a malformed option changed the thread count");
     }
 
     #[test]
