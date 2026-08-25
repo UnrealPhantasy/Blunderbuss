@@ -3507,6 +3507,7 @@ mod tests {
             assert_eq!(a.best.map(|(m, _)| m), b.best.map(|(m, _)| m), "d{depth}: move changed");
         }
     }
+
     // ------------------------------------------------------------------ Lazy SMP (#64)
 
     #[test]
