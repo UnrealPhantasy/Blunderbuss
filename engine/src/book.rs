@@ -277,10 +277,22 @@ mod tests {
         }
         let bb5 = p.move_from_uci("f1b5").unwrap();
         let picks = (0..600).filter(|_| book.pick(&p) == Some(bb5)).count();
-        // Two of four lines from this position play Bb5, so ~50%. The bounds are wide because
-        // this asserts that the weighting *happens*, not what the exact ratio is.
+        // **The lower bound is 250 because 150 did not test anything.** The entry here is
+        // `[(Bb5, 2), (Bc4, 1), (d4, 1)]`, and with the weight update neutralised it becomes
+        // three moves at 1 each. Measured, both ways, over the same 600 draws:
+        //
+        //     as written          303 picks   (50.5%, the 2:1:1 split)
+        //     weights neutralised 210 picks   (35%, a uniform third)
+        //
+        // 210 sits inside `150..450`, so the old bound asserted that `pick` returns Bb5
+        // *sometimes* — which a uniform choice does too. 250 separates the two regimes with
+        // room on both sides, and the mutation now reddens this test with the message it was
+        // written to print.
+        //
+        // These are constants rather than samples: the generator is a seeded xorshift, so a
+        // fixed book and a fixed sequence of calls give the same count every run.
         assert!(
-            (150..450).contains(&picks),
+            (250..450).contains(&picks),
             "Bb5 chosen {picks} times in 600: the weights are not being read",
         );
     }
