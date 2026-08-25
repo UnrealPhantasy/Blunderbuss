@@ -3567,6 +3567,63 @@ mod tests {
     }
 
     #[test]
+    fn the_forward_margin_grows_with_the_depth_it_covers() {
+        // `FFP_MARGIN` argues the growth at length — a move skipped at depth 2 hides a subtree
+        // one ply larger, so the static evaluation is given that much more room to be wrong —
+        // and nothing asserted it. Mutating `margin * depth` to `margin` left the whole suite
+        // green: every other call here passes depth 1, where the two expressions coincide, and
+        // the one call at the ceiling sets alpha as high and the evaluation as low as they go
+        // precisely so the margin cannot interfere.
+        //
+        // Measured, the mutation skips about ten percent more moves and changes what the quiet
+        // middlegame is worth at depth 9. Same shape, same silence, as the reverse cut in #66.
+        let p = Position::from_fen(NATURES[3].1).unwrap();
+        let mut t = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &mut t);
+        let mv = *p.legal_moves().iter().find(|&&m| is_quiet(&p, m)).expect("a quiet move");
+        let (margin, ceiling) = (s.ffp_margin, s.ffp_max_depth);
+        assert!(
+            ceiling >= 2,
+            "precondition: with a ceiling of one ply there is no second depth to compare against, \
+             and this test would silently stop testing anything",
+        );
+        // The evaluation is a parameter of this cut rather than something it computes, so it can
+        // be pinned at zero and alpha read straight off as "how far below alpha this node sits".
+        let eval = Some(0);
+        // The growth as one fact about one alpha: what depth 1 declines to search, the ceiling
+        // must search. A flat margin makes these two calls agree.
+        let between = margin * ceiling as i32 - 1;
+        assert!(
+            s.forward_futile(&p, mv, 1, between, eval, false, 1),
+            "at depth 1 the cut searched a move sitting {between} below alpha",
+        );
+        assert!(
+            !s.forward_futile(&p, mv, ceiling, between, eval, false, 1),
+            "the same move was skipped at depth {ceiling}: the margin is not growing",
+        );
+        // And the slope, pinned at its boundary at every depth rather than at one chosen depth:
+        // an off-by-one in the multiplier would clear the pair above at every depth it has.
+        for depth in 1..=ceiling {
+            // The lowest alpha this depth may still skip against, since the comparison is
+            // `eval + margin * depth <= alpha`.
+            let boundary = margin * depth as i32;
+            assert!(
+                boundary.abs() < MATE_THRESHOLD,
+                "precondition: alpha must stay out of mate range at depth {depth}, otherwise the \
+                 mate guard is what refuses the cut and this test reads the wrong guard",
+            );
+            assert!(
+                s.forward_futile(&p, mv, depth, boundary, eval, false, 1),
+                "at depth {depth} the cut searched a move exactly {boundary} below alpha",
+            );
+            assert!(
+                !s.forward_futile(&p, mv, depth, boundary - 1, eval, false, 1),
+                "at depth {depth} the cut skipped a move one centipawn short of its margin",
+            );
+        }
+    }
+
+    #[test]
     fn the_first_move_is_never_skipped() {
         // The one guard whose absence is a correctness bug rather than a strength loss: a node
         // that skipped every move would return a score no move produced. Same reason the
