@@ -1203,6 +1203,7 @@ mod tests {
     }
 
 
+
     // ------------------------------------------- rook and pawn against rook (#81)
 
     // Every threshold below was **read off the engine before it was written**, not chosen: the
@@ -1264,26 +1265,44 @@ mod tests {
     }
 
     #[test]
-    fn the_lucena_position_keeps_its_winning_score() {
-        // **The criterion that guards the other face of the error**, and the reason this brick is
-        // shaped differently from #79. Rook and pawn against rook is won when the defending king
-        // is cut off from the pawn's file and the strong king escorts: the Lucena position, won by
-        // building a bridge. Raw 245 cp, and it must stay 245.
+    fn a_won_rook_and_pawn_keeps_its_winning_score() {
+        // **The criterion that guards the other face of the error.** Rook and pawn against rook is
+        // won when the defending king cannot reach the pawn's file, and a factor that flattened
+        // such a position would make the search decline a win it would otherwise bring home — at
+        // move 30 this engine converts 95.6% of the positions Stockfish calls winning for it.
         //
-        // At move 30 this engine converts 95.6% of the positions Stockfish calls winning for it.
-        // A factor that flattened this position would make the search decline a win it would
-        // otherwise have brought home, which is a cost #79's condition could never incur.
-        let p = Position::from_fen("8/4PK1k/8/8/8/8/r7/3R4 w - - 0 1").unwrap();
-        assert_eq!(
-            evaluate(&p),
-            without_scaling(|| evaluate(&p)),
-            "the Lucena position is won and the factor must not touch it",
-        );
-        assert!(
-            evaluate(&p) > 200,
-            "and it must still read as a win: {} cp",
-            evaluate(&p),
-        );
+        // **The first version of this test called its position "the Lucena position" and it was
+        // neither Lucena nor technical.** On `8/4PK1k/8/8/8/8/r7/3R4 w` the white king stands
+        // *beside* its pawn and guards the queening square, so `e8=Q` is free — Stockfish reads
+        // **mate in 2** (`Rh1+ Rh2 Rxh2#`). Spotted by Théo looking at the board, not by review.
+        // In a real Lucena the strong king stands *on* the queening square and blocks its own
+        // pawn, which is what forces the bridge. Both positions are kept below, because a two-move
+        // tactic and a technical win are different things and only one of them was here before.
+        for (fen, name, sf) in [
+            (
+                "3K4/3P1k2/8/8/8/8/r7/4R3 w - - 0 1",
+                "Kd8 blocking its own pawn on d7, Kf7 cut off by Re1 — no promotion available",
+                "+48.57 at depth 30",
+            ),
+            (
+                "8/4PK1k/8/8/8/8/r7/3R4 w - - 0 1",
+                "Kf7 guarding the queening square — trivially won, kept as the tactical case",
+                "mate in 2",
+            ),
+        ] {
+            // Inertness is the claim, and it is asserted as equality rather than against a
+            // threshold: what must hold is that the arm does not touch these positions at all.
+            assert_eq!(
+                evaluate(&Position::from_fen(fen).unwrap()),
+                without_scaling(|| evaluate(&Position::from_fen(fen).unwrap())),
+                "{name} is won ({sf}) and the factor must not touch it",
+            );
+            // And it must still read as a clear edge. Measured before being written: 169 cp for
+            // the first, 245 for the second — so `> 200` would have failed on the technical win,
+            // which is exactly the position this test needed most.
+            let v = evaluate(&Position::from_fen(fen).unwrap());
+            assert!(v > 150, "{name}: and it must read as an edge, not a draw: {v} cp");
+        }
     }
 
     #[test]
@@ -1309,12 +1328,14 @@ mod tests {
     #[test]
     fn a_strong_king_past_its_fifth_rank_abstains() {
         // The guard on motif 2. Past its own fifth rank the escort is close enough to fight for
-        // the queening square and the verdict stops being clear, so the arm abstains rather than
-        // guess. Raw 182 cp, untouched.
+        // the queening square, so the arm abstains. Raw 182 cp, untouched.
         //
-        // Asserted as inertness and **not** as a verdict: we are not claiming this position is
-        // won, only that we decline to call it drawn. Overstating it would be a claim no
-        // measurement here can support.
+        // **And the abstention is not merely prudent — it protects a forced win.** Measured after
+        // the fact, because the first version of this comment claimed only that we "decline to
+        // guess": Stockfish reads this position as **mate in 6** for the strong side. So the guard
+        // is doing real work here rather than hedging, and the claim can be made rather than
+        // avoided. Still asserted as inertness, because inertness is what the code guarantees;
+        // the mate is why inertness is the right behaviour.
         let p = Position::from_fen("2k5/8/3K4/3P4/8/8/8/r6R w - - 0 1").unwrap();
         assert_eq!(
             evaluate(&p),
