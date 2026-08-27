@@ -1470,7 +1470,16 @@ mod tests {
 
 
 
+
     // ------------------------------------------- rook and pawn against rook (#81)
+
+    // **None of the figures below moved when mobility (#77) was merged**, and that is structural
+    // rather than lucky: this arm's gate admits exactly one pawn, one rook each and nothing else,
+    // and mobility weights pawns, rooks and kings all at **zero** — only the minor pieces carry it.
+    // So the two bricks cannot interact on any position this arm can reach. Verified on all ten
+    // positions below rather than argued, because the #79 arm one file up *did* shift by up to
+    // 39 centipawns on the same merge.
+
 
     // Every threshold below was **read off the engine before it was written**, not chosen: the
     // scaled and raw scores are quoted beside each position. A first draft of a #79 test picked
