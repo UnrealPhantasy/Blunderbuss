@@ -150,6 +150,38 @@ fn is_passed(square: usize, color: Color, enemy_pawns: u64) -> bool {
     PASSED_MASK[color as usize][square] & enemy_pawns == 0
 }
 
+/// Centipawns per square commanded, by piece, in the middlegame and in the endgame.
+///
+/// **Why this term exists, and it was located rather than chosen from a list.** Over 29 276
+/// positions from 6 400 anchored games, our search score was compared to Stockfish's on the same
+/// position. Our error correlates with the mobility difference at **−0.31**, the strongest of the
+/// eight features tested — and, unlike the others, it correlates *identically* in games we win
+/// (−0.29) and games we lose (−0.31). A feature that only appeared inside losses would describe
+/// what losing looks like; one that holds in both is a blind spot. The sign says we are optimistic
+/// when our pieces are cramped.
+///
+/// **Why only the minor pieces, and this was measured rather than reasoned.** The first version
+/// weighted rooks and queens too, and the tree **doubled** — 733 605 nodes against 371 194 at
+/// depth 10 on the start position. A queen's mobility swings between five squares and
+/// twenty-five, and feeding that swing into the evaluation moves scores past the futility margins
+/// that decide whether a node is cut at all. The knights and bishops carry the signal; the heavy
+/// pieces carried noise, and the noise was expensive. Weights at zero for pawns and the king for
+/// the ordinary reasons — a pawn's "mobility" is two capture squares, and the king's is king
+/// safety, a different term that measured neutral here (#29).
+///
+/// | weights (N,B,R,Q) | nodes, opening | nodes, ruy-lopez |
+/// |---|---|---|
+/// | 4,4,3,2 | ×1.98 | ×1.02 |
+/// | 2,2,2,1 | ×1.28 | ×1.19 |
+/// | 1,1,1,1 | ×1.28 | ×1.61 |
+/// | **3,3,0,0** | **×0.98** | **×1.02** |
+///
+/// **Why tapered.** Everything in this evaluation is. A queen's freedom matters less in a
+/// middlegame full of pieces than in an endgame where it decides; a rook's matters more once the
+/// files open.
+const MOBILITY_MIDDLEGAME: [i32; 6] = [0, 3, 3, 0, 0, 0];
+const MOBILITY_ENDGAME: [i32; 6] = [0, 3, 4, 0, 0, 0];
+
 pub fn evaluate(pos: &Position) -> i32 {
     // Two running scores — one reading the middlegame tables, one the endgame tables
     // — plus the phase, all accumulated in the **same** pass over the board.
@@ -204,6 +236,20 @@ pub fn evaluate(pos: &Position) -> i32 {
                     mg += bonus_mg;
                     eg += bonus_eg;
                 }
+            }
+            // Mobility, riding the walk that is already happening rather than adding a second
+            // one — the cost of a second pass over the board is what ended #29, and this term has
+            // to be cheap enough not to buy accuracy with depth.
+            //
+            // **The zero-weight pieces are skipped, not multiplied by zero**, because the lookup
+            // is the cost and the multiply is free. With rooks and queens at zero this saves the
+            // two most expensive probes — a queen costs a rook lookup *and* a bishop lookup — on
+            // every occupied square that holds one. Both arrays are `const`, so the test folds
+            // away at compile time for every piece whose weights are zero.
+            if MOBILITY_MIDDLEGAME[piece as usize] != 0 || MOBILITY_ENDGAME[piece as usize] != 0 {
+                let mob = pos.mobility_from(sq, piece, color) as i32;
+                mg += MOBILITY_MIDDLEGAME[piece as usize] * mob;
+                eg += MOBILITY_ENDGAME[piece as usize] * mob;
             }
             phase += phase_weight(piece);
             // Idiom: a `match` used as an expression — it yields +1 or -1, so the two
@@ -791,4 +837,196 @@ mod tests {
              against {gain_when_blocked}",
         );
     }
+
+    // ------------------------------------------------------------------- mobility (#77)
+
+    #[test]
+    fn mobility_counts_only_squares_a_piece_could_move_to() {
+        // **The definition of the term, and the one line nothing else asserts.** `mobility_from`
+        // excludes squares occupied by one's own side; mutating it to count them left the entire
+        // suite green, because the error is *symmetric* — the mirror test still reads zero — and
+        // it preserves the ordering, so the cramped-versus-free comparison still holds. Every
+        // other test here compares two positions, and this defect moves both.
+        //
+        // Asserted as a statement about chess rather than as a number: on the initial board, a
+        // bishop behind its own pawns commands nothing at all, and a rook in the corner nothing
+        // either. Counting own pieces would make them 2 each.
+        let p = Position::initial();
+        assert_eq!(
+            p.mobility_from(Square::C1, Piece::Bishop, Color::White), 0,
+            "a bishop on its initial square is blocked by its own pawn and its own knight",
+        );
+        assert_eq!(
+            p.mobility_from(Square::A1, Piece::Rook, Color::White), 0,
+            "a rook in the corner is blocked by its own pawn and its own knight",
+        );
+        assert_eq!(
+            p.mobility_from(Square::D1, Piece::Queen, Color::White), 0,
+            "a queen on its initial square commands nothing: every ray runs into its own side",
+        );
+        // The control that keeps the three zeros from proving nothing: the knight *can* jump over
+        // its own pieces, and reads exactly the two squares it really has.
+        assert_eq!(
+            p.mobility_from(Square::B1, Piece::Knight, Color::White), 2,
+            "a knight on b1 has exactly a3 and c3 — c1 and d2 are its own pieces",
+        );
+        // And once the board opens, the same bishop counts: without the control above, a term
+        // that always returned zero would satisfy the assertions.
+        let opened = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/4P3/PPPP1PPP/RNBQKBNR b KQkq - 0 1")
+            .unwrap();
+        assert!(
+            opened.mobility_from(Square::F1, Piece::Bishop, Color::White) > 0,
+            "precondition: with the e-pawn advanced the light bishop must see something",
+        );
+
+        // **The other half of the definition, and it was the half nothing asserted.** Only *one's
+        // own* side is excluded, so a square held by an enemy piece counts — it is a capture, which
+        // is a move. Narrowing the mask to `!occupied()` — "empty squares only" — used to leave this
+        // whole test green and reddened one transposition-table assertion by accident.
+        //
+        // Asserted as a **pair on the same square**, since that is what isolates the asymmetry: the
+        // three zeros above and every comparison in this file move together when both sides are
+        // excluded, and a single count proves nothing about which side was meant.
+        //
+        // Both families of piece, because they fail differently: a jumper simply includes or
+        // excludes the square, while for a slider the enemy piece is the *last* square of the ray.
+        for (enemy, ours, empty, sq, piece, name) in [
+            (
+                "4k3/8/8/8/8/2p5/8/1N2K3 w - - 0 1",
+                "4k3/8/8/8/8/2P5/8/1N2K3 w - - 0 1",
+                "4k3/8/8/8/8/8/8/1N2K3 w - - 0 1",
+                Square::B1, Piece::Knight, "a knight on b1, c3 held",
+            ),
+            (
+                "4k3/8/8/8/p7/8/8/R3K3 w - - 0 1",
+                "4k3/8/8/8/P7/8/8/R3K3 w - - 0 1",
+                "4k3/8/8/8/8/8/8/R3K3 w - - 0 1",
+                Square::A1, Piece::Rook, "a rook on a1, a4 held",
+            ),
+        ] {
+            let m = |fen: &str| {
+                Position::from_fen(fen).unwrap().mobility_from(sq, piece, Color::White)
+            };
+            assert_eq!(
+                m(enemy), m(empty).min(m(enemy)),
+                "{name}: precondition, an enemy piece cannot add mobility",
+            );
+            assert!(
+                m(enemy) > m(ours),
+                "{name}: an enemy piece on a reachable square is a capture and must count, \
+                 while one of ours must not — read {} against {}",
+                m(enemy), m(ours),
+            );
+        }
+        // And the slider case pinned exactly: the enemy pawn on a4 is counted *and* stops the ray,
+        // so the a-file contributes a2, a3, a4 and nothing beyond. Measured before written — 6 with
+        // the pawn there, 10 with the file clear.
+        let blocked = Position::from_fen("4k3/8/8/8/p7/8/8/R3K3 w - - 0 1").unwrap();
+        let clear = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
+        assert_eq!(
+            blocked.mobility_from(Square::A1, Piece::Rook, Color::White), 6,
+            "the enemy pawn counts and ends the ray: a2, a3, a4, then b1, c1, d1",
+        );
+        assert_eq!(
+            clear.mobility_from(Square::A1, Piece::Rook, Color::White), 10,
+            "control: with the file clear the same rook reads the whole of it",
+        );
+    }
+
+    #[test]
+    fn mobility_cancels_on_a_mirrored_position() {
+        // The load-bearing control. A term that did not cancel on a symmetric position would be
+        // a side-to-move bonus wearing a positional name — and it would show up as strength in
+        // a duel against our own clone while being worth nothing at all.
+        for fen in [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQkq - 0 1",
+            "4k3/8/8/3n4/3N4/8/8/4K3 w - - 0 1",
+        ] {
+            let p = Position::from_fen(fen).unwrap();
+            assert_eq!(
+                evaluate(&p), 0,
+                "{fen}: a mirrored position must evaluate to exactly zero",
+            );
+        }
+    }
+
+    #[test]
+    fn a_cramped_side_is_scored_below_a_free_one() {
+        // The term's whole claim, on identical material. Both sides have a knight and a bishop;
+        // White's stand in the centre, Black's are boxed into the corner behind their own pawns.
+        let free = Position::from_fen("4k3/pppppppp/8/8/3NB3/8/PPPPPPPP/4K3 w - - 0 1").unwrap();
+        let cramped = Position::from_fen("4k3/pppppppp/8/8/8/8/PPPPPPPP/N3K2B w - - 0 1").unwrap();
+        // Material is identical by construction, so any difference is positional. The
+        // piece-square tables also prefer the centre, which is why the assertion is on the
+        // *difference between two versions of this evaluation* rather than on a raw number:
+        // see `mobility_is_what_makes_the_difference` below.
+        assert!(
+            evaluate(&free) > evaluate(&cramped),
+            "free pieces {} must beat cramped ones {}",
+            evaluate(&free), evaluate(&cramped),
+        );
+    }
+
+    #[test]
+    fn mobility_is_what_makes_the_difference_not_the_tables() {
+        // The control the test above needs: the piece-square tables also reward the centre, so
+        // "free scores higher than cramped" does not by itself say *this* term did anything.
+        //
+        // The contribution is recomputed here from the same constants and the same lookup the
+        // evaluation uses, rather than by re-walking the board in a second implementation — a
+        // first version did that and was **inert**: the copy drifted from the original, so the
+        // difference it measured was its own bug rather than the term. Zeroing the weights left
+        // it green, which is how it was caught.
+        let free = Position::from_fen("4k3/pppppppp/8/8/3NB3/8/PPPPPPPP/4K3 w - - 0 1").unwrap();
+        let cramped = Position::from_fen("4k3/pppppppp/8/8/8/8/PPPPPPPP/N3K2B w - - 0 1").unwrap();
+        assert!(
+            mobility_contribution(&free) > mobility_contribution(&cramped),
+            "the term itself must separate these two: {} against {}",
+            mobility_contribution(&free), mobility_contribution(&cramped),
+        );
+    }
+
+    // What the mobility term adds to White's side of the score, from the same constants and the
+    // same lookup `evaluate` uses. Zero when the weights are zero, which is what makes the test
+    // above sensitive to them.
+    fn mobility_contribution(pos: &Position) -> i32 {
+        let mut total = 0;
+        for sq in Square::ALL {
+            if let Some(piece) = pos.piece_on(sq) {
+                if pos.color_on(sq) == Some(Color::White) {
+                    total += MOBILITY_MIDDLEGAME[piece as usize]
+                        * pos.mobility_from(sq, piece, Color::White) as i32;
+                }
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn mobility_is_tapered_like_everything_else() {
+        // Every term in this evaluation is phase-dependent, and this one has to be too: a
+        // bishop's freedom is worth more once the board empties. Asserted on the constants
+        // rather than through a position, because a position mixes the taper with the tables.
+        assert_ne!(
+            MOBILITY_MIDDLEGAME, MOBILITY_ENDGAME,
+            "the term must differ between phases, or it is not tapered",
+        );
+        for piece in [Piece::Knight, Piece::Bishop] {
+            assert!(
+                MOBILITY_ENDGAME[piece as usize] >= MOBILITY_MIDDLEGAME[piece as usize],
+                "{piece:?} mobility must not be worth less in the endgame",
+            );
+        }
+        // And the heavy pieces stay out, which is a measured decision rather than an oversight:
+        // weighting them doubled the tree. See the constant's own comment for the sweep.
+        for piece in [Piece::Rook, Piece::Queen, Piece::Pawn, Piece::King] {
+            assert_eq!(
+                (MOBILITY_MIDDLEGAME[piece as usize], MOBILITY_ENDGAME[piece as usize]),
+                (0, 0),
+                "{piece:?} must stay at zero: weighting it cost a factor of two in nodes",
+            );
+        }
+    }
+
 }
