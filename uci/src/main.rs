@@ -575,7 +575,7 @@ mod tests {
         // move. Nothing in the protocol stream said so, and a local board spent an hour looking at
         // its own code.
         for (fen, name) in [
-            ("pas-un-fen", "not a FEN at all"),
+            ("not-a-fen", "not a FEN at all"),
             ("r7/8/3k4/2PP4/8/8/1K6/7R w - - 0 1", "well-formed but illegal (opposite check)"),
             ("8/8/8/8/8/8/8/8 w - - 0 1", "no kings"),
             ("4k3/8/8/8/8/8/8/4K3", "truncated — no side to move"),
@@ -662,7 +662,7 @@ mod tests {
         // engine back. A version that latched the flag would pass every assertion above and break
         // any real session, since a GUI that sends one malformed command sends valid ones after.
         let (mut uci, log) = uci_with_log();
-        uci.handle("position fen pas-un-fen");
+        uci.handle("position fen not-a-fen");
         assert_eq!(uci.handle("go depth 2").lines, vec!["bestmove 0000".to_string()],
                    "precondition: the refusal must be in force, or nothing below proves anything");
         log.borrow_mut().clear();
@@ -674,7 +674,7 @@ mod tests {
         bestmove_is_legal(&uci, &out.lines[0]);
         // `ucinewgame` is the other way back to a valid position, and it must clear the flag too.
         let (mut uci, _log) = uci_with_log();
-        uci.handle("position fen pas-un-fen");
+        uci.handle("position fen not-a-fen");
         uci.handle("ucinewgame");
         let out = uci.handle("go depth 2");
         assert_ne!(out.lines, vec!["bestmove 0000".to_string()],
