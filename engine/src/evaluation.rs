@@ -338,10 +338,20 @@ fn defence_holds(pos: &Position, strong: Color) -> bool {
     // Motif 1 — the defending king stands on the pawn's file, ahead of it. The pawn is blockaded
     // and can never promote, whatever the rooks do.
     //
-    // The escort guard is not caution, it is a concrete win being protected: with the pawn on the
-    // seventh, the defending king on the queening square and the strong king beside its own pawn,
-    // a rook check along the eighth rank drives the king off and the pawn goes through. Requiring
-    // two squares of king distance excludes exactly that family.
+    // **The escort guard is not a margin, it is the "is the pawn defended" test.** With the pawn on
+    // the seventh and the defending king on the queening square, a rook check along the eighth rank
+    // drives that king off — but only if it cannot simply take the pawn on its way. One square of
+    // king distance decides which, and Stockfish at depth 24 puts a whole game between the two:
+    //
+    // | escort | after Ra8+ | verdict |
+    // |--------|------------|---------|
+    // | `Kc6`, two squares from `e7` | `Kf7`, `Kxe7`, `Rb8` | **score 0** — the king just takes it |
+    // | `Kd6`, beside `e7`           | `Kf7`, `Rb8`          | **mate in 6**, pv `Ra8+ Rb8 Rxb8` |
+    //
+    // So `>= 2` is exact rather than cautious: at distance 1 the escort defends the pawn, `Kxe7`
+    // disappears from the list, and the position is won. Established by measurement after a review
+    // probed this family — the first reading here called the drawn case a win by overlooking
+    // `Kxe7`, which is the move the whole guard is about.
     if defender.0 == pawn.0 && defender.1 > pawn.1 && king_distance(escort, pawn) >= 2 {
         return true;
     }
@@ -1192,6 +1202,7 @@ mod tests {
         }
     }
 
+
     // ------------------------------------------- rook and pawn against rook (#81)
 
     // Every threshold below was **read off the engine before it was written**, not chosen: the
@@ -1361,6 +1372,40 @@ mod tests {
             evaluate(&p),
             raw / HELD_DIVISOR,
             "and it must not have picked up the rook-and-pawn divisor",
+        );
+    }
+
+
+    #[test]
+    fn the_escort_guard_turns_on_whether_the_pawn_is_defended() {
+        // **The boundary of the escort guard, pinned by a pair that differs by one square.** The
+        // guard is not a margin: at distance 1 the escort defends the pawn, so a rook check along
+        // the eighth rank cannot be answered by taking it, and the position is won. At distance 2
+        // the pawn is undefended, `Kxe7` is on the list, and the position is dead.
+        //
+        // Stockfish at depth 24 on the two, and it puts a whole game between them:
+        //
+        // | escort | verdict | this arm |
+        // |--------|---------|----------|
+        // | `Kc6`, two squares from `e7` | **score 0** | fires, 219 → 54 |
+        // | `Kd6`, beside `e7`           | **mate in 6**, pv `Ra8+ Rb8 Rxb8` | inert, 226 |
+        //
+        // This pair exists because a review probed exactly this family, and because the first
+        // reading of it here — mine — called the drawn position a win by overlooking `Kxe7`. A
+        // threshold nobody has tried to move from both sides is a threshold nobody has checked.
+        let undefended = Position::from_fen("4k3/4P3/2K5/8/8/8/1r6/R7 w - - 0 1").unwrap();
+        let defended = Position::from_fen("4k3/4P3/3K4/8/8/8/1r6/R7 w - - 0 1").unwrap();
+        assert!(
+            evaluate(&undefended) * 2 < without_scaling(|| evaluate(&undefended)),
+            "an undefended pawn on the seventh is held: {} against {} raw",
+            evaluate(&undefended),
+            without_scaling(|| evaluate(&undefended)),
+        );
+        assert_eq!(
+            evaluate(&defended),
+            without_scaling(|| evaluate(&defended)),
+            "one square closer the escort defends the pawn and it is mate in 6 — the arm must be \
+             inert",
         );
     }
 
