@@ -840,6 +840,46 @@ mod tests {
     // ------------------------------------------------------------------- mobility (#77)
 
     #[test]
+    fn mobility_counts_only_squares_a_piece_could_move_to() {
+        // **The definition of the term, and the one line nothing else asserts.** `mobility_from`
+        // excludes squares occupied by one's own side; mutating it to count them left the entire
+        // suite green, because the error is *symmetric* — the mirror test still reads zero — and
+        // it preserves the ordering, so the cramped-versus-free comparison still holds. Every
+        // other test here compares two positions, and this defect moves both.
+        //
+        // Asserted as a statement about chess rather than as a number: on the initial board, a
+        // bishop behind its own pawns commands nothing at all, and a rook in the corner nothing
+        // either. Counting own pieces would make them 2 each.
+        let p = Position::initial();
+        assert_eq!(
+            p.mobility_from(Square::C1, Piece::Bishop, Color::White), 0,
+            "a bishop on its initial square is blocked by its own pawn and its own knight",
+        );
+        assert_eq!(
+            p.mobility_from(Square::A1, Piece::Rook, Color::White), 0,
+            "a rook in the corner is blocked by its own pawn and its own knight",
+        );
+        assert_eq!(
+            p.mobility_from(Square::D1, Piece::Queen, Color::White), 0,
+            "a queen on its initial square commands nothing: every ray runs into its own side",
+        );
+        // The control that keeps the three zeros from proving nothing: the knight *can* jump over
+        // its own pieces, and reads exactly the two squares it really has.
+        assert_eq!(
+            p.mobility_from(Square::B1, Piece::Knight, Color::White), 2,
+            "a knight on b1 has exactly a3 and c3 — c1 and d2 are its own pieces",
+        );
+        // And once the board opens, the same bishop counts: without the control above, a term
+        // that always returned zero would satisfy the assertions.
+        let opened = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/4P3/PPPP1PPP/RNBQKBNR b KQkq - 0 1")
+            .unwrap();
+        assert!(
+            opened.mobility_from(Square::F1, Piece::Bishop, Color::White) > 0,
+            "precondition: with the e-pawn advanced the light bishop must see something",
+        );
+    }
+
+    #[test]
     fn mobility_cancels_on_a_mirrored_position() {
         // The load-bearing control. A term that did not cancel on a symmetric position would be
         // a side-to-move bonus wearing a positional name — and it would show up as strength in
