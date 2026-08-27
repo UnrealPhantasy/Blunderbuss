@@ -291,6 +291,36 @@ impl Position {
         )
     }
 
+    /// How many squares the `piece` standing on `square` commands, excluding squares occupied by
+    /// its own side.
+    ///
+    /// **One attack lookup and one popcount, and it takes the square rather than the piece type
+    /// on purpose.** The evaluation already walks the 64 squares once; asking per square lets the
+    /// term ride that walk instead of adding a second pass. A king-safety term was abandoned on
+    /// this engine for costing 0.23 µs per node, so the shape of the call matters as much as what
+    /// it computes.
+    ///
+    /// What is counted is *pseudo-legal* reach: a pinned bishop still counts the squares it looks
+    /// at. That is the standard formulation and it is deliberate — a pin is a fact about one move,
+    /// while mobility says how much a position constrains a side, and paying for legality here
+    /// would cost more than the term is worth.
+    pub fn mobility_from(&self, square: Square, piece: Piece, color: Color) -> u32 {
+        use cozy_chess::{get_bishop_moves, get_king_moves, get_knight_moves, get_pawn_attacks,
+                         get_rook_moves};
+        let occupied = self.0.occupied();
+        let reach = match piece {
+            Piece::Knight => get_knight_moves(square),
+            Piece::Bishop => get_bishop_moves(square, occupied),
+            Piece::Rook => get_rook_moves(square, occupied),
+            // A queen is a rook and a bishop on one square, which is how the lookups are built —
+            // two probes rather than a third table.
+            Piece::Queen => get_rook_moves(square, occupied) | get_bishop_moves(square, occupied),
+            Piece::King => get_king_moves(square),
+            Piece::Pawn => get_pawn_attacks(square, color),
+        };
+        (reach & !self.0.colors(color)).len()
+    }
+
     pub fn legal_moves(&self) -> Vec<Move> {
         let mut moves = Vec::new();
         // cozy-chess idiom: generation is a *visitor*. We pass it an `FnMut`
