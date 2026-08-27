@@ -158,6 +158,18 @@ fn is_passed(square: usize, color: Color, enemy_pawns: u64) -> bool {
 /// keeps the ordering while removing the illusion of a win.
 const DRAWISH_DIVISOR: i32 = 8;
 
+/// By how much a rook-and-pawn edge is divided once the defending king holds the pawn's path.
+///
+/// **Gentler than [`DRAWISH_DIVISOR`], and the difference is the point.** That one divides by 8
+/// because its condition is a theorem: K+N against K cannot be mated, so it cannot be wrong. This
+/// one divides a *judgement* — rook and pawn against rook is drawn or won depending on where the
+/// kings stand, and the conditions below read three squares to decide. A misjudgement here costs a
+/// win we would otherwise convert, so it is not multiplied by eight.
+///
+/// Four is still enough to do the work: the edge reads around +100 before scaling, and what the
+/// search is trading away from is the +300 it held five moves earlier.
+const HELD_DIVISOR: i32 = 4;
+
 // The switch the tests use to hold the factor off, so a comparison is between two verdicts of
 // **one** binary rather than between two builds. Compiled out of production entirely.
 //
@@ -210,6 +222,113 @@ fn cannot_mate(pos: &Position, pawns: [u64; 2], balance: i32) -> bool {
         + pos.count(strong, Piece::Rook)
         + pos.count(strong, Piece::Queen);
     knights == 2 && others == 0
+}
+
+/// King distance: how many king moves separate two squares.
+///
+/// Chebyshev rather than Euclidean because a king crosses a file and a rank in the same single
+/// move, so the diagonal costs no more than the straight line.
+fn king_distance(a: (usize, usize), b: (usize, usize)) -> usize {
+    (a.0.abs_diff(b.0)).max(a.1.abs_diff(b.1))
+}
+
+/// Whether the position is **exactly** rook and pawn against rook: one pawn on the board, one rook
+/// each, and nothing else but the kings.
+///
+/// Returns which side owns the pawn, since that — and not the sign of the balance — is what makes
+/// one side the strong one here. Reading the material fact keeps the answer independent of the
+/// piece-square tables, which could in principle tip a balance the other way.
+fn rook_and_pawn_against_rook(pos: &Position, pawns: [u64; 2]) -> Option<Color> {
+    // The cheap gate first, and it is what keeps this off the hot path: one OR and one popcount
+    // reject every position holding two pawns or more, which is all but the deepest endgames.
+    // `evaluate` runs at every leaf, and this engine has already abandoned an evaluation term
+    // (king safety, #29) for costing 0.23 µs a node.
+    if (pawns[0] | pawns[1]).count_ones() != 1 {
+        return None;
+    }
+    let strong = if pawns[Color::White as usize] != 0 {
+        Color::White
+    } else {
+        Color::Black
+    };
+    // Rust idiom: `!color` is the `Not` operator implemented on `Color` by cozy-chess, so it reads
+    // as "the other side" rather than as a match on two variants.
+    let weak = !strong;
+    if pos.count(strong, Piece::Rook) != 1 || pos.count(weak, Piece::Rook) != 1 {
+        return None;
+    }
+    for piece in [Piece::Knight, Piece::Bishop, Piece::Queen] {
+        if pos.count(strong, piece) != 0 || pos.count(weak, piece) != 0 {
+            return None;
+        }
+    }
+    Some(strong)
+}
+
+/// Whether the defending king already holds the pawn's path, so that rook and pawn against rook is
+/// a draw rather than the edge the material count reads.
+///
+/// **This is a judgement, not a theorem** — the distinction that sets this arm apart from
+/// [`cannot_mate`]. Rook and pawn against rook is the most-analysed endgame in chess precisely
+/// because it goes both ways, and the fork is the placement of the kings: a defending king that
+/// reaches the file in front of the pawn draws, one that is cut off from it loses to the bridge
+/// (the Lucena position). Two motifs are recognised, and both read only the three king-and-pawn
+/// squares.
+///
+/// **The guard on the strong king is what protects the other face of the error.** At move 30 this
+/// engine converts 95.6% of the positions Stockfish calls winning for it; a factor that flattened a
+/// won Lucena would make the search decline a win it would otherwise have brought home. Every
+/// condition below therefore has to fail closed.
+fn defence_holds(pos: &Position, strong: Color) -> bool {
+    // Everything is read from the strong side's point of view: `relative_to` flips the rank for
+    // Black, so rank 0 is always the strong side's home rank and rank 7 the promotion rank. Same
+    // idiom the passed-pawn schedule uses, and it keeps `cozy_chess::Rank` out of this module.
+    let oriented = |square: Square| {
+        let index = square.relative_to(strong) as usize;
+        (index % 8, index / 8)
+    };
+    // Each of the three is known to exist: the gate above counted exactly one pawn, and a position
+    // without both kings cannot be parsed.
+    let pawn = oriented(
+        pos.pieces_of(strong, Piece::Pawn)
+            .next_square()
+            .expect("the gate counted exactly one pawn"),
+    );
+    let defender = oriented(
+        pos.pieces_of(!strong, Piece::King)
+            .next_square()
+            .expect("both kings are always on the board"),
+    );
+    let escort = oriented(
+        pos.pieces_of(strong, Piece::King)
+            .next_square()
+            .expect("both kings are always on the board"),
+    );
+
+    // Motif 1 — the defending king stands on the pawn's file, ahead of it. The pawn is blockaded
+    // and can never promote, whatever the rooks do.
+    //
+    // The escort guard is not caution, it is a concrete win being protected: with the pawn on the
+    // seventh, the defending king on the queening square and the strong king beside its own pawn,
+    // a rook check along the eighth rank drives the king off and the pawn goes through. Requiring
+    // two squares of king distance excludes exactly that family.
+    if defender.0 == pawn.0 && defender.1 > pawn.1 && king_distance(escort, pawn) >= 2 {
+        return true;
+    }
+
+    // Motif 2 — the defending king is within one king move of the queening square while the pawn
+    // has not passed its own fifth rank. The defender is not cut off, so it reaches the file in
+    // front of the pawn in time: Philidor territory.
+    //
+    // The second half of the condition asks that the strong king has not passed its own fifth rank
+    // either. Past it, the escort is close enough to fight for the queening square and the verdict
+    // stops being clear — so the arm abstains rather than guess.
+    let queening = (pawn.0, 7);
+    if pawn.1 <= 4 && king_distance(defender, queening) <= 1 && escort.1 <= 4 {
+        return true;
+    }
+
+    false
 }
 
 pub fn evaluate(pos: &Position) -> i32 {
@@ -291,8 +410,18 @@ pub fn evaluate(pos: &Position) -> i32 {
     let scaling_on = SCALING.with(|s| s.get());
     #[cfg(not(test))]
     let scaling_on = true;
-    if scaling_on && cannot_mate(pos, pawns, balance) {
-        balance /= DRAWISH_DIVISOR;
+    if scaling_on {
+        // `else if` rather than two statements, because the two arms are mutually exclusive **by
+        // construction** and the code should say so: the first requires no pawn on the board, the
+        // second requires exactly one. Written as two `if`s, a later widening of either condition
+        // could divide the same balance twice and no test would name what broke.
+        if cannot_mate(pos, pawns, balance) {
+            balance /= DRAWISH_DIVISOR;
+        } else if rook_and_pawn_against_rook(pos, pawns)
+            .is_some_and(|strong| defence_holds(pos, strong))
+        {
+            balance /= HELD_DIVISOR;
+        }
     }
 
     // Flip to the side-to-move perspective: negamax wants "good for me" > 0.
@@ -876,6 +1005,7 @@ mod tests {
              against {gain_when_blocked}",
         );
     }
+
     // ---------------------------------------------------------- endgame scaling (#79)
 
     #[test]
@@ -980,6 +1110,179 @@ mod tests {
             evaluate(&crushing) > 500,
             "a queen up with pawns on the board is a win: {} cp",
             evaluate(&crushing),
+        );
+    }
+
+
+    // ------------------------------------------- rook and pawn against rook (#81)
+
+    // Every threshold below was **read off the engine before it was written**, not chosen: the
+    // scaled and raw scores are quoted beside each position. A first draft of a #79 test picked
+    // 200 cp for a knight against a pawn that actually evaluates to 177.
+    //
+    // And each assertion is made *against the unscaled score of the same position* rather than
+    // against a bare number. A motif-1 position reads 99 cp raw, so `abs() < 100` would have
+    // passed with the arm removed entirely — an inert test, and this project has found six.
+
+    #[test]
+    fn a_blockading_king_holds_the_pawn() {
+        // Motif 1: the defending king stands on the pawn's file, ahead of it, so the pawn can
+        // never promote whatever the rooks do. Raw 99 cp, scaled 24.
+        //
+        // Both sides, and the mirror is not decoration: the arm orients every square with
+        // `relative_to(strong)`, so a version that only handled White would pass the first
+        // assertion and fail on a real board half the time. The two positions are the same one
+        // reflected, and they read the same number.
+        for (fen, name) in [
+            ("r7/8/3k4/3P4/8/8/1K6/7R w - - 0 1", "White pawn d5 blockaded on d6"),
+            ("7r/1k6/8/8/3p4/3K4/8/R7 b - - 0 1", "the same, mirrored: Black pawn d4 on d3"),
+        ] {
+            let p = Position::from_fen(fen).unwrap();
+            let raw = without_scaling(|| evaluate(&p));
+            let held = evaluate(&p);
+            assert!(
+                held.abs() * 2 < raw.abs(),
+                "{name}: a blockaded pawn must lose most of its edge, {held} against {raw} raw",
+            );
+            assert!(
+                held.abs() < 60,
+                "{name}: and what is left must read as a draw, not an edge: {held} cp",
+            );
+        }
+    }
+
+    #[test]
+    fn a_king_beside_the_queening_square_holds_the_pawn() {
+        // Motif 2: the defending king is within one king move of the queening square while the
+        // pawn has not passed its own fifth rank, so it reaches the file in front of the pawn in
+        // time — Philidor territory. Raw 210 cp, scaled 52.
+        //
+        // This one matters on its own because motif 1 cannot see it: the king is on c8, beside the
+        // d-file, so the blockade test fails and only this arm fires. Mirrored for the same reason
+        // as above.
+        for (fen, name) in [
+            ("2k5/8/8/3P4/3K4/8/8/r6R w - - 0 1", "White pawn d5, Black king on c8"),
+            ("R6r/8/8/3k4/3p4/8/8/2K5 b - - 0 1", "the same, mirrored: White king on c1"),
+        ] {
+            let p = Position::from_fen(fen).unwrap();
+            let raw = without_scaling(|| evaluate(&p));
+            let held = evaluate(&p);
+            assert!(
+                held.abs() * 2 < raw.abs(),
+                "{name}: the defence arrives in time, {held} against {raw} raw",
+            );
+        }
+    }
+
+    #[test]
+    fn the_lucena_position_keeps_its_winning_score() {
+        // **The criterion that guards the other face of the error**, and the reason this brick is
+        // shaped differently from #79. Rook and pawn against rook is won when the defending king
+        // is cut off from the pawn's file and the strong king escorts: the Lucena position, won by
+        // building a bridge. Raw 245 cp, and it must stay 245.
+        //
+        // At move 30 this engine converts 95.6% of the positions Stockfish calls winning for it.
+        // A factor that flattened this position would make the search decline a win it would
+        // otherwise have brought home, which is a cost #79's condition could never incur.
+        let p = Position::from_fen("8/4PK1k/8/8/8/8/r7/3R4 w - - 0 1").unwrap();
+        assert_eq!(
+            evaluate(&p),
+            without_scaling(|| evaluate(&p)),
+            "the Lucena position is won and the factor must not touch it",
+        );
+        assert!(
+            evaluate(&p) > 200,
+            "and it must still read as a win: {} cp",
+            evaluate(&p),
+        );
+    }
+
+    #[test]
+    fn an_escorting_king_beside_its_pawn_keeps_the_win() {
+        // The guard on motif 1, and it protects a concrete win rather than a vague risk. Pawn on
+        // the seventh, defending king on the queening square, strong king beside its own pawn: a
+        // rook check along the eighth rank drives the king off and the pawn goes through. The
+        // blockade is real and the position is still won, so two squares of king distance are
+        // required. Raw 236 cp, untouched.
+        for (fen, name) in [
+            ("3k4/3P4/3K4/8/8/8/8/r6R w - - 0 1", "White Kd6 beside Pd7, Black Kd8"),
+            ("R6r/8/8/8/8/3k4/3p4/3K4 b - - 0 1", "the same, mirrored"),
+        ] {
+            let p = Position::from_fen(fen).unwrap();
+            assert_eq!(
+                evaluate(&p),
+                without_scaling(|| evaluate(&p)),
+                "{name}: an escorted pawn on the seventh is a win, not a blockade",
+            );
+        }
+    }
+
+    #[test]
+    fn a_strong_king_past_its_fifth_rank_abstains() {
+        // The guard on motif 2. Past its own fifth rank the escort is close enough to fight for
+        // the queening square and the verdict stops being clear, so the arm abstains rather than
+        // guess. Raw 182 cp, untouched.
+        //
+        // Asserted as inertness and **not** as a verdict: we are not claiming this position is
+        // won, only that we decline to call it drawn. Overstating it would be a claim no
+        // measurement here can support.
+        let p = Position::from_fen("2k5/8/3K4/3P4/8/8/8/r6R w - - 0 1").unwrap();
+        assert_eq!(
+            evaluate(&p),
+            without_scaling(|| evaluate(&p)),
+            "with the escort on the sixth the arm must abstain, not guess",
+        );
+    }
+
+    #[test]
+    fn the_gate_is_exactly_rook_and_pawn_against_rook() {
+        // The gate admits one pawn on the board, one rook each and nothing else. Each position
+        // below is the motif-1 draw with exactly one thing added or removed, so the assertion
+        // isolates the gate rather than the motif.
+        //
+        // Asserted as equality with the factor disabled rather than against a threshold: what has
+        // to hold is that the arm does not touch these positions **at all**, and a threshold would
+        // need recalibrating every time a piece-square table moves.
+        let held = Position::from_fen("r7/8/3k4/3P4/8/8/1K6/7R w - - 0 1").unwrap();
+        assert!(
+            evaluate(&held).abs() < 60,
+            "precondition: the plain case must be scaled, or nothing below proves anything",
+        );
+        for (fen, name) in [
+            ("r7/8/3k4/3P4/8/6N1/1K6/7R w - - 0 1", "a knight as well"),
+            ("r7/8/3k4/3P4/3p4/8/1K6/7R w - - 0 1", "a pawn for the defender too"),
+            ("r7/8/3k4/3P4/3P4/8/1K6/7R w - - 0 1", "R+P+P against R, out of scope"),
+            ("r7/8/3k4/3P4/8/8/1K6/R6R w - - 0 1", "a second rook for the strong side"),
+            ("4k3/8/8/8/8/8/3P4/4K3 w - - 0 1", "K+P against K, no rooks at all"),
+        ] {
+            let p = Position::from_fen(fen).unwrap();
+            assert_eq!(
+                evaluate(&p),
+                without_scaling(|| evaluate(&p)),
+                "{name}: the gate must switch the arm off entirely",
+            );
+        }
+    }
+
+    #[test]
+    fn the_pawnless_arm_keeps_its_own_divisor() {
+        // The two arms are mutually exclusive by construction — one requires no pawn on the board,
+        // the other exactly one — and they divide by different amounts on purpose: 8 for a verdict
+        // that cannot be wrong, 4 for one that can. This asserts the pawnless case still takes
+        // its own divisor and not the new one, which is what a merge folding the two arms into a
+        // single condition would break while every other test stayed green.
+        let p = Position::from_fen("4k3/8/8/8/8/8/8/3NK3 w - - 0 1").unwrap();
+        let raw = without_scaling(|| evaluate(&p));
+        assert_eq!(
+            evaluate(&p),
+            raw / DRAWISH_DIVISOR,
+            "K+N against K belongs to the pawnless arm: {} against {raw} raw",
+            evaluate(&p),
+        );
+        assert_ne!(
+            evaluate(&p),
+            raw / HELD_DIVISOR,
+            "and it must not have picked up the rook-and-pawn divisor",
         );
     }
 
