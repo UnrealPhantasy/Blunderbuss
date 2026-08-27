@@ -837,6 +837,7 @@ mod tests {
              against {gain_when_blocked}",
         );
     }
+
     // ------------------------------------------------------------------- mobility (#77)
 
     #[test]
@@ -876,6 +877,59 @@ mod tests {
         assert!(
             opened.mobility_from(Square::F1, Piece::Bishop, Color::White) > 0,
             "precondition: with the e-pawn advanced the light bishop must see something",
+        );
+
+        // **The other half of the definition, and it was the half nothing asserted.** Only *one's
+        // own* side is excluded, so a square held by an enemy piece counts — it is a capture, which
+        // is a move. Narrowing the mask to `!occupied()` — "empty squares only" — used to leave this
+        // whole test green and reddened one transposition-table assertion by accident.
+        //
+        // Asserted as a **pair on the same square**, since that is what isolates the asymmetry: the
+        // three zeros above and every comparison in this file move together when both sides are
+        // excluded, and a single count proves nothing about which side was meant.
+        //
+        // Both families of piece, because they fail differently: a jumper simply includes or
+        // excludes the square, while for a slider the enemy piece is the *last* square of the ray.
+        for (enemy, ours, empty, sq, piece, name) in [
+            (
+                "4k3/8/8/8/8/2p5/8/1N2K3 w - - 0 1",
+                "4k3/8/8/8/8/2P5/8/1N2K3 w - - 0 1",
+                "4k3/8/8/8/8/8/8/1N2K3 w - - 0 1",
+                Square::B1, Piece::Knight, "a knight on b1, c3 held",
+            ),
+            (
+                "4k3/8/8/8/p7/8/8/R3K3 w - - 0 1",
+                "4k3/8/8/8/P7/8/8/R3K3 w - - 0 1",
+                "4k3/8/8/8/8/8/8/R3K3 w - - 0 1",
+                Square::A1, Piece::Rook, "a rook on a1, a4 held",
+            ),
+        ] {
+            let m = |fen: &str| {
+                Position::from_fen(fen).unwrap().mobility_from(sq, piece, Color::White)
+            };
+            assert_eq!(
+                m(enemy), m(empty).min(m(enemy)),
+                "{name}: precondition, an enemy piece cannot add mobility",
+            );
+            assert!(
+                m(enemy) > m(ours),
+                "{name}: an enemy piece on a reachable square is a capture and must count, \
+                 while one of ours must not — read {} against {}",
+                m(enemy), m(ours),
+            );
+        }
+        // And the slider case pinned exactly: the enemy pawn on a4 is counted *and* stops the ray,
+        // so the a-file contributes a2, a3, a4 and nothing beyond. Measured before written — 6 with
+        // the pawn there, 10 with the file clear.
+        let blocked = Position::from_fen("4k3/8/8/8/p7/8/8/R3K3 w - - 0 1").unwrap();
+        let clear = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
+        assert_eq!(
+            blocked.mobility_from(Square::A1, Piece::Rook, Color::White), 6,
+            "the enemy pawn counts and ends the ray: a2, a3, a4, then b1, c1, d1",
+        );
+        assert_eq!(
+            clear.mobility_from(Square::A1, Piece::Rook, Color::White), 10,
+            "control: with the file clear the same rook reads the whole of it",
         );
     }
 
