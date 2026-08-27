@@ -199,6 +199,38 @@ fn cannot_mate(pos: &Position, pawns: [u64; 2], balance: i32) -> bool {
         return false;
     }
     let strong = if balance > 0 { Color::White } else { Color::Black };
+    // Rust idiom: `!color` is the `Not` operator cozy-chess implements on `Color`, so this reads as
+    // "the other side" rather than as a match on two variants.
+    let weak = !strong;
+    // **The weak side may hold nothing more than a single minor**, and without this line the
+    // function stops matching its name. Everything above is a statement about what the *strong
+    // side's material* can do; the threshold below is a statement about the *edge between the two
+    // sides*, and the two part company the moment the weak side holds something real. Measured on
+    // this branch before the line existed, all pawnless and all divided by eight:
+    //
+    // | position       | theory           | scored |
+    // |----------------|------------------|--------|
+    // | K+Q vs K+R     | win              |     49 |
+    // | Q+R+N vs Q+R   | clear advantage  |     35 |
+    // | 2Q vs Q+R      | win              |     47 |
+    //
+    // The second is not even an endgame — a knight up with queens and rooks still on the board is
+    // exactly the middlegame case this brick must never touch.
+    //
+    // Narrow on purpose: every true positive the rule was built for survives, because in each of
+    // them the weak side has a bare king (a lone minor, two knights) or a single minor (rook
+    // against knight, rook against bishop, both drawn). What stops firing is the whole family
+    // where the weak side answers with a rook or a queen.
+    //
+    // One true positive goes with them, and it is a decision rather than an oversight: **R+N
+    // against R is a theoretical draw** and was firing here by accident of the threshold, never
+    // having been named in this brick's scope. It needs a rule of its own — the weak side holding
+    // a rook is precisely what makes it drawn, so no widening of *this* condition can express it.
+    if pos.count(weak, Piece::Rook) + pos.count(weak, Piece::Queen) > 0
+        || pos.count(weak, Piece::Knight) + pos.count(weak, Piece::Bishop) > 1
+    {
+        return false;
+    }
     if balance.abs() < PAWNLESS_WIN_THRESHOLD {
         return true;
     }
@@ -981,6 +1013,56 @@ mod tests {
             "a queen up with pawns on the board is a win: {} cp",
             evaluate(&crushing),
         );
+    }
+
+
+    #[test]
+    fn a_pawnless_edge_the_weak_side_can_answer_is_not_a_draw() {
+        // AC#4, and the case that had no test: the factor keys on pawns, so a **pawnless** board
+        // still crowded with pieces reaches it, and the threshold it then applies is about the
+        // *edge between the sides* rather than about what the strong side can mate with.
+        //
+        // Every position below was measured before the weak-side condition existed and was being
+        // divided by eight. The middle one is not an endgame at all — a knight up with queens and
+        // rooks on the board — which is exactly what AC#4 says must stay a win.
+        for (fen, name, was) in [
+            ("4k2r/8/8/8/8/8/8/3QK3 w - - 0 1", "K+Q against K+R", 49),
+            ("r2qk3/8/8/8/8/8/8/RN1QK3 w - - 0 1", "Q+R+N against Q+R", 35),
+            ("r2qk3/8/8/8/8/8/8/Q2QK3 w - - 0 1", "2Q against Q+R", 47),
+        ] {
+            let p = Position::from_fen(fen).unwrap();
+            assert_eq!(
+                evaluate(&p),
+                without_scaling(|| evaluate(&p)),
+                "{name}: the weak side answers with a rook or a queen, so the factor must not \
+                 fire — it used to read {was} cp",
+            );
+            assert!(
+                evaluate(&p) > 200,
+                "{name}: and it must read as the advantage it is: {} cp",
+                evaluate(&p),
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_minor_on_the_weak_side_still_scales() {
+        // The other half of the condition, and it is what keeps it narrow. Rook against a lone
+        // minor is drawn, the weak side holds one piece, and both must keep scaling — a fix
+        // written as "the weak side must be bare" would have passed every assertion above while
+        // throwing these two away.
+        for (fen, name) in [
+            ("4n3/4k3/8/8/8/8/8/3RK3 w - - 0 1", "K+R against K+N"),
+            ("4b3/4k3/8/8/8/8/8/3RK3 w - - 0 1", "K+R against K+B"),
+        ] {
+            let p = Position::from_fen(fen).unwrap();
+            assert!(
+                evaluate(&p).abs() < 60,
+                "{name} is drawn and must still be scaled: {} cp against {} raw",
+                evaluate(&p),
+                without_scaling(|| evaluate(&p)),
+            );
+        }
     }
 
 }
