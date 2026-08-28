@@ -248,6 +248,21 @@ struct Uci {
     ///
     /// `None` when the book loaded cleanly — the ordinary case says nothing, as it should.
     book_note: Option<String>,
+    /// Why the last `position` command was refused, or `None` when the engine holds a position
+    /// it was actually given.
+    ///
+    /// **The state exists because dropping the command silently is worse than refusing it.** Before
+    /// this field, an unparseable or illegal FEN left the previous position in place and said
+    /// nothing; the next `go` then searched **whatever the engine happened to be holding** and
+    /// answered with a move that was well formed for that position and meaningless for the one the
+    /// caller asked about. Measured: after `position startpos`, a rejected endgame FEN produced
+    /// `bestmove d2d4` from the book, or `bestmove e2e4` at `score cp 20` with the book off. Neither
+    /// names a square that exists in the position that was sent.
+    ///
+    /// A `String` rather than a `bool` so the refusal can say *what* it refused — the whole cost of
+    /// the original defect was that the symptom pointed at the caller.
+    rejected: Option<String>,
+
     /// What the engine has learned and keeps between moves — the transposition table.
     ///
     /// It lives here, at the protocol layer, because this is the only level that knows
@@ -297,6 +312,7 @@ impl Uci {
             info,
             engine,
             book_note,
+            rejected: None,
         }
     }
 
@@ -368,6 +384,8 @@ impl Uci {
             Some("ucinewgame") => {
                 self.position = Position::initial();
                 self.history.clear();
+                // A valid position has just been set, so any refusal is moot.
+                self.rejected = None;
                 // A new game must not inherit the previous one's positions: they would
                 // compete for slots with the ones that matter now. Within a game the
                 // opposite is true, and that is the point of keeping the table at all.
@@ -395,10 +413,14 @@ impl Uci {
                 let fen = args[1..setup_end].join(" ");
                 match Position::from_fen(&fen) {
                     Ok(p) => p,
-                    Err(_) => return, // malformed FEN: leave the position unchanged
+                    // The previous position is still kept — inventing one would replace a wrong
+                    // answer with a different wrong answer — but the refusal is now **recorded and
+                    // announced**, and `go` will not search until a valid position arrives.
+                    Err(e) => return self.refuse(format!("cannot use this FEN: {e} — {fen}")),
                 }
             }
-            _ => return,
+            Some(other) => return self.refuse(format!("unknown position type: {other}")),
+            None => return self.refuse("no position given".to_string()),
         };
 
         // The history is rebuilt from scratch on every `position` command rather than
@@ -414,12 +436,42 @@ impl Uci {
                         history.push(pos.hash());
                         pos = next;
                     }
-                    None => break, // stop at the first move that does not apply
+                    None => {
+                        // Announced but **not** refused, and the asymmetry is deliberate. The
+                        // position reached so far is legal, so the engine has something real to
+                        // search; refusing here would end a game over one token a front end
+                        // spelled differently, which is the failure mode `set_option` is
+                        // documented to avoid. What was silent is *where* the list stopped, and
+                        // that is now on the record — a truncated game and a complete one are
+                        // indistinguishable to the caller otherwise.
+                        (self.info)(format!(
+                            "info string move list stopped at \"{tok}\" ({} of {} applied)",
+                            history.len(),
+                            args.len() - i - 1,
+                        ));
+                        break;
+                    }
                 }
             }
         }
         self.position = pos;
         self.history = history;
+        // A position was accepted, so any earlier refusal is cleared. The failure must not be
+        // sticky: a GUI that sends one bad FEN and then a good one gets a working engine back.
+        self.rejected = None;
+    }
+
+    /// Records and announces a refused `position`, and returns nothing so the caller can
+    /// `return self.refuse(…)` on the spot.
+    ///
+    /// On the `info` channel rather than in the `Response`: `handle` answers `position` with
+    /// nothing at all, and this is the channel `setoption` already uses for the book note — the
+    /// same one a test can read.
+    fn refuse(&mut self, reason: String) {
+        (self.info)(format!(
+            "info string position rejected: {reason}; not searching until a valid position arrives"
+        ));
+        self.rejected = Some(reason);
     }
 
     /// `go [depth N | movetime N | wtime N btime N winc N binc N | infinite]`
@@ -428,6 +480,15 @@ impl Uci {
     /// Every form goes through the same two steps — plan, then search — so the engine
     /// has a single search path whatever the GUI sends.
     fn go(&mut self, args: &[&str]) -> String {
+        // **The criterion this whole change exists for.** Searching the position the engine happens
+        // to be holding produces a move that looks entirely legitimate and answers a different
+        // question. `bestmove 0000` is what the protocol already uses for "no move", and an arena
+        // scores it as a loss rather than playing something arbitrary — which is the correct
+        // outcome for an engine that has been told nothing it could understand.
+        if let Some(reason) = self.rejected.clone() {
+            (self.info)(format!("info string refusing to search: {reason}"));
+            return "bestmove 0000".to_string();
+        }
         let plan = parse_go(args, self.position.side_to_move(), self.default_budget);
         let deadline = plan.budget.map(|b| Instant::now() + b);
 
@@ -488,6 +549,181 @@ mod tests {
         let mv_str = line.strip_prefix("bestmove ").expect("bestmove prefix");
         let mv = uci.position.move_from_uci(mv_str).expect("a parseable move");
         assert!(uci.position.try_play(mv).is_ok(), "the reported move must be legal");
+    }
+
+
+
+    // ---------------------------------------------- a refused `position` (#83)
+
+    // Helper: the `info string` lines a command produced, in order.
+    //
+    // The refusal travels on the `info` channel rather than in the `Response`, because `handle`
+    // answers `position` with nothing at all — and it is the channel `setoption` already uses for
+    // the book note, which is what makes both observable from a test at all.
+    fn strings_said(log: &Rc<RefCell<Vec<String>>>) -> Vec<String> {
+        log.borrow().iter().filter(|l| l.starts_with("info string")).cloned().collect()
+    }
+
+    #[test]
+    fn an_unusable_fen_is_announced_rather_than_dropped() {
+        // Four ways for a `position fen` to be unusable, and cozy-chess refuses all four with the
+        // same message — so the assertion is on the **prefix and the echoed FEN**, not on the
+        // library's wording, which a dependency bump is free to change.
+        //
+        // The second case is the one that motivated this: `r7/8/3k4/2PP4/8/8/1K6/7R w` is
+        // well-formed and **illegal** — the c5 pawn checks the enemy king with the other side to
+        // move. Nothing in the protocol stream said so, and a local board spent an hour looking at
+        // its own code.
+        for (fen, name) in [
+            ("not-a-fen", "not a FEN at all"),
+            ("r7/8/3k4/2PP4/8/8/1K6/7R w - - 0 1", "well-formed but illegal (opposite check)"),
+            ("8/8/8/8/8/8/8/8 w - - 0 1", "no kings"),
+            ("4k3/8/8/8/8/8/8/4K3", "truncated — no side to move"),
+        ] {
+            let (mut uci, log) = uci_with_log();
+            log.borrow_mut().clear();
+            uci.handle(&format!("position fen {fen}"));
+            let said = strings_said(&log);
+            assert_eq!(said.len(), 1, "{name}: expected exactly one note, got {said:?}");
+            assert!(
+                said[0].starts_with("info string position rejected"),
+                "{name}: the note must name the rejection: {}",
+                said[0],
+            );
+            assert!(
+                said[0].contains(fen),
+                "{name}: and echo what was refused, so it can be reproduced: {}",
+                said[0],
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_position_command_is_announced_too() {
+        // The other two silent paths, which had nothing to do with FEN parsing: an unrecognised
+        // first token, and no token at all. Both used to `return` without a word.
+        for (cmd, fragment, name) in [
+            ("position bidule", "bidule", "unknown position type"),
+            ("position", "no position given", "no position at all"),
+        ] {
+            let (mut uci, log) = uci_with_log();
+            log.borrow_mut().clear();
+            uci.handle(cmd);
+            let said = strings_said(&log);
+            assert_eq!(said.len(), 1, "{name}: expected one note, got {said:?}");
+            assert!(
+                said[0].contains(fragment),
+                "{name}: the note must say what it refused: {}",
+                said[0],
+            );
+        }
+    }
+
+    #[test]
+    fn go_after_a_refused_position_refuses_to_answer() {
+        // **The criterion the whole change exists for**, and it is asserted as the regression that
+        // produced the issue rather than as a property in the abstract.
+        //
+        // Before: `position startpos`, then a rejected endgame FEN, then `go` searched the position
+        // the engine happened to be holding — the *starting* one — and answered `bestmove d2d4`
+        // from the book, or `bestmove e2e4` at `score cp 20` with the book off. Both are well formed
+        // for a position nobody asked about, and neither names a square that exists in the FEN that
+        // was sent.
+        let (mut uci, log) = uci_with_log();
+        uci.handle("position startpos");
+        // Precondition: the engine answers the initial position with a legal move, which is what
+        // made the silent failure look legitimate. **Not** asserted as a specific move: cargo runs
+        // tests from the crate root, where neither book file exists, so every `Uci` built here is
+        // bookless — the same condition `a_missing_book_is_announced_rather_than_left_silent`
+        // depends on. In a real binary the stale answer was `d2d4` straight from the book.
+        let before = uci.handle("go depth 2");
+        assert_ne!(before.lines, vec!["bestmove 0000".to_string()], "precondition: it must answer");
+        bestmove_is_legal(&uci, &before.lines[0]);
+        uci.handle("position fen r7/8/3k4/2PP4/8/8/1K6/7R w - - 0 1");
+        log.borrow_mut().clear();
+        let out = uci.handle("go depth 2");
+        assert_eq!(out.lines, vec!["bestmove 0000".to_string()],
+                   "a refused position must not be answered with a move: {:?}", out.lines);
+        // And specifically not with a move for the position it is still holding.
+        for stale in ["bestmove e2e4", "bestmove d2d4"] {
+            assert!(!out.lines.iter().any(|l| l == stale),
+                    "answered {stale} — the exact regression this test exists for");
+        }
+        let said = strings_said(&log);
+        assert!(
+            said.iter().any(|l| l.starts_with("info string refusing to search")),
+            "the refusal to search must be on the record too: {said:?}",
+        );
+    }
+
+    #[test]
+    fn a_valid_position_clears_the_refusal() {
+        // The failure must not be sticky: one bad FEN followed by a good one gives a working
+        // engine back. A version that latched the flag would pass every assertion above and break
+        // any real session, since a GUI that sends one malformed command sends valid ones after.
+        let (mut uci, log) = uci_with_log();
+        uci.handle("position fen not-a-fen");
+        assert_eq!(uci.handle("go depth 2").lines, vec!["bestmove 0000".to_string()],
+                   "precondition: the refusal must be in force, or nothing below proves anything");
+        log.borrow_mut().clear();
+        uci.handle("position fen 4k3/8/8/8/8/8/8/4K3 w - - 0 1");
+        assert!(strings_said(&log).is_empty(), "an accepted position must say nothing");
+        let out = uci.handle("go depth 2");
+        assert_ne!(out.lines, vec!["bestmove 0000".to_string()],
+                   "the engine must search again once it has a position");
+        bestmove_is_legal(&uci, &out.lines[0]);
+        // `ucinewgame` is the other way back to a valid position, and it must clear the flag too.
+        let (mut uci, _log) = uci_with_log();
+        uci.handle("position fen not-a-fen");
+        uci.handle("ucinewgame");
+        let out = uci.handle("go depth 2");
+        assert_ne!(out.lines, vec!["bestmove 0000".to_string()],
+                   "ucinewgame sets a valid position, so it must lift the refusal");
+    }
+
+    #[test]
+    fn a_move_that_does_not_apply_says_where_the_list_stopped() {
+        // Announced but **not** refused, and the asymmetry is the design decision: the position
+        // reached so far is legal, so the engine has something real to search, and refusing would
+        // end a game over one token a front end spelled differently. What was silent is *where*
+        // the list stopped — a truncated game and a complete one are otherwise indistinguishable.
+        let (mut uci, log) = uci_with_log();
+        log.borrow_mut().clear();
+        uci.handle("position startpos moves e2e4 zzzz e7e5");
+        let said = strings_said(&log);
+        assert_eq!(said.len(), 1, "expected one note, got {said:?}");
+        assert!(said[0].contains("zzzz"), "the note must name the token: {}", said[0]);
+        assert!(said[0].contains("1 of 3"), "and say how far it got: {}", said[0]);
+        // The engine still answers, and from the position the applied moves reached — after `e2e4`
+        // it is Black to move, which is what makes this different from a refusal.
+        let out = uci.handle("go depth 2");
+        assert_ne!(out.lines, vec!["bestmove 0000".to_string()],
+                   "a truncated move list is not a refusal");
+        bestmove_is_legal(&uci, &out.lines[0]);
+    }
+
+    #[test]
+    fn nothing_is_said_about_a_well_formed_position() {
+        // The inertness control, and it is what stops this change from adding noise to every
+        // measurement. Three well-formed shapes, and the `info string` channel must stay empty —
+        // an arena reads that channel, and a note on every move would end up in every PGN.
+        for cmd in [
+            "position startpos",
+            "position startpos moves e2e4 e7e5 g1f3",
+            "position fen 8/8/3k4/2rP4/3K4/8/8/7R w - - 4 3 moves h1h6",
+        ] {
+            let (mut uci, log) = uci_with_log();
+            log.borrow_mut().clear();
+            uci.handle(cmd);
+            assert!(
+                strings_said(&log).is_empty(),
+                "`{cmd}` must say nothing, said {:?}",
+                strings_said(&log),
+            );
+            let out = uci.handle("go depth 2");
+            assert_ne!(out.lines, vec!["bestmove 0000".to_string()], "`{cmd}` must be searchable");
+            bestmove_is_legal(&uci, &out.lines[0]);
+        }
     }
 
     #[test]
