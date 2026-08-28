@@ -182,6 +182,101 @@ fn is_passed(square: usize, color: Color, enemy_pawns: u64) -> bool {
 const MOBILITY_MIDDLEGAME: [i32; 6] = [0, 3, 3, 0, 0, 0];
 const MOBILITY_ENDGAME: [i32; 6] = [0, 3, 4, 0, 0, 0];
 
+/// By how much a pawnless material edge is divided when it cannot mate.
+///
+/// **Not zero, and that is deliberate.** A drawn endgame is drawn, but returning exactly 0 would
+/// make every such position identical and leave the search nothing to steer by — reaching K+N
+/// against K is still better than being mated, and the engine has to be able to say so. Dividing
+/// keeps the ordering while removing the illusion of a win.
+const DRAWISH_DIVISOR: i32 = 8;
+
+// The switch the tests use to hold the factor off, so a comparison is between two verdicts of
+// **one** binary rather than between two builds. Compiled out of production entirely.
+//
+// Rust idiom: a thread-local `Cell` rather than a parameter, because `evaluate` is called from the
+// hottest loop in the engine and threading a flag through every call site would change a signature
+// the search, the quiescence and four tests all share. A plain comment and not a doc comment —
+// `thread_local!` expands to several items, so rustdoc has nothing single to attach it to and
+// clippy says so.
+#[cfg(test)]
+thread_local! {
+    static SCALING: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Below this edge, a pawnless side cannot be assumed to be winning.
+///
+/// A rook is the threshold because K+R against K **is** a win and K+B or K+N against K is not.
+/// Everything between — two minors at 640, for instance — needs its own condition rather than a
+/// wider net, which is why two knights are named explicitly below and bishop-plus-knight is not:
+/// B+N against a bare king is a genuine win, and flattening it would throw away real games.
+const PAWNLESS_WIN_THRESHOLD: i32 = 500;
+
+/// Whether `balance` describes a material edge that cannot be converted, so that calling it a win
+/// is what makes the engine trade into it.
+///
+/// **Measured, not assumed.** Over 10 400 anchored games, 44% of our draws were positions we had
+/// been winning by +300 or more; 23% of those ended with **no pawn at all** on our side, at a
+/// median edge of +320 cp, and the most frequent final positions were a lone knight or a lone
+/// bishop against a bare king. `evaluate` was returning about +320 for those, so the search walked
+/// into them and then shuffled until the threefold repetition — 55% of all our draws.
+fn cannot_mate(pos: &Position, pawns: [u64; 2], balance: i32) -> bool {
+    // **No pawn anywhere on the board**, and the restriction is measured rather than cautious.
+    // A first version asked only that the *strong* side be pawnless, which also caught a rook
+    // against three pawns — an edge of 200 cp that is nothing like drawn, and three existing
+    // tests said so immediately. Every configuration this brick was built for is pawnless on
+    // both sides: a lone knight, a lone bishop, two knights, rook against rook.
+    //
+    // The counts are already in hand: `evaluate` reads them before walking the board.
+    if pawns[0] != 0 || pawns[1] != 0 {
+        return false;
+    }
+    let strong = if balance > 0 { Color::White } else { Color::Black };
+    // Rust idiom: `!color` is the `Not` operator cozy-chess implements on `Color`, so this reads as
+    // "the other side" rather than as a match on two variants.
+    let weak = !strong;
+    // **The weak side may hold nothing more than a single minor**, and without this line the
+    // function stops matching its name. Everything above is a statement about what the *strong
+    // side's material* can do; the threshold below is a statement about the *edge between the two
+    // sides*, and the two part company the moment the weak side holds something real. Measured on
+    // this branch before the line existed, all pawnless and all divided by eight — and all
+    // before mobility was merged, so the raw figures are a few centipawns higher today:
+    //
+    // | position       | theory           | scored |
+    // |----------------|------------------|--------|
+    // | K+Q vs K+R     | win              |     49 |
+    // | Q+R+N vs Q+R   | clear advantage  |     35 |
+    // | 2Q vs Q+R      | win              |     47 |
+    //
+    // The second is not even an endgame — a knight up with queens and rooks still on the board is
+    // exactly the middlegame case this brick must never touch.
+    //
+    // Narrow on purpose: every true positive the rule was built for survives, because in each of
+    // them the weak side has a bare king (a lone minor, two knights) or a single minor (rook
+    // against knight, rook against bishop, both drawn). What stops firing is the whole family
+    // where the weak side answers with a rook or a queen.
+    //
+    // One true positive goes with them, and it is a decision rather than an oversight: **R+N
+    // against R is a theoretical draw** and was firing here by accident of the threshold, never
+    // having been named in this brick's scope. It needs a rule of its own — the weak side holding
+    // a rook is precisely what makes it drawn, so no widening of *this* condition can express it.
+    if pos.count(weak, Piece::Rook) + pos.count(weak, Piece::Queen) > 0
+        || pos.count(weak, Piece::Knight) + pos.count(weak, Piece::Bishop) > 1
+    {
+        return false;
+    }
+    if balance.abs() < PAWNLESS_WIN_THRESHOLD {
+        return true;
+    }
+    // Two knights and a bare king is the one drawn position above the threshold: 640 cp of
+    // material that cannot force mate. Named rather than covered by a wider net, because the
+    // configurations either side of it — B+N at 650, R at 500 — are wins.
+    let knights = pos.count(strong, Piece::Knight);
+    let others = pos.count(strong, Piece::Bishop)
+        + pos.count(strong, Piece::Rook)
+        + pos.count(strong, Piece::Queen);
+    knights == 2 && others == 0
+}
+
 pub fn evaluate(pos: &Position) -> i32 {
     // Two running scores — one reading the middlegame tables, one the endgame tables
     // — plus the phase, all accumulated in the **same** pass over the board.
@@ -267,7 +362,17 @@ pub fn evaluate(pos: &Position) -> i32 {
     let phase = phase.min(MAX_PHASE);
     // Weighted average of the two readings. With every piece on the board this is
     // exactly `middlegame`; with none, exactly `endgame`; in between it slides.
-    let balance = (middlegame * phase + endgame * (MAX_PHASE - phase)) / MAX_PHASE;
+    let mut balance = (middlegame * phase + endgame * (MAX_PHASE - phase)) / MAX_PHASE;
+
+    // The endgame scale, applied after the taper because it is about what the *remaining*
+    // material can do, and the taper is what already knows how little is left.
+    #[cfg(test)]
+    let scaling_on = SCALING.with(|s| s.get());
+    #[cfg(not(test))]
+    let scaling_on = true;
+    if scaling_on && cannot_mate(pos, pawns, balance) {
+        balance /= DRAWISH_DIVISOR;
+    }
 
     // Flip to the side-to-move perspective: negamax wants "good for me" > 0.
     match pos.side_to_move() {
@@ -385,6 +490,19 @@ const PST_ENDGAME: [[i32; 64]; 6] = [PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING_END
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Runs `f` with the endgame scale held off, for the tests that isolate another term.
+    //
+    // Two of them use a lone knight against a bare king as their reference point — which is
+    // exactly the position the scale divides — so leaving it on would make them measure the pair
+    // rather than the term they name. Same reasoning `search_reducing` applies to the futility
+    // cuts, one crate down.
+    fn without_scaling<T>(f: impl FnOnce() -> T) -> T {
+        SCALING.with(|s| s.set(false));
+        let out = f();
+        SCALING.with(|s| s.set(true));
+        out
+    }
 
     #[test]
     fn initial_position_is_balanced() {
@@ -720,8 +838,8 @@ mod tests {
         let blocked = Position::from_fen("4k3/8/3n4/3P4/8/8/8/4K3 w - - 0 1").unwrap();
         let bare = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
         let knight_only = Position::from_fen("4k3/8/3n4/8/8/8/8/4K3 w - - 0 1").unwrap();
-        let running = evaluate(&free) - evaluate(&bare);
-        let stopped = evaluate(&blocked) - evaluate(&knight_only);
+        let running = without_scaling(|| evaluate(&free)) - without_scaling(|| evaluate(&bare));
+        let stopped = without_scaling(|| evaluate(&blocked)) - without_scaling(|| evaluate(&knight_only));
         assert!(
             stopped < running,
             "a blockaded passer must be worth less: {stopped} against {running}",
@@ -736,7 +854,7 @@ mod tests {
         let blocked_not_passed =
             Position::from_fen("4k3/8/3p4/3P4/8/8/8/4K3 w - - 0 1").unwrap();
         let pawn_only = Position::from_fen("4k3/8/3p4/8/8/8/8/4K3 w - - 0 1").unwrap();
-        let no_bonus_at_all = evaluate(&blocked_not_passed) - evaluate(&pawn_only);
+        let no_bonus_at_all = without_scaling(|| evaluate(&blocked_not_passed)) - without_scaling(|| evaluate(&pawn_only));
         assert!(
             stopped > no_bonus_at_all,
             "a blockaded passer must keep part of its bonus: {stopped} against \
@@ -778,7 +896,7 @@ mod tests {
         let free = Position::from_fen("k7/8/8/3P4/8/8/8/4K3 w - - 0 1").unwrap();
         let bare = Position::from_fen("k7/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
         assert!(
-            evaluate(&own) - evaluate(&own_baseline) < evaluate(&free) - evaluate(&bare),
+            without_scaling(|| evaluate(&own)) - without_scaling(|| evaluate(&own_baseline)) < without_scaling(|| evaluate(&free)) - without_scaling(|| evaluate(&bare)),
             "a pawn cannot advance through its own piece either",
         );
     }
@@ -1025,6 +1143,199 @@ mod tests {
                 (MOBILITY_MIDDLEGAME[piece as usize], MOBILITY_ENDGAME[piece as usize]),
                 (0, 0),
                 "{piece:?} must stay at zero: weighting it cost a factor of two in nodes",
+            );
+        }
+    }
+
+
+
+    // ---------------------------------------------------------- endgame scaling (#79)
+
+    // **Every figure below was re-measured after mobility (#77) was merged into this branch**, and
+    // this note exists because the merge could have broken the arm in silence. Mobility adds to the
+    // balance the arm then compares against `PAWNLESS_WIN_THRESHOLD`, so a position could have
+    // crossed it without a single test failing.
+    //
+    // **Each row carries its FEN**, and that is not decoration. A first version of this table named
+    // only the material, and two rows could not be reproduced by a reader — `K+R vs K+N` read 203
+    // instead of 176 — because with mobility counting, *where the defending minor stands* moves the
+    // number by exactly that much. A table of measured values without the positions they were
+    // measured on is not a measurement, it is a recollection.
+    //
+    // | position | FEN | before | after | verdict |
+    // |---|---|---|---|---|
+    // | K+N vs K | `4k3/8/8/8/8/8/8/3NK3 w` | 290 | **302** | still divided |
+    // | K+B vs K | `4k3/8/8/8/8/8/8/3BK3 w` | 320 | **347** | still divided |
+    // | K+N+N vs K | `4k3/8/8/8/8/8/8/1N1NK3 w` | 570 | **591** | still divided, two-knights clause |
+    // | K+B+N vs K | `4k3/8/8/8/8/8/8/1B1NK3 w` | 610 | **649** | still a win, untouched |
+    // | **K+R vs K** | `4k3/8/8/8/8/8/8/3RK3 w` | 505 | **505** | still a win, untouched |
+    // | K+R vs K+N | `4n3/4k3/8/8/8/8/8/3RK3 w` | 188 | **176** | still divided |
+    // | K+R vs K+B | `4b3/4k3/8/8/8/8/8/3RK3 w` | 158 | **131** | still divided |
+    //
+    // **The row that mattered is `K+R vs K`, and it did not move at all.** It sits five centipawns
+    // above the threshold, so any addition to it would have turned a won ending into a scaled one —
+    // and mobility weights rooks at **zero**, which is what keeps it still. Not luck: the weights
+    // were set that way because pricing the heavy pieces doubled the tree (#77), and the reason
+    // happens to protect this arm as well.
+    //
+    // The two rows that went *down* are the weak side gaining mobility, which shrinks our edge:
+    // that is the arm being fed a smaller number and still reaching the same verdict. And they are
+    // the two rows whose value depends on the defending minor's square — on `e8` beside its king
+    // here, which is why the FEN had to be written down.
+
+
+    #[test]
+    fn a_lone_minor_against_a_bare_king_is_not_a_win() {
+        // The measured failure this brick exists for: over 10 400 anchored games, 44% of our
+        // draws were positions we had been winning, 23% of those ended with no pawn on our side,
+        // and the two most frequent final positions were exactly these. `evaluate` was returning
+        // about +330 for them, so the search traded into them and then shuffled to a repetition.
+        for (fen, name) in [
+            ("4k3/8/8/8/8/8/8/3NK3 w - - 0 1", "K+N against K"),
+            ("4k3/8/8/8/8/8/8/3BK3 w - - 0 1", "K+B against K"),
+            ("4k3/8/8/8/8/8/8/1N1NK3 w - - 0 1", "K+N+N against K"),
+        ] {
+            let p = Position::from_fen(fen).unwrap();
+            assert!(
+                evaluate(&p).abs() < 100,
+                "{name} is drawn and must not read as a win: {} cp",
+                evaluate(&p),
+            );
+            // From the other side too: the factor keys on the sign of the balance, and a version
+            // that only handled White would pass the three assertions above.
+            let mirrored = Position::from_fen(&fen.replace('N', "\u{1}").replace('n', "N")
+                .replace('\u{1}', "n").replace('B', "\u{2}").replace('b', "B")
+                .replace('\u{2}', "b").replace('K', "\u{3}").replace('k', "K")
+                .replace('\u{3}', "k").replace(" w ", " b ")).unwrap();
+            assert!(
+                evaluate(&mirrored).abs() < 100,
+                "{name} mirrored is drawn too: {} cp",
+                evaluate(&mirrored),
+            );
+        }
+    }
+
+    #[test]
+    fn the_endgames_that_do_win_keep_their_score() {
+        // The control, and it is what stops the rule from being a wider net than the measurement
+        // asked for. B+N against a bare king is a genuine win — long and technical, but a win —
+        // and a factor that flattened it would throw away real games. Same for a rook.
+        for (fen, name) in [
+            ("4k3/8/8/8/8/8/8/1B1NK3 w - - 0 1", "K+B+N against K"),
+            ("4k3/8/8/8/8/8/8/3RK3 w - - 0 1", "K+R against K"),
+            ("4k3/8/8/8/8/8/8/3QK3 w - - 0 1", "K+Q against K"),
+        ] {
+            let p = Position::from_fen(fen).unwrap();
+            assert!(
+                evaluate(&p) > 300,
+                "{name} is a win and must keep its score: {} cp",
+                evaluate(&p),
+            );
+        }
+    }
+
+    #[test]
+    fn a_pawn_anywhere_switches_the_factor_off() {
+        // Pawns mean a promotion to play for, so none of this applies — and the restriction is
+        // measured rather than cautious. A first version asked only that the *strong* side be
+        // pawnless, which also caught a rook against three pawns: an edge of 200 cp that is
+        // nothing like drawn. Two existing passed-pawn tests said so within the minute.
+        let bare = Position::from_fen("4k3/8/8/8/8/8/8/3NK3 w - - 0 1").unwrap();
+        let with_our_pawn = Position::from_fen("4k3/8/8/8/8/8/P7/3NK3 w - - 0 1").unwrap();
+        let with_their_pawn = Position::from_fen("4k3/p7/8/8/8/8/8/3NK3 w - - 0 1").unwrap();
+        assert!(
+            evaluate(&bare).abs() < 100,
+            "precondition: the pawnless version must be scaled, or the two below prove nothing",
+        );
+        // Asserted as inertness rather than against a number: what has to hold is that the factor
+        // does not touch these positions at all. A threshold would have to be recalibrated every
+        // time a piece-square table moves — and a first draft of this test picked 200 cp for a
+        // knight against a pawn that actually evaluates to 189 — 177 before mobility was
+        // merged, which is why the assertion is inertness and not a threshold.
+        for (p, name) in [(&with_our_pawn, "a pawn of ours"), (&with_their_pawn, "an enemy pawn")] {
+            assert_eq!(
+                evaluate(p), without_scaling(|| evaluate(p)),
+                "{name} must switch the factor off entirely",
+            );
+        }
+        // And the enemy-pawn case is the one the first version of the rule got wrong: it asked
+        // only that the *strong* side be pawnless, which also caught a rook against three pawns.
+        assert!(
+            evaluate(&with_their_pawn) > 150,
+            "a knight against a lone pawn is an edge, not a draw: {} cp",
+            evaluate(&with_their_pawn),
+        );
+    }
+
+    #[test]
+    fn the_factor_never_fires_while_the_board_is_full() {
+        // It keys on pawns, not on the phase, so a middlegame with every piece present is
+        // untouched by construction — but the property is worth an assertion rather than an
+        // argument, since a later version keying on `phase` instead would pass every test above.
+        let p = Position::from_fen(
+            "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 0 3",
+        )
+        .unwrap();
+        assert_eq!(
+            evaluate(&p), without_scaling(|| evaluate(&p)),
+            "the factor must be inert on a full board",
+        );
+        // And a crushing middlegame edge stays crushing: pawns are on the board, so nothing
+        // scales, whatever the material difference.
+        let crushing = Position::from_fen("4k3/pppppppp/8/8/8/8/PPPPPPPP/3QK3 w - - 0 1").unwrap();
+        assert!(
+            evaluate(&crushing) > 500,
+            "a queen up with pawns on the board is a win: {} cp",
+            evaluate(&crushing),
+        );
+    }
+
+
+    #[test]
+    fn a_pawnless_edge_the_weak_side_can_answer_is_not_a_draw() {
+        // AC#4, and the case that had no test: the factor keys on pawns, so a **pawnless** board
+        // still crowded with pieces reaches it, and the threshold it then applies is about the
+        // *edge between the sides* rather than about what the strong side can mate with.
+        //
+        // Every position below was measured before the weak-side condition existed and was being
+        // divided by eight. The middle one is not an endgame at all — a knight up with queens and
+        // rooks on the board — which is exactly what AC#4 says must stay a win.
+        for (fen, name, was) in [
+            ("4k2r/8/8/8/8/8/8/3QK3 w - - 0 1", "K+Q against K+R", 49),
+            ("r2qk3/8/8/8/8/8/8/RN1QK3 w - - 0 1", "Q+R+N against Q+R", 35),
+            ("r2qk3/8/8/8/8/8/8/Q2QK3 w - - 0 1", "2Q against Q+R", 47),
+        ] {
+            let p = Position::from_fen(fen).unwrap();
+            assert_eq!(
+                evaluate(&p),
+                without_scaling(|| evaluate(&p)),
+                "{name}: the weak side answers with a rook or a queen, so the factor must not \
+                 fire — it used to read {was} cp",
+            );
+            assert!(
+                evaluate(&p) > 200,
+                "{name}: and it must read as the advantage it is: {} cp",
+                evaluate(&p),
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_minor_on_the_weak_side_still_scales() {
+        // The other half of the condition, and it is what keeps it narrow. Rook against a lone
+        // minor is drawn, the weak side holds one piece, and both must keep scaling — a fix
+        // written as "the weak side must be bare" would have passed every assertion above while
+        // throwing these two away.
+        for (fen, name) in [
+            ("4n3/4k3/8/8/8/8/8/3RK3 w - - 0 1", "K+R against K+N"),
+            ("4b3/4k3/8/8/8/8/8/3RK3 w - - 0 1", "K+R against K+B"),
+        ] {
+            let p = Position::from_fen(fen).unwrap();
+            assert!(
+                evaluate(&p).abs() < 60,
+                "{name} is drawn and must still be scaled: {} cp against {} raw",
+                evaluate(&p),
+                without_scaling(|| evaluate(&p)),
             );
         }
     }
