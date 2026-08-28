@@ -1148,6 +1148,7 @@ mod tests {
     }
 
 
+
     // ---------------------------------------------------------- endgame scaling (#79)
 
     // **Every figure below was re-measured after mobility (#77) was merged into this branch**, and
@@ -1155,15 +1156,21 @@ mod tests {
     // balance the arm then compares against `PAWNLESS_WIN_THRESHOLD`, so a position could have
     // crossed it without a single test failing.
     //
-    // | position | before | after | verdict |
-    // |---|---|---|---|
-    // | K+N vs K | 290 | **302** | still divided |
-    // | K+B vs K | 320 | **347** | still divided |
-    // | K+N+N vs K | 570 | **591** | still divided, by the two-knights clause |
-    // | K+B+N vs K | 610 | **649** | still a win, untouched |
-    // | **K+R vs K** | 505 | **505** | still a win, untouched |
-    // | K+R vs K+N | 188 | **176** | still divided |
-    // | K+R vs K+B | 158 | **131** | still divided |
+    // **Each row carries its FEN**, and that is not decoration. A first version of this table named
+    // only the material, and two rows could not be reproduced by a reader — `K+R vs K+N` read 203
+    // instead of 176 — because with mobility counting, *where the defending minor stands* moves the
+    // number by exactly that much. A table of measured values without the positions they were
+    // measured on is not a measurement, it is a recollection.
+    //
+    // | position | FEN | before | after | verdict |
+    // |---|---|---|---|---|
+    // | K+N vs K | `4k3/8/8/8/8/8/8/3NK3 w` | 290 | **302** | still divided |
+    // | K+B vs K | `4k3/8/8/8/8/8/8/3BK3 w` | 320 | **347** | still divided |
+    // | K+N+N vs K | `4k3/8/8/8/8/8/8/1N1NK3 w` | 570 | **591** | still divided, two-knights clause |
+    // | K+B+N vs K | `4k3/8/8/8/8/8/8/1B1NK3 w` | 610 | **649** | still a win, untouched |
+    // | **K+R vs K** | `4k3/8/8/8/8/8/8/3RK3 w` | 505 | **505** | still a win, untouched |
+    // | K+R vs K+N | `4n3/4k3/8/8/8/8/8/3RK3 w` | 188 | **176** | still divided |
+    // | K+R vs K+B | `4b3/4k3/8/8/8/8/8/3RK3 w` | 158 | **131** | still divided |
     //
     // **The row that mattered is `K+R vs K`, and it did not move at all.** It sits five centipawns
     // above the threshold, so any addition to it would have turned a won ending into a scaled one —
@@ -1172,7 +1179,9 @@ mod tests {
     // happens to protect this arm as well.
     //
     // The two rows that went *down* are the weak side gaining mobility, which shrinks our edge:
-    // that is the arm being fed a smaller number and still reaching the same verdict.
+    // that is the arm being fed a smaller number and still reaching the same verdict. And they are
+    // the two rows whose value depends on the defending minor's square — on `e8` beside its king
+    // here, which is why the FEN had to be written down.
 
 
     #[test]
