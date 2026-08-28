@@ -1549,7 +1549,8 @@ mod tests {
         // **The first version of this test called its position "the Lucena position" and it was
         // neither Lucena nor technical.** On `8/4PK1k/8/8/8/8/r7/3R4 w` the white king stands
         // *beside* its pawn and guards the queening square, so `e8=Q` is free — Stockfish reads
-        // **mate in 2** (`Rh1+ Rh2 Rxh2#`). Spotted by Théo looking at the board, not by review.
+        // **mate in 2** (`Rh1+ Rh2 Rxh2#`). Spotted by playing the position on a board, not by
+        // reading the diff — which is the part worth keeping.
         // In a real Lucena the strong king stands *on* the queening square and blocks its own
         // pawn, which is what forces the bridge. Both positions are kept below, because a two-move
         // tactic and a technical win are different things and only one of them was here before.
