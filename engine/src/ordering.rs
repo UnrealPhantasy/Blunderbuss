@@ -266,6 +266,186 @@ impl Default for Killers {
     }
 }
 
+/// The quiet moves that have caused cutoffs, and how often — a counter per
+/// (side to move, from square, to square).
+///
+/// **What reads it, and it is not the sort.** The counter's *value* is read by
+/// `Searcher::late_move_reduction` to decide how much depth a late quiet move loses.
+/// It deliberately does **not** enter [`order_moves`]: that use of the same table —
+/// as an extra tier in the ordering key — was implemented and measured twice, and
+/// read zero both times. The reason is structural. Ordering is *ordinal*: it keeps
+/// only a rank, and the killers already own the top of it, so history was left
+/// ranking the moves that cut off least often — it improved the band that mattered
+/// least, while costing about 6 % of throughput. Reading the value instead is
+/// *cardinal*: it uses the one thing a rank throws away, the difference between "has
+/// never refuted anything" and "has refuted something". And that bottom band is
+/// exactly the one late move reductions act on.
+///
+/// The complement to [`Killers`], and the difference is what each one remembers.
+/// A killer is *local*: two slots at one ply, forgotten as soon as a third quiet
+/// move cuts off there. History is *global*: a rook lift that refutes branches all
+/// over the tree accumulates credit wherever it does so, and carries it to plies
+/// where it has never been tried.
+///
+/// Indexed by side to move, because the same pair of squares means opposite things
+/// for the two colours: `e2e4` is a White pawn push and cannot be a Black move at
+/// all. Sharing one table would have each side reading the other's evidence.
+pub struct History {
+    /// `[colour][from][to]`. 8 KB, allocated once per search.
+    ///
+    /// Idiom: a fixed-size nested array rather than a `HashMap` — the index is
+    /// always in range, so there is nothing to look up and nothing to allocate.
+    /// `Box` puts those 8 KB on the heap instead of inside every `Searcher`, which
+    /// matters because one searcher exists per thread and the struct is moved.
+    counts: Box<[[[i32; 64]; 64]; 2]>,
+    /// The largest counter currently in the table.
+    ///
+    /// Tracked rather than recomputed because the reduction threshold is expressed
+    /// *relative* to it, so it is read on every late quiet move — and scanning 8 192
+    /// entries per move would cost more than the whole brick can win. Maintained by
+    /// `record` and halved by `age`, which are the only two things that change a counter.
+    best: i32,
+}
+
+/// Above this, every counter is halved. See [`History::age`].
+pub const HISTORY_CEILING: i32 = 1 << 14;
+
+impl History {
+    pub fn new() -> History {
+        History { counts: Box::new([[[0; 64]; 64]; 2]), best: 0 }
+    }
+
+    /// How many square pairs carry any credit at all.
+    ///
+    /// **Tests only.** Every other test drives `record` and `get` directly, which says
+    /// the table works but not that the *search* feeds it — a distinction that matters,
+    /// since a heuristic wired to nothing passes every unit test it has.
+    #[cfg(test)]
+    pub fn entries(&self) -> usize {
+        self.counts.iter().flatten().flatten().filter(|&&c| c > 0).count()
+    }
+
+    /// The maximum this table believes it holds — the bar the reduction threshold is a
+    /// fraction of.
+    ///
+    /// **Tests only.** Exposed so a test can check the cache against the table it caches;
+    /// the search reads it through [`History::is_well_established`].
+    #[cfg(test)]
+    pub fn best(&self) -> i32 {
+        self.best
+    }
+
+    /// The largest counter, the 90th centile of the non-zero ones, and how many there are.
+    ///
+    /// **Tests only.** A threshold has to be chosen against what the table actually
+    /// holds, not against what its ceiling allows — and the first threshold tried here
+    /// was chosen the other way round, which is how it came to admit almost every move.
+    #[cfg(test)]
+    pub fn spread(&self) -> (i32, i32, usize) {
+        let mut v: Vec<i32> =
+            self.counts.iter().flatten().flatten().copied().filter(|&c| c > 0).collect();
+        v.sort_unstable();
+        let n = v.len();
+        if n == 0 {
+            return (0, 0, 0);
+        }
+        (v[n - 1], v[n * 9 / 10], n)
+    }
+
+    /// How often `mv` has caused a cutoff for the side to move in `pos`, weighted by
+    /// the depths that proved those cutoffs.
+    pub fn get(&self, pos: &Position, mv: Move) -> i32 {
+        self.counts[pos.side_to_move() as usize][mv.from as usize][mv.to as usize]
+    }
+
+    /// Whether `mv` is among the moves this search has learned the most about.
+    ///
+    /// **The threshold is relative, and the first version of it was not — that is the whole
+    /// story of this predicate.** It began as `get(..) >= depth * depth`, which reads well
+    /// and is wrong twice over. First a dimension error: the counter is a *sum* over every
+    /// cutoff the move ever caused, and `depth * depth` is what *one* cutoff is worth, so ten
+    /// cutoffs at depth 3 (90) cleared the depth-9 bar (81) without the move having proven
+    /// anything deep. Second, and this is what measurement showed, the bar sat far below what
+    /// the table actually holds: at depth 7 the threshold was 49 while the 90th centile of the
+    /// non-zero counters was 604 in the opening and 136 in an endgame. It admitted nearly
+    /// everything, and softening nearly every reduction cost **49 % of the tree** in the
+    /// opening and 41 % in the endgame.
+    ///
+    /// An absolute bar taken from the other end fails symmetrically: `HISTORY_CEILING / 2` is
+    /// 8 192, and the largest counter a depth-7 search produces is 3 182. Ageing never even
+    /// fires at these depths. That bar would make the brick inert, which the node bench would
+    /// report as `1.0000` — the number that means "the gate never opened".
+    ///
+    /// So the bar is relative to `best`: a move qualifies when it carries at least half of
+    /// the largest credit this search has awarded. That scales with depth, with the position,
+    /// and with how full the table is, all without a constant to tune. The one choice left is
+    /// the fraction, and a half is both the simplest available and the same factor `age` uses.
+    pub fn is_well_established(&self, pos: &Position, mv: Move) -> bool {
+        // An empty table must qualify nothing: `0 * 2 >= 0` would otherwise be true and
+        // every move would pass before a single cutoff had been recorded.
+        self.best > 0 && self.get(pos, mv) * 2 >= self.best
+    }
+
+    /// Credit `mv` with a cutoff found at `depth`.
+    ///
+    /// The weight is `depth * depth`, the conventional choice: a cutoff proven deep
+    /// in the tree survived more scrutiny than one found at a leaf, and squaring
+    /// separates them sharply enough that a handful of deep cutoffs outrank a crowd
+    /// of shallow ones.
+    ///
+    /// **The counter is a SUM, and that matters to whoever sets a threshold on it.** It
+    /// is not "the depth this move proved"; it is everything it has ever accumulated. Ten
+    /// cutoffs at depth 3 come to 90, which is more than one cutoff at depth 9 — so a
+    /// threshold of the form `depth * depth` compares a sum against a single term and
+    /// admits moves that never proved anything deep. That was the first version of the
+    /// reduction predicate, and it cost 49 % of the tree in the opening at depth 7.
+    ///
+    /// Non-quiet moves are refused here rather than at the call site, for the same
+    /// reason as [`Killers::record`]: an invariant the caller must remember is one a
+    /// later caller forgets. Captures are already ranked by `mvv_lva`, and they are
+    /// never reduced, so crediting them would fill the table with entries nothing reads.
+    pub fn record(&mut self, pos: &Position, mv: Move, depth: u32) {
+        if !is_quiet(pos, mv) {
+            return;
+        }
+        let entry =
+            &mut self.counts[pos.side_to_move() as usize][mv.from as usize][mv.to as usize];
+        *entry += (depth * depth) as i32;
+        self.best = self.best.max(*entry);
+        if *entry > HISTORY_CEILING {
+            self.age();
+        }
+    }
+
+    /// Halve every counter.
+    ///
+    /// Two things at once. It bounds the values, which an unbounded counter would
+    /// eventually overflow — but more importantly it lets the table **keep adapting**:
+    /// without ageing, a move that cut off often in the opening would keep its credit
+    /// for the rest of the game, and go on being protected from reduction long after
+    /// the position stopped resembling the one where it earned that credit.
+    ///
+    /// Halving rather than clamping, because it preserves the *relative* size of the
+    /// entries. Clamping would flatten the top of the table into a mass of ties at the
+    /// ceiling, and a threshold is exactly what ties destroy.
+    fn age(&mut self) {
+        self.best /= 2;
+        for side in self.counts.iter_mut() {
+            for from in side.iter_mut() {
+                for count in from.iter_mut() {
+                    *count /= 2;
+                }
+            }
+        }
+    }
+}
+
+impl Default for History {
+    fn default() -> History {
+        History::new()
+    }
+}
+
 // The ordering bands. They must not overlap: every capture is tried before every
 // killer, and every killer before every remaining quiet move.
 //
@@ -394,6 +574,228 @@ mod tests {
         pos.move_from_uci(uci).expect("a legal move")
     }
 
+    #[test]
+    fn a_deeper_cutoff_counts_for_more() {
+        // Weighted by `depth * depth`: a cutoff proven deep in the tree survived more
+        // scrutiny than one found at a leaf. Squaring separates them sharply enough
+        // that a few deep cutoffs outrank a crowd of shallow ones.
+        let p = Position::from_fen(CAPTURES_AND_QUIETS).unwrap();
+        let deep = uci_move(&p, QUIET_A);
+        let shallow = uci_move(&p, QUIET_B);
+
+        let mut history = History::new();
+        history.record(&p, deep, 6);
+        // Four shallow cutoffs against one deep: 4 × 4 = 16 against 36.
+        for _ in 0..4 {
+            history.record(&p, shallow, 2);
+        }
+        assert!(
+            history.get(&p, deep) > history.get(&p, shallow),
+            "one cutoff at depth 6 ({}) must outrank four at depth 2 ({})",
+            history.get(&p, deep),
+            history.get(&p, shallow),
+        );
+    }
+
+    #[test]
+    fn the_counter_is_a_sum_and_shallow_cutoffs_accumulate_past_a_deep_one() {
+        // The property that broke the first threshold, pinned so it cannot be forgotten
+        // again. `get` does not answer "how deep did this move prove itself"; it answers
+        // "what has it accumulated". Enough shallow cutoffs outrank one deep cutoff, so any
+        // threshold expressed as a single `depth * depth` term compares a sum against a term
+        // and admits moves that never proved anything deep.
+        let p = Position::from_fen(CAPTURES_AND_QUIETS).unwrap();
+        let (shallow, deep) = (uci_move(&p, QUIET_A), uci_move(&p, QUIET_B));
+        let mut history = History::new();
+
+        history.record(&p, deep, 9); // 81, from a single deep cutoff
+        for _ in 0..10 {
+            history.record(&p, shallow, 3); // 10 × 9 = 90, from ten shallow ones
+        }
+        assert!(
+            history.get(&p, shallow) > history.get(&p, deep),
+            "ten cutoffs at depth 3 ({}) outrank one at depth 9 ({}) — a sum, not a depth",
+            history.get(&p, shallow),
+            history.get(&p, deep),
+        );
+    }
+
+    #[test]
+    fn a_counter_stays_within_the_ceiling_however_busy_the_move() {
+        // What bounds the table. It matters to the reduction threshold and not to any sort:
+        // an unbounded counter would eventually clear any threshold and protect a move
+        // permanently on the strength of cutoffs it proved long ago.
+        let p = Position::from_fen(CAPTURES_AND_QUIETS).unwrap();
+        let busy = uci_move(&p, QUIET_A);
+        let mut history = History::new();
+        // Kept modest on purpose: each ageing walks all 8 192 entries, and in a debug
+        // build a five-figure loop here turns a 0.1 s test into minutes.
+        for _ in 0..200 {
+            history.record(&p, busy, MAX_DEPTH);
+        }
+        assert!(
+            history.get(&p, busy) <= HISTORY_CEILING,
+            "a counter must stay under {HISTORY_CEILING}, read {}",
+            history.get(&p, busy),
+        );
+    }
+
+    #[test]
+    fn ageing_preserves_the_order_it_shrinks() {
+        // Halving rather than clamping, and this is the reason. Clamping would flatten the
+        // top of the table into ties at the ceiling, and a threshold is exactly what ties
+        // destroy: every tied move would clear it together.
+        let p = Position::from_fen(CAPTURES_AND_QUIETS).unwrap();
+        let (a, b) = (uci_move(&p, QUIET_A), uci_move(&p, QUIET_B));
+        let mut history = History::new();
+        history.record(&p, a, 8);
+        history.record(&p, b, 4);
+        let (before_a, before_b) = (history.get(&p, a), history.get(&p, b));
+        assert!(before_a > before_b, "precondition: a is above b");
+
+        // Counted, not waited for. `record` ages *as soon as* an entry crosses the ceiling,
+        // so the value read back is never above it — a loop waiting for
+        // `get(..) > HISTORY_CEILING` would never terminate.
+        let steps = HISTORY_CEILING / (8 * 8) + 1;
+        for _ in 0..steps {
+            history.record(&p, a, 8);
+        }
+        assert!(history.get(&p, a) <= HISTORY_CEILING, "bounded");
+        assert!(history.get(&p, a) > history.get(&p, b), "and still apart");
+        assert!(
+            history.get(&p, b) > 0,
+            "one ageing shrinks the smaller entry, it does not erase it",
+        );
+        // And it *did* shrink. Without this line the test accepts a clamp instead of a halving:
+        // clamping only touches entries above the clamp, so the small one comes out untouched
+        // and every other assertion here still holds. Found by mutation, not by reading.
+        assert!(
+            history.get(&p, b) < before_b,
+            "ageing must divide every entry, not just clamp the large ones: b went \
+             {before_b} -> {}",
+            history.get(&p, b),
+        );
+    }
+
+    #[test]
+    fn ageing_eventually_forgets_a_move_that_stops_cutting_off() {
+        // The other half of ageing, and it is a feature rather than a limit of integer
+        // division. A move that earned credit in the opening and has not cut off since is
+        // *supposed* to lose it — otherwise the reduction would keep protecting it long
+        // after the position stopped resembling the one where it worked.
+        //
+        // Written as its own test because the previous one asserts the opposite over a
+        // shorter horizon, and the two are easy to confuse into a single wrong assertion.
+        let p = Position::from_fen(CAPTURES_AND_QUIETS).unwrap();
+        let (busy, forgotten) = (uci_move(&p, QUIET_A), uci_move(&p, QUIET_B));
+        let mut history = History::new();
+        history.record(&p, forgotten, 4);
+        assert!(history.get(&p, forgotten) > 0, "precondition: it starts with credit");
+
+        for _ in 0..200 {
+            history.record(&p, busy, MAX_DEPTH);
+        }
+        assert_eq!(history.get(&p, forgotten), 0, "never renewed, eventually forgotten");
+        assert!(history.get(&p, busy) > 0, "while the move still cutting off keeps its credit");
+    }
+
+    #[test]
+    fn history_is_kept_per_side() {
+        // The same pair of squares means different things for the two colours: `e2e4` is a
+        // White pawn push and cannot be a Black move at all. One shared table would have
+        // each side reading the other's evidence.
+        let white = Position::initial();
+        let black =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1")
+                .unwrap();
+        let mv = white.move_from_uci("e2e4").expect("a legal move");
+
+        let mut history = History::new();
+        history.record(&white, mv, 5);
+        assert!(history.get(&white, mv) > 0, "White's cutoff is recorded");
+        assert_eq!(history.get(&black, mv), 0, "and says nothing about Black's moves");
+    }
+
+    #[test]
+    fn a_capture_never_enters_the_history() {
+        // Same rule as the killers, refused inside `record` rather than trusted to the
+        // caller. Captures are ranked by `mvv_lva` and are never reduced, so crediting them
+        // would fill the table with entries nothing reads.
+        let p = Position::from_fen(CAPTURES_AND_QUIETS).unwrap();
+        let capture = uci_move(&p, "d4e5");
+        let mut history = History::new();
+        history.record(&p, capture, 8);
+        assert_eq!(history.get(&p, capture), 0, "a capture earns no history");
+
+        let ep = Position::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 2").unwrap();
+        let en_passant = ep.move_from_uci("e5d6").expect("a legal move");
+        let mut h2 = History::new();
+        h2.record(&ep, en_passant, 8);
+        assert_eq!(h2.get(&ep, en_passant), 0, "en passant is a capture too");
+    }
+
+    #[test]
+    fn the_tracked_maximum_never_goes_stale() {
+        // `best` is a cache: it is maintained by hand in `record` and `age` rather than
+        // recomputed, because the reduction threshold reads it on every late quiet move and
+        // scanning 8 192 entries per move would cost more than the brick can win. A cache that
+        // drifts from the thing it caches is the classic way for that trade to go wrong, and
+        // nothing else in this file would notice — the threshold would simply start admitting
+        // the wrong moves, silently and in the right general direction.
+        //
+        // The mutation this exists for: dropping `self.best /= 2` from `age`. Every other test
+        // stays green, because they all read counters rather than the bar.
+        let p = Position::from_fen(CAPTURES_AND_QUIETS).unwrap();
+        let (a, b) = (uci_move(&p, QUIET_A), uci_move(&p, QUIET_B));
+        let mut history = History::new();
+
+        history.record(&p, a, 6);
+        history.record(&p, b, 3);
+        let (max, _, _) = history.spread();
+        assert_eq!(history.best(), max, "the cache must match the table before ageing");
+
+        // Enough to cross the ceiling and fire `age` at least once. Counted rather than waited
+        // for: `record` ages as soon as an entry crosses, so no value read back is ever above
+        // the ceiling and a loop watching for one would never end.
+        let steps = HISTORY_CEILING / (MAX_DEPTH * MAX_DEPTH) as i32 + 2;
+        for _ in 0..steps {
+            history.record(&p, a, MAX_DEPTH);
+        }
+        let (max, _, _) = history.spread();
+        assert_eq!(history.best(), max, "the cache must still match the table after ageing");
+        assert!(max > 0, "precondition: the table is not empty");
+    }
+
+    #[test]
+    fn the_generator_order_survives_for_quiet_moves_that_never_cut_off() {
+        // **The premise the whole reduction brick rests on**, and the reason it is tested here
+        // rather than asserted in prose. `score` returns 0 for every quiet move that is not a
+        // killer, and the sort is stable, so those moves keep the order the generator produced
+        // — an order that carries no information about how good they are. That is exactly why
+        // reading the *rank* cannot separate them, and why `late_move_reduction` reads the
+        // history counter's value instead.
+        //
+        // This replaces a test that looked like coverage and was not: it called `order_moves`
+        // twice with identical arguments and compared the results, which no mutation can break,
+        // because the history table is not a parameter of that function at all. The compiler
+        // guarantees the absence; a test cannot. What a test *can* pin is the property the
+        // absence produces, which is this one.
+        let p = Position::from_fen(CAPTURES_AND_QUIETS).unwrap();
+        let generated: Vec<Move> = p.legal_moves().into_iter().collect();
+        let quiet_in_order: Vec<Move> =
+            generated.iter().copied().filter(|&mv| is_quiet(&p, mv)).collect();
+        assert!(quiet_in_order.len() >= 3, "precondition: the fixture offers several quiet moves");
+
+        let mut ordered = p.legal_moves();
+        order_moves(&p, &mut ordered, KillerSlots::none());
+        let quiet_after: Vec<Move> =
+            ordered.iter().copied().filter(|&mv| is_quiet(&p, mv)).collect();
+
+        assert_eq!(
+            quiet_in_order, quiet_after,
+            "with no killers, quiet moves must come out in the generator's order",
+        );
+    }
     #[test]
     fn a_killer_is_tried_before_the_other_quiet_moves() {
         let p = Position::from_fen(CAPTURES_AND_QUIETS).unwrap();

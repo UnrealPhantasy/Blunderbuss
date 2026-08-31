@@ -12,7 +12,7 @@
 //! direct depth-N pass. [`best_move`] is a thin convenience wrapper over it.
 
 use crate::evaluation::{evaluate, phase};
-use crate::ordering::{is_quiet, mvv_lva, order_moves, see, KillerSlots, Killers};
+use crate::ordering::{is_quiet, mvv_lva, order_moves, see, History, KillerSlots, Killers};
 use crate::position::{Move, Piece, Position};
 use crate::book::Book;
 use crate::transposition::{Bound, Table};
@@ -646,7 +646,7 @@ pub fn search(pos: &Position, request: Request) -> SearchStats {
 fn deepen(pos: &Position, mut request: Request, searcher: &mut Searcher) -> SearchStats {
     let started = Instant::now();
     let limits = &request.limits;
-    searcher.history = request.history.to_vec();
+    searcher.game_history = request.history.to_vec();
     let max_depth = limits.max_depth.max(1);
 
     let mut best: Option<(Move, i32)> = None;
@@ -785,7 +785,17 @@ struct Searcher<'a> {
     /// Zobrist keys of the positions played *before* the search started. A draw by
     /// repetition depends on the game, not on the board alone, so the search cannot
     /// see one without being told what came before.
-    history: Vec<u64>,
+    ///
+    /// Named `game_history` and not `history` because the searcher holds two unrelated
+    /// things that word would name: this list of positions the game passed through, and
+    /// the history *heuristic* below, which counts which quiet moves refute branches.
+    game_history: Vec<u64>,
+    /// Which quiet moves have caused cutoffs, and how often, weighted by the depth that
+    /// proved each one. Lives for one search, like the killers.
+    ///
+    /// Read by [`Searcher::late_move_reduction`], and **only** there — deliberately not by
+    /// the move ordering. See [`History`] for why that distinction is the whole point.
+    history: History,
     /// Zobrist keys along the branch currently being explored, pushed on the way
     /// down and popped on the way back up.
     path: Vec<u64>,
@@ -922,6 +932,25 @@ struct Searcher<'a> {
     lmr_reductions: u64,
     #[cfg(test)]
     lmr_researches: u64,
+    /// Whether the history counter may soften a reduction at all.
+    ///
+    /// **Tests only**, same device as `lmr_growing` and for the same reason: the acceptance
+    /// criterion for this brick is "improves on the plain curve", so the baseline has to be
+    /// reachable from inside the same binary — a comparison across two builds picks up every
+    /// other difference between them.
+    #[cfg(test)]
+    allow_history_reduction: bool,
+    /// How many reductions the history counter softened.
+    ///
+    /// **Tests only, and this is the load-bearing counter of the brick.** #40 is the reason:
+    /// eight unit tests covered the history table, all green, and unplugging it from the
+    /// search broke none of them, because every test drove the component directly. A
+    /// heuristic wired to nothing passes every unit test it owns. This counter is what lets a
+    /// test assert that the gate actually *opens* in a real search — without it, a brick that
+    /// never fires would read `1.0000` at the node bench, and that number means "the gate
+    /// never opened", not "the brick is free".
+    #[cfg(test)]
+    history_softenings: u64,
     /// Whether checks may be extended at all.
     ///
     /// **Tests only**, compiled out otherwise — the same device as `allow_lmr`, and for the
@@ -986,7 +1015,8 @@ impl<'a> Searcher<'a> {
             table_probes: 0,
             table_hits: 0,
             table_cutoffs: 0,
-            history: Vec::new(),
+            game_history: Vec::new(),
+            history: History::new(),
             path: Vec::new(),
             #[cfg(test)]
             evals: 0,
@@ -1026,6 +1056,10 @@ impl<'a> Searcher<'a> {
             lmr_growing: true,
             #[cfg(test)]
             allow_lmr_research: true,
+            #[cfg(test)]
+            allow_history_reduction: true,
+            #[cfg(test)]
+            history_softenings: 0,
             #[cfg(test)]
             lmr_reductions: 0,
             #[cfg(test)]
@@ -1093,7 +1127,7 @@ impl<'a> Searcher<'a> {
         }
         // Idiom: `iter().filter(...).count()` counts matches without allocating.
         // Two prior occurrences, so that this one is the third.
-        self.history.iter().filter(|&&seen| seen == key).count() >= 2
+        self.game_history.iter().filter(|&&seen| seen == key).count() >= 2
     }
 
     /// Set `aborted` if a limit has been reached. The clock is read only every so
@@ -1429,7 +1463,7 @@ impl<'a> Searcher<'a> {
     /// the same fact to decide whether to *extend* the move, and detecting check means
     /// generating attacks on the king, which is not free in the hottest loop of the engine.
     fn late_move_reduction(
-        &self,
+        &mut self,
         pos: &Position,
         gives_check: bool,
         mv: Move,
@@ -1462,9 +1496,53 @@ impl<'a> Searcher<'a> {
         // Compiled out of production builds, where the curve always applies.
         #[cfg(test)]
         let reduction = if self.lmr_growing { reduction } else { 1 };
+
+        // **One ply back for a move that has already proven itself.** The curve above reads
+        // only the *rank*, and below the killers that rank carries almost no information:
+        // `ordering::score` gives every remaining quiet move zero, so their order is the move
+        // generator's. The history counter is the one thing that distinguishes them — the
+        // difference between "has never refuted anything, anywhere" and "has refuted
+        // something, at a depth comparable to this one".
+        //
+        // **The threshold is relative to what this search has learned** — see
+        // `History::is_well_established`, which carries the reasoning and the measurement that
+        // forced it. The short version: the first threshold was `depth * depth`, it compared a
+        // sum against a single term, it admitted nearly every move, and softening nearly every
+        // reduction cost 49 % of the tree in the opening at depth 7. A bar relative to the
+        // table's own maximum has no constant to tune and scales with depth, position and
+        // fill on its own.
+        //
+        // **Why it softens rather than sharpens.** The asymmetry is already stated in the
+        // curve's own documentation: the cost of wrongly reducing a good move rises much
+        // faster than the saving from reducing a bad one further. So the counter is spent
+        // protecting the moves that have earned it, not punishing the ones that have not.
+        //
+        // Idiom: `saturating_sub` floors at zero rather than wrapping, which for an unsigned
+        // type is the difference between "not reduced" and a reduction of four billion plies.
+        let soften = self.history_reduction_applies(pos, mv);
+        let reduction = if soften { reduction.saturating_sub(1) } else { reduction };
+        #[cfg(test)]
+        if soften {
+            self.history_softenings += 1;
+        }
+
         // Leave the search something to do — see `reduction_ceiling`, which is also what the
         // equivalence test reads, so that either mechanism moving is observable.
         reduction.min(reduction_ceiling(depth))
+    }
+
+    /// Whether the history counter earns `mv` one ply back at `depth`.
+    ///
+    /// A named predicate rather than an expression inlined above, for the reason
+    /// `reduction_ceiling` is one: a test reads it directly, so the threshold has a single
+    /// source read from both sides, and moving it is observable rather than silent.
+    fn history_reduction_applies(&self, pos: &Position, mv: Move) -> bool {
+        // Compiled out of production builds, where the counter always applies.
+        #[cfg(test)]
+        if !self.allow_history_reduction {
+            return false;
+        }
+        self.history.is_well_established(pos, mv)
     }
 
     fn negamax_inner(
@@ -1736,6 +1814,14 @@ impl<'a> Searcher<'a> {
                 // table itself drops the move if it is a capture or a promotion.
                 if self.order == MoveOrder::Full {
                     self.killers.record(pos, ply as usize, mv);
+                    // Same cutoff, second ledger, and they answer different questions.
+                    // The killers remember it *here*, as one of two slots at this ply,
+                    // and a third cutoff evicts it. The history remembers it
+                    // *everywhere*, weighted by the depth that proved it — which is
+                    // what `late_move_reduction` needs, since it has to judge a move it
+                    // may never have seen cut off at the ply it is looking at. Both
+                    // tables refuse non-quiet moves themselves.
+                    self.history.record(pos, mv, depth);
                 }
                 break;
             }
@@ -2535,9 +2621,9 @@ mod tests {
         assert!(!searcher.is_repetition(42), "and it stops counting once popped");
 
         // In the game: one prior occurrence makes this only the second.
-        searcher.history.push(42);
+        searcher.game_history.push(42);
         assert!(!searcher.is_repetition(42), "one played occurrence is not a draw yet");
-        searcher.history.push(42);
+        searcher.game_history.push(42);
         assert!(searcher.is_repetition(42), "two played occurrences make this the third");
     }
 
@@ -2555,7 +2641,7 @@ mod tests {
         // Asserting that first is the point: with one, this test would pass while
         // exercising nothing — which is exactly what happened when the history
         // threshold moved from one to two.
-        searcher.history = vec![after_ke2.hash(), after_ke2.hash()];
+        searcher.game_history = vec![after_ke2.hash(), after_ke2.hash()];
         assert_eq!(
             searcher.root(&p, 4, None).best.map(|(_, s)| s),
             Some(0),
@@ -2989,6 +3075,32 @@ mod tests {
         // applies to the reductions.
         s.allow_rfp = false;
         s.allow_ffp = false;
+        // And the history-driven softening (#88), for the same reason and with a sharper
+        // twist: it is **asymmetric** across the two arms of this comparison. It can only act
+        // where there is a reduction to soften, so it fires in the `allow = true` arm and
+        // never in the other — which means it moves the numerator alone. Measured when it was
+        // added: the endgame at depth 5 went from 0.774 to **0.820**, tripping the ceiling
+        // below. Neutralising it here is not a workaround for that failure; it is what makes
+        // this test go on measuring the reductions rather than the pair. What the softening
+        // costs in nodes is measured on its own, in `the_softening_costs_nodes_where_it_acts`.
+        s.allow_history_reduction = false;
+        let stats = deepen(pos, Request::new(Limits::depth(depth)), &mut s);
+        Reduced { reductions: s.lmr_reductions, stats }
+    }
+
+    /// The same harness, one flag apart on the softening instead of on the reductions.
+    ///
+    /// A separate helper rather than a parameter on `search_reducing`: that one exists to
+    /// isolate the reductions and neutralises everything else, this one keeps the reductions
+    /// **on** in both arms — the question here is what the softening costs *given* that the
+    /// curve is applying, which is the only regime where it can act at all.
+    #[cfg(test)]
+    fn search_softening(pos: &Position, depth: u32, allow: bool) -> Reduced {
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
+        s.allow_rfp = false;
+        s.allow_ffp = false;
+        s.allow_history_reduction = allow;
         let stats = deepen(pos, Request::new(Limits::depth(depth)), &mut s);
         Reduced { reductions: s.lmr_reductions, stats }
     }
@@ -3120,6 +3232,253 @@ mod tests {
             "and must re-search at least one of them at full depth",
         );
     }
+
+    #[test]
+    fn the_softening_costs_nodes_where_it_acts_and_this_is_what_it_costs() {
+        // AC#7's unit-test half, and the assertion was written **after** reading the numbers
+        // rather than guessed and then accommodated. Node counts at fixed depth are
+        // deterministic, so these figures reproduce exactly and a 1 % margin is meaningful
+        // here in a way it would not be in an arena.
+        //
+        // What the sweep measured, ratio of nodes with the softening to nodes without:
+        //
+        //                    d5      d6      d7
+        //   opening        1.0000  0.9846  0.9655
+        //   middlegame     1.0562  1.0649  0.9802
+        //   tactical       1.0007  1.0018  1.0025
+        //   endgame        1.0519  1.0233  0.9962
+        //
+        // Two properties, on two domains, as this file does for the null move and the
+        // reductions. **It never runs away**: no position at any swept depth costs more than a
+        // tenth of its tree, which is the regression this pins. **It pays at depth**: the
+        // geometric mean over the four natures is 0.986 at the deepest swept depth, so where
+        // the engine actually plays the brick is not buying reduction quality with nodes.
+        //
+        // Why the shape. The bar is relative to the table's maximum, and the table fills as
+        // the search deepens, so at shallow depth few moves qualify and those that do sit near
+        // a maximum set by very little evidence. The middlegame at d5-d6 is the worst case and
+        // is quoted rather than hidden — an earlier brick in this repository went into a branch
+        // on an *average* while being negative on two positions out of four, and its Elo came
+        // back negative.
+        //
+        // The tactical position is nearly inert (1.0007 to 1.0025), and that is structural
+        // rather than a threshold artefact: its cutoffs are captures, which never enter the
+        // table, so its largest counter at d7 is 75 against 3 182 in the opening. A brick that
+        // reads quiet-move history has nothing to read where the cutoffs are tactical.
+        const DEEPEST: u32 = 7;
+        let mut product = 1.0f64;
+        for (nature, fen) in NATURES {
+            let p = Position::from_fen(fen).unwrap();
+            for depth in 5..=DEEPEST {
+                let on = search_softening(&p, depth, true);
+                let off = search_softening(&p, depth, false);
+                let ratio = on.stats.nodes as f64 / off.stats.nodes as f64;
+                assert!(
+                    ratio < 1.10,
+                    "{nature} at depth {depth}: the softening cost {ratio:.4} of the tree, \
+                     which is a runaway rather than a trade",
+                );
+                if depth == DEEPEST {
+                    product *= ratio;
+                }
+            }
+        }
+        let geometric_mean = product.powf(0.25);
+        assert!(
+            geometric_mean < 1.0,
+            "at depth {DEEPEST} the softening must not cost nodes on average, read \
+             {geometric_mean:.4}",
+        );
+    }
+    #[test]
+    fn a_real_search_softens_reductions_with_history() {
+        // **AC#4, and it is the test #40 did not have.** That brick shipped with eight green
+        // unit tests on its table, and unplugging it from the search broke none of them,
+        // because every one drove the component directly. So this one asserts nothing about
+        // the table: it runs the search the engine actually runs and checks that the gate
+        // *opened*. A brick that never fires reads `1.0000` at the node bench, and that
+        // number means "the gate never opened", not "the brick is free".
+        //
+        // Two things at once, because they fail differently. The table being fed is the
+        // wiring; the reduction being softened is the brick. The first can hold while the
+        // second never happens — if the threshold were unreachable, for instance.
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
+        assert_eq!(s.history.entries(), 0, "precondition: nothing learned yet");
+        assert_eq!(s.history_softenings, 0, "precondition: nothing softened yet");
+
+        let stats = deepen(&Position::initial(), Request::new(Limits::depth(7)), &mut s);
+
+        assert!(stats.best.is_some(), "precondition: the search returns a move");
+        assert!(
+            s.history.entries() > 0,
+            "a search must credit the quiet moves that cut off",
+        );
+        assert!(
+            s.history_softenings > 0,
+            "the history-driven branch never fired in a depth-7 search: the threshold \
+             `depth * depth` is unreachable in practice and the brick is inert",
+        );
+    }
+
+    #[test]
+    fn history_takes_exactly_one_ply_off_the_curve() {
+        // AC#2. Same searcher, same position, same (depth, rank) — one credited move against
+        // the same move uncredited. Reading the difference rather than an absolute value is
+        // what keeps this test alive when `LMR_BASE` or `LMR_DIVISOR` move.
+        let p = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
+        let mv = p.move_from_uci("a1a7").unwrap();
+        let gives_check = p.play(mv).in_check();
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
+
+        const DEPTH: u32 = 8;
+        const RANK: usize = 20;
+        let plain = s.late_move_reduction(&p, gives_check, mv, DEPTH, RANK, 1);
+        assert!(plain >= 2, "precondition: the curve must have a ply to give back, got {plain}");
+
+        // One cutoff at a depth above this one clears the threshold on its own.
+        s.history.record(&p, mv, DEPTH + 1);
+        let softened = s.late_move_reduction(&p, gives_check, mv, DEPTH, RANK, 1);
+        assert_eq!(softened, plain - 1, "history must return exactly one ply, no more");
+    }
+
+    #[test]
+    fn the_threshold_is_half_of_what_the_search_has_learned() {
+        // The bar is relative to the table's own maximum, so it is tested by moving the
+        // maximum rather than by moving the counter — a threshold only ever fails at its edge,
+        // and this one's edge moves with the rest of the table.
+        //
+        // Why relative at all: the first version was `get(..) >= depth * depth`, which
+        // compared a *sum* over every cutoff a move ever caused against what *one* cutoff is
+        // worth. At depth 7 that bar was 49 while the 90th centile of the live counters was
+        // 604; it admitted nearly everything, and cost 49 % of the tree in the opening.
+        let p = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
+        let quiet_a = p.move_from_uci("a1a7").unwrap();
+        let quiet_b = p.move_from_uci("e1d2").unwrap();
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
+
+        // An empty table qualifies nothing. Worth its own assertion: `0 * 2 >= 0` holds, so
+        // without the `best > 0` guard every move would pass before a single cutoff existed —
+        // and every reduction in the engine would be softened from the first node onwards.
+        assert!(
+            !s.history_reduction_applies(&p, quiet_a),
+            "an empty table must qualify nothing",
+        );
+
+        // One credited move is its own maximum, so it qualifies.
+        s.history.record(&p, quiet_a, 10); // 100, and best = 100
+        assert!(
+            s.history_reduction_applies(&p, quiet_a),
+            "the best move the search knows must qualify",
+        );
+
+        // A move at 49 % of the maximum does not; at 50 % it does. Both sides of the edge.
+        s.history.record(&p, quiet_b, 7); // 49 against a maximum of 100
+        assert_eq!(s.history.get(&p, quiet_b), 49, "precondition on the fixture's arithmetic");
+        assert!(
+            !s.history_reduction_applies(&p, quiet_b),
+            "49 is under half of 100 and must not earn a ply",
+        );
+        s.history.record(&p, quiet_b, 1); // +1 -> 50, exactly half
+        assert_eq!(s.history.get(&p, quiet_b), 50, "precondition on the fixture's arithmetic");
+        assert!(
+            s.history_reduction_applies(&p, quiet_b),
+            "exactly half of the maximum qualifies",
+        );
+
+        // And the bar *moves*: crediting another move far above them drops both below half.
+        s.history.record(&p, quiet_a, 20); // 100 + 400 = 500, best = 500
+        assert!(
+            !s.history_reduction_applies(&p, quiet_b),
+            "50 against a maximum of 500 no longer qualifies — the bar is relative",
+        );
+    }
+    #[test]
+    fn softening_can_cancel_a_reduction_and_never_goes_below_zero() {
+        // Where the brick meets the shallow end of the curve. `ln` is small there, so the
+        // reduction is one ply, and giving a ply back means **not reducing at all**.
+        //
+        // That is the intent rather than an edge case to be clamped away: the point of the
+        // counter is to protect a move that has proven itself, and the strongest protection
+        // available is a full-depth search. The call site handles it — `reduced` becomes
+        // `depth - 1` and the re-search is skipped, because there is nothing to re-search.
+        //
+        // Note the invariant this deliberately breaks. `the_reduction_is_never_zero_...`
+        // asserts every (depth, rank) yields at least one ply; it still passes because it
+        // runs on an empty table. The invariant belongs to the *curve*, not to the decision.
+        let p = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
+        let mv = p.move_from_uci("a1a7").unwrap();
+        let gives_check = p.play(mv).in_check();
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
+
+        // The shallowest depth and earliest rank the guards admit — where the curve is at
+        // its floor of one ply.
+        let depth = LMR_MIN_DEPTH;
+        let rank = LMR_FULL_DEPTH_MOVES;
+        assert_eq!(
+            s.late_move_reduction(&p, gives_check, mv, depth, rank, 1),
+            1,
+            "precondition: the curve is at its one-ply floor here",
+        );
+        s.history.record(&p, mv, MAX_DEPTH);
+        assert_eq!(
+            s.late_move_reduction(&p, gives_check, mv, depth, rank, 1),
+            0,
+            "a credited move at the curve's floor is not reduced at all",
+        );
+    }
+
+    #[test]
+    fn history_never_reduces_a_move_the_guards_refuse() {
+        // The counter modulates a reduction; it must never *create* one. Asked with a rank
+        // the guard refuses, a heavily credited move must still read zero — otherwise the
+        // brick would start reducing early moves, which is a different feature entirely and
+        // one nobody measured.
+        let p = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
+        let mv = p.move_from_uci("a1a7").unwrap();
+        let gives_check = p.play(mv).in_check();
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
+        for _ in 0..20 {
+            s.history.record(&p, mv, MAX_DEPTH);
+        }
+
+        assert_eq!(
+            s.late_move_reduction(&p, gives_check, mv, MAX_DEPTH, LMR_FULL_DEPTH_MOVES - 1, 1),
+            0,
+            "an early move is not reduced, however much history it carries",
+        );
+        assert_eq!(
+            s.late_move_reduction(&p, gives_check, mv, LMR_MIN_DEPTH - 1, 40, 1),
+            0,
+            "a shallow node is not reduced, however much history it carries",
+        );
+    }
+
+    #[test]
+    fn the_softening_can_be_switched_off_inside_one_binary() {
+        // The measurement baseline. The criterion for this brick is "improves on the plain
+        // curve", so the curve alone has to be reachable from inside the same binary —
+        // comparing across two builds picks up every other difference between them. Same
+        // device as `lmr_growing`, and this test is what makes the switch trustworthy.
+        let p = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 0 1").unwrap();
+        let mv = p.move_from_uci("a1a7").unwrap();
+        let gives_check = p.play(mv).in_check();
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
+        s.history.record(&p, mv, MAX_DEPTH);
+
+        const DEPTH: u32 = 8;
+        const RANK: usize = 20;
+        let on = s.late_move_reduction(&p, gives_check, mv, DEPTH, RANK, 1);
+        s.allow_history_reduction = false;
+        let off = s.late_move_reduction(&p, gives_check, mv, DEPTH, RANK, 1);
+        assert_eq!(off, on + 1, "switching the counter off must restore the plain curve");
+    }
+
 
     // The reduction the search would apply to `mv` sitting at `rank`, with `killer`
     // recorded at this ply if given.
@@ -3367,7 +3726,7 @@ mod tests {
         let mv = p.move_from_uci("a1a7").unwrap();
         let child = p.play(mv);
         let table = Table::new();
-        let searcher = Searcher::new(MoveOrder::Full, None, &table);
+        let mut searcher = Searcher::new(MoveOrder::Full, None, &table);
         // The table's own promise first, over **every** cell — including the low ones the
         // guards make unreachable today. `ln(1)` is zero, so those cells would hold a
         // reduction of zero without the floor, and a later change to `LMR_MIN_DEPTH` or
@@ -3406,7 +3765,7 @@ mod tests {
         let mv = p.move_from_uci("a1a7").unwrap();
         let child = p.play(mv);
         let table = Table::new();
-        let searcher = Searcher::new(MoveOrder::Full, None, &table);
+        let mut searcher = Searcher::new(MoveOrder::Full, None, &table);
         for (depth, rank) in [
             (MAX_DEPTH, LMR_TABLE_RANKS),          // exactly one past the rank axis
             (MAX_DEPTH, 218),                      // the most moves a legal position can offer
@@ -3438,6 +3797,12 @@ mod tests {
                     let t = Table::new();
                     let mut s = Searcher::new(MoveOrder::Full, None, &t);
                     s.lmr_growing = growing;
+                    // The history-driven softening (#88) is off in both arms, and it has to be:
+                    // it gives back **one ply**, which is the whole of the flat reduction but
+                    // only a fraction of the curve's, so leaving it on would not cancel between
+                    // the arms — it would shrink the very difference this ratio measures. Same
+                    // reasoning `search_reducing` applies to the reverse futility cut.
+                    s.allow_history_reduction = false;
                     deepen(&p, Request::new(Limits::depth(depth)), &mut s).nodes
                 };
                 let (flat, curved) = (nodes(false), nodes(true));
