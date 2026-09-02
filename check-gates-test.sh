@@ -152,13 +152,38 @@ echo "── the commit-message path, which no git-ls-files grep can see"
 # reads `git log main..HEAD`.
 if [ -n "${NAME:-}" ]; then
   BR="gate-test-tmp-$$"
-  ORIG=$(git rev-parse --abbrev-ref HEAD)
-  git switch -q -c "$BR" 2>/dev/null
+  # WHERE TO COME BACK TO, and it must survive a detached HEAD. `git rev-parse --abbrev-ref HEAD`
+  # returns the literal string `HEAD` when nothing is checked out by name — which is the state of a
+  # worktree created with `git worktree add <dir> origin/<branch>`, i.e. exactly how a pull request
+  # on this repository gets reviewed. `git switch HEAD` then fails, `git branch -D` fails too
+  # because the branch is still checked out, and the caller is left standing on the test branch
+  # **with a commit whose message contains a real name**. That is the leak this gate exists to
+  # prevent, produced by the gate's own test suite.
+  #
+  # `git symbolic-ref` succeeds only when HEAD names a branch, so it is the test: a branch to switch
+  # back to, or a SHA to detach onto.
+  if ORIG=$(git symbolic-ref -q --short HEAD); then
+    RETOUR=(switch -q "$ORIG")
+  else
+    ORIG=$(git rev-parse HEAD)
+    RETOUR=(switch -q --detach "$ORIG")
+  fi
+  git switch -q -c "$BR" || { bad "cannot create the temporary branch"; exit 1; }
   git -c user.name=UnrealPhantasy -c user.email=x@example.invalid -c commit.gpgsign=false \
       commit -q --allow-empty -m "test: spotted by $NAME on the board" 2>/dev/null
   out=$(./check.sh --gates-only 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
-  git switch -q "$ORIG" 2>/dev/null
-  git branch -q -D "$BR" 2>/dev/null
+  # NOT silenced, and that is the point of this whole block. Everything else in this script may
+  # fail quietly; a failed restore leaves a name behind, so it has to be loud and fatal.
+  git "${RETOUR[@]}" || {
+    echo "FATAL: cannot return to $ORIG — branch $BR still holds a commit naming a real person."
+    echo "       Repair by hand:  git switch --detach $ORIG && git branch -D $BR"
+    exit 1
+  }
+  git branch -q -D "$BR" || {
+    echo "FATAL: branch $BR could not be deleted and holds a commit naming a real person."
+    echo "       Repair by hand:  git branch -D $BR"
+    exit 1
+  }
   if grep -q 'no real name' <<< "$out" && grep -qE '^ +commit [0-9a-f]+' <<< "$out"; then
     ok "a real name in a commit message fails, and the output names the commit"
   else bad "a real name in a commit message was not caught"; fi
