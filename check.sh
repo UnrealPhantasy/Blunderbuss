@@ -91,11 +91,51 @@ ACCENTS='[\x{00E0}\x{00E2}\x{00E7}\x{00E8}\x{00E9}\x{00EA}\x{00EB}\x{00EE}\x{00E
 
 # The strings the identity gate looks for, derived rather than stored. Empty output means the gate
 # cannot work, and the caller treats that as a failure.
+#
+# THE FOUR-CHARACTER FLOOR, why it exists and why it does NOT apply to both sources.
+#
+# The derived half needs a floor: `git config --global user.name` is split on camel case and on
+# non-letters, so it yields fragments, and fragments of one to three letters fire on ordinary
+# English -- an initial, or a three-letter particle out of a surname. Without the floor this gate
+# is noise, and a noisy gate gets commented out.
+#
+# But the floor applied to BOTH sources would contradict the reason this gate is separate from the
+# language ones. Their tolerances are opposite: a false positive on language costs a moment, a
+# false **negative** on identity is not repairable in place -- editing a message rewrites history,
+# and a pull request keeps its commits reachable for ever. So this gate is tuned against MISSES,
+# and a floor that silently drops a three-letter given name is exactly a miss.
+#
+# Hence: the floor governs what is DERIVED, and an untracked `.check-identity` bypasses it. A
+# string written there by hand is deliberate -- whoever wrote it knows what it will match, which is
+# precisely what cannot be assumed of an automatically split fragment. Its own floor is two
+# characters, which drops blank lines and stray single letters and nothing else.
+# The two floors, named so that a test can read them instead of transcribing them. The property
+# that matters is not either value but the fact that the DERIVED floor is the higher of the two —
+# that is what says the two sources are trusted differently, and it is the thing a later edit could
+# quietly undo by making them equal.
+#
+# HONEST NOTE ON WHAT IS TESTED HERE, in the same spirit as the null move's `return beta`.
+# Three mutations are caught by the tests: equalising the two constants, lowering the derived one,
+# and making the function ignore the explicit one. The fourth — making the function ignore the
+# DERIVED constant, i.e. dropping its floor to 1 — **cannot be caught on this machine and probably
+# not on any**: the check is only observable if the global git identity yields a fragment shorter
+# than four letters, and a name that splits into such a fragment is unusual. Verified: with the
+# floor at 1 and at 4, this machine derives the same two strings. So that line rests on reasoning,
+# and saying so is better than an assertion that cannot fail.
+IDENTITY_FLOOR_DERIVED=4
+IDENTITY_FLOOR_EXPLICIT=2
+
 identity_strings() {
-  { git config --global user.name 2>/dev/null
-    [ -f .check-identity ] && cat .check-identity
-  } | sed -E 's/([a-z])([A-Z])/\1\n\2/g' | tr -c 'A-Za-z\n' '\n' \
-    | awk 'length($0) >= 4' | sort -u
+  {
+    # Derived: split on camel case, then on anything that is not a letter, then floored.
+    git config --global user.name 2>/dev/null \
+      | sed -E 's/([a-z])([A-Z])/\1\n\2/g' | tr -c 'A-Za-z\n' '\n' \
+      | awk -v n="$IDENTITY_FLOOR_DERIVED" 'length($0) >= n'
+    # Explicit: one string per line, with the lower floor. See the note above for why it differs.
+    [ -f .check-identity ] \
+      && tr -c 'A-Za-z\n' '\n' < .check-identity \
+       | awk -v n="$IDENTITY_FLOOR_EXPLICIT" 'length($0) >= n'
+  } | sort -u
 }
 
 # Every tracked file, transliterated, one `grep -n` per file so the name of the file is known.

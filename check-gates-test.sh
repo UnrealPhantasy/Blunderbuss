@@ -195,6 +195,42 @@ else
 fi
 
 echo
+echo "── the explicit list bypasses the four-character floor"
+
+# The floor exists for the DERIVED half: `user.name` is split into fragments, and fragments of one
+# to three letters fire on ordinary English. But this gate is tuned against MISSES — a false
+# negative on identity is not repairable in place — so a floor that silently drops a three-letter
+# given name is exactly the failure it must not have. A string written by hand in `.check-identity`
+# is deliberate, so it bypasses the floor.
+#
+# `Xqz` rather than a real short name: three letters, and grepped word-wise over the tracked tree at
+# zero occurrences, so the fixture below is the only thing it can match.
+SHORT=Xqz
+if [ -f .check-identity ]; then
+  bad ".check-identity already exists, refusing to overwrite it — test skipped"
+else
+  printf '%s\n' "$SHORT" > .check-identity
+  out=$(with_fixture "reviewed by $SHORT last week")
+  rm -f .check-identity
+  if grep -q 'no real name' <<< "$out" && grep -q "$FIXTURE:1" <<< "$out"; then
+    ok "a three-letter string from .check-identity is caught — the floor does not apply to it"
+  else bad "a short explicit string was dropped: the floor still governs both sources"; fi
+
+  # And the two floors must stay DIFFERENT, which is the property that says the two sources are
+  # trusted differently. Read from the two named constants rather than from the behaviour of
+  # `identity_strings`, and the reason is worth recording: a first version of this test asserted
+  # that nothing the function returns is shorter than four, and that assertion **could not fail on
+  # this machine** — the global git identity yields no fragment under four letters, so lowering the
+  # floor to 1 returned the same two strings. The mutation was inert, not the test blind. An
+  # assertion whose mutation cannot move it is worth deleting, so it was.
+  fd=$(grep -E '^IDENTITY_FLOOR_DERIVED=' check.sh | cut -d= -f2)
+  fe=$(grep -E '^IDENTITY_FLOOR_EXPLICIT=' check.sh | cut -d= -f2)
+  if [ -n "$fd" ] && [ -n "$fe" ] && [ "$fd" -gt "$fe" ]; then
+    ok "the derived floor ($fd) is above the explicit one ($fe) — the sources are trusted differently"
+  else bad "the two identity floors no longer differ ($fd against $fe): the explicit list lost its point"; fi
+fi
+
+echo
 echo "── the ordering inside check.sh"
 
 # A gate costing milliseconds placed after a 100-second sweep is a gate that gets interrupted.
