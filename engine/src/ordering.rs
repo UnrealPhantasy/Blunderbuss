@@ -395,6 +395,31 @@ mod tests {
     }
 
     #[test]
+    fn this_module_and_the_evaluation_agree_on_what_a_piece_is_worth() {
+        // Two private tables, in two modules, with the same numbers — and this module's comment
+        // says only their **relative** order matters here. That is fine while nothing reads them
+        // absolutely, and quiescence's delta cut now does: it compares a bound built from piece
+        // values against `alpha`, which lives on the evaluation's scale.
+        //
+        // The cut reads `evaluation::piece_value` for exactly that reason. This test pins that the
+        // two tables have not drifted anyway, because the failure mode otherwise is silent: the
+        // ordering keeps working (it only needs the order) while any absolute reading of it becomes
+        // wrong by the difference. One source read from both sides is what makes either of them
+        // moving observable.
+        //
+        // The king is excluded and that is deliberate: 20 000 here so that a king capture never
+        // falls among the quiet moves, 0 in the evaluation because both sides always have exactly
+        // one. Neither number is wrong for its own use, and no legal position lets them meet.
+        for piece in [Piece::Pawn, Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen] {
+            assert_eq!(
+                value(piece),
+                crate::evaluation::piece_value(piece),
+                "the two piece-value tables disagree on {piece:?}",
+            );
+        }
+    }
+
+    #[test]
     fn a_killer_is_tried_before_the_other_quiet_moves() {
         let p = Position::from_fen(CAPTURES_AND_QUIETS).unwrap();
         let killer = uci_move(&p, QUIET_A);

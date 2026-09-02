@@ -42,6 +42,17 @@ fn value(piece: Piece) -> i32 {
     }
 }
 
+/// What a piece is worth, in the scale [`evaluate`] returns.
+///
+/// Exposed because quiescence's delta cut compares a bound on what a capture can win against
+/// `alpha`, and `alpha` is on this scale. `ordering` has a table of its own with the same numbers
+/// today, but its comment says only the *relative* order matters there — so reading it for an
+/// absolute comparison would be borrowing a coincidence. A test pins that the two agree, which is
+/// what makes either of them moving observable.
+pub fn piece_value(piece: Piece) -> i32 {
+    value(piece)
+}
+
 /// How much each piece contributes to the game phase.
 ///
 /// Pawns count for nothing: a position with every pawn and no piece is an endgame,

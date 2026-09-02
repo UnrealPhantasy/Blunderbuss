@@ -11,7 +11,7 @@
 //! better, so deepening to depth N costs about as much as (often less than) a single
 //! direct depth-N pass. [`best_move`] is a thin convenience wrapper over it.
 
-use crate::evaluation::{evaluate, phase};
+use crate::evaluation::{self, evaluate, phase};
 use crate::ordering::{is_quiet, mvv_lva, order_moves, see, KillerSlots, Killers};
 use crate::position::{Move, Piece, Position};
 use crate::book::Book;
@@ -349,6 +349,49 @@ pub struct SearchStats {
 /// exactly why the comparison has to be made on a position where pawns are promoting.
 fn is_queen_promotion(mv: Move) -> bool {
     mv.promotion == Some(Piece::Queen)
+}
+
+/// How far below `alpha` a capture's best case may still land and be searched anyway.
+///
+/// **One pawn**, and the value is chosen rather than swept. It is the smallest unit of material
+/// that can change a node's verdict, and it is already a constant of this codebase rather than a
+/// number invented for this cut. A margin too small prunes moves that would have mattered; too
+/// large and the cut never fires. The smallest meaningful unit of material is the defensible end
+/// of that trade — and this repository has a brick that died after four successive recalibrations
+/// produced no gain, so a margin with a reason is worth more than a margin with a sweep.
+const DELTA_MARGIN: i32 = 100;
+
+/// The most material `mv` can possibly win, on the scale [`evaluate`] returns.
+///
+/// **Optimistic on purpose.** It counts the captured piece and the promotion without subtracting
+/// any recapture, because it is used to prove a capture *cannot* help: an upper bound that is too
+/// generous prunes less than it could, while one that is too tight would prune a move that wins.
+/// The exchange evaluation answers the other question — "does this lose material" — and both
+/// filters sit side by side in quiescence for that reason.
+///
+/// Idiom: `map_or(0, f)` on an `Option` is "0 if None, else f(x)" in one step, which avoids
+/// unwrapping a value that may not be there.
+fn optimistic_gain(pos: &Position, mv: Move) -> i32 {
+    let on_destination = pos.piece_on(mv.to);
+    // A king is never capturable in a legal position, but `piece_value(King)` is 0, so a bound
+    // built from it would be *under*-estimated rather than over — the one direction that prunes a
+    // move it should not. Refused explicitly instead of trusted to legality.
+    if on_destination == Some(Piece::King) {
+        return INF;
+    }
+    let captured = on_destination.map_or(0, evaluation::piece_value);
+    // En passant: the captured pawn is not on the destination square, so `piece_on` finds
+    // nothing. Same test `is_quiet` uses — a pawn changing file onto an empty square.
+    let en_passant = on_destination.is_none()
+        && pos.piece_on(mv.from) == Some(Piece::Pawn)
+        && mv.from.file() != mv.to.file();
+    let captured = if en_passant { evaluation::piece_value(Piece::Pawn) } else { captured };
+    // A promotion replaces the pawn, so the gain is the difference and not the new piece's
+    // whole value.
+    let promoted = mv
+        .promotion
+        .map_or(0, |p| evaluation::piece_value(p) - evaluation::piece_value(Piece::Pawn));
+    captured + promoted
 }
 
 /// The best move for `pos` at a fixed `depth`, or `None` at a terminal root.
@@ -971,6 +1014,21 @@ struct Searcher<'a> {
     /// verdicts on the same position — which requires both to be reachable from one binary.
     #[cfg(test)]
     allow_see_pruning: bool,
+    /// Whether the delta cut may skip a capture in quiescence.
+    ///
+    /// **Tests only**, same device as `allow_see_pruning` and for the same reason: a node count
+    /// only means something against a search identical but for the one thing being measured, and
+    /// the baseline has to be reachable from inside the same binary.
+    #[cfg(test)]
+    allow_delta_pruning: bool,
+    /// How many captures the delta cut skipped.
+    ///
+    /// **Tests only, and it is the load-bearing counter of this brick.** A cut that never fires
+    /// reads `1.0000` at the node bench, and that number means "the gate never opened", not "the
+    /// brick is free" — a distinction this repository has paid for twice. Counting from inside the
+    /// search is what lets a test assert the *use* rather than the mechanism.
+    #[cfg(test)]
+    delta_cuts: u64,
 }
 
 impl<'a> Searcher<'a> {
@@ -1044,6 +1102,10 @@ impl<'a> Searcher<'a> {
             ext_max_depth: CHECK_EXTENSION_MAX_DEPTH,
             #[cfg(test)]
             allow_see_pruning: true,
+            #[cfg(test)]
+            allow_delta_pruning: true,
+            #[cfg(test)]
+            delta_cuts: 0,
         }
     }
 
@@ -1768,6 +1830,38 @@ impl<'a> Searcher<'a> {
     /// quiescence searches changes the material on the board, so no line it explores
     /// can return to a position seen earlier. The entry node is already covered —
     /// [`Searcher::negamax`] tests for a repetition before handing over.
+    /// Whether `mv` can be skipped because its best case cannot reach `alpha`.
+    ///
+    /// **The second question about a capture, and nothing asked it before.** The exchange filter
+    /// above asks "does this capture lose material?". This asks "could it matter?" — a rook taking
+    /// an undefended pawn wins material and is worth searching, unless the side to move is 900
+    /// centipawns behind, in which case winning a pawn cannot change this node's value and the
+    /// whole subtree below the move is spent proving something already known.
+    ///
+    /// Never applied when in check, for the same reason the exchange filter is not: a side in
+    /// check has no choice, and pruning its replies by material could drop the only legal escape
+    /// from a mate threat.
+    ///
+    /// Note what this does *not* risk: the loop's `best` starts at `stand_pat`, so a node whose
+    /// every move is skipped returns the static evaluation rather than a mate score or a zero.
+    /// Pruning the whole move list here is a statement about `alpha`, not about the position.
+    fn delta_cut(&mut self, pos: &Position, mv: Move, stand_pat: i32, alpha: i32) -> bool {
+        // Compiled out of production builds, where the cut always applies.
+        #[cfg(test)]
+        if !self.allow_delta_pruning {
+            return false;
+        }
+        if pos.in_check() {
+            return false;
+        }
+        let hopeless = stand_pat.saturating_add(optimistic_gain(pos, mv)).saturating_add(DELTA_MARGIN) <= alpha;
+        #[cfg(test)]
+        if hopeless {
+            self.delta_cuts += 1;
+        }
+        hopeless
+    }
+
     fn quiescence(&mut self, pos: &Position, mut alpha: i32, beta: i32, ply: i32) -> i32 {
         self.nodes += 1;
         self.check_limits();
@@ -1830,6 +1924,11 @@ impl<'a> Searcher<'a> {
 
         let mut best = stand_pat;
         for &mv in &moves {
+            // Asked before the move is played, which is the whole point: the cost of the test is
+            // two integer operations and what it saves is a recursive call plus its subtree.
+            if self.delta_cut(pos, mv, stand_pat, alpha) {
+                continue;
+            }
             let score = -self.quiescence(&pos.play(mv), -beta, -alpha, ply + 1);
             if self.aborted {
                 return 0;
@@ -1851,7 +1950,7 @@ impl<'a> Searcher<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::position::{Color, Piece, Status};
+    use crate::position::{Color, Piece, Square, Status};
 
     // A position where the engine changes its mind as it deepens: c1d1 at depths 1-2,
     // h2h3 at 3-4, f3e1 at 5-6. That is what makes it usable for the tests below —
@@ -4720,6 +4819,25 @@ mod tests {
         let table = Table::new();
         let mut s = Searcher::new(MoveOrder::Full, None, &table);
         s.allow_see_pruning = prune;
+        // The delta cut (#90) is off in both arms, and it has to be. It is the *other* pruning
+        // filter in quiescence, and the two interact through `alpha`: with the exchange filter
+        // disabled, more captures are searched, `alpha` climbs differently, and the delta cut
+        // then skips a different set of moves. The two arms would no longer differ by the
+        // exchange filter alone — measured, Kiwipete at depth 7 came back 35 against 38.
+        //
+        // What the delta cut costs in tactical sight is measured on its own, by the same ten
+        // positions, in `the_delta_cut_keeps_what_the_search_saw`.
+        s.allow_delta_pruning = false;
+        let stats = deepen(pos, Request::new(Limits::depth(depth)), &mut s);
+        (stats.best, stats.nodes)
+    }
+
+    /// The same harness, one flag apart on the delta cut instead of on the exchange filter.
+    #[cfg(test)]
+    fn quiescence_delta(pos: &Position, depth: u32, delta: bool) -> (Option<(Move, i32)>, u64) {
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
+        s.allow_delta_pruning = delta;
         let stats = deepen(pos, Request::new(Limits::depth(depth)), &mut s);
         (stats.best, stats.nodes)
     }
@@ -5104,6 +5222,248 @@ mod tests {
         // depths 4 and 6 too. The reason is structural — `best` starts at the stand-pat and only
         // ever rises, so a reply that was never searched cannot pull the answer down. What the
         // guard protects is which replies get searched, which is why the assertion counts nodes.
+    }
+
+
+    // ---- delta pruning in quiescence (#90) ------------------------------------------------
+
+    #[test]
+    fn optimistic_gain_counts_the_captured_piece() {
+        // The ordinary case, and the scale matters as much as the number: `alpha` and
+        // `stand_pat` are on the evaluation's scale, so the bound has to be too.
+        let p = Position::from_fen("4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1").unwrap();
+        let takes_queen = p.move_from_uci("e4d5").expect("a legal move");
+        assert_eq!(
+            optimistic_gain(&p, takes_queen),
+            evaluation::piece_value(Piece::Queen),
+            "a capture is worth the piece it takes, no more and no less",
+        );
+    }
+
+    #[test]
+    fn optimistic_gain_counts_the_en_passant_pawn_that_is_not_on_the_square() {
+        // The destination square is **empty** in an en passant capture — the captured pawn sits
+        // beside it. A bound built from `piece_on(mv.to)` alone would read 0 and let the cut prune
+        // a move that wins a pawn. Same shape as the trap the capture filter already knows about.
+        let p = Position::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 2").unwrap();
+        let en_passant = p.move_from_uci("e5d6").expect("a legal move");
+        assert!(p.piece_on(en_passant.to).is_none(), "precondition: the square is empty");
+        assert_eq!(
+            optimistic_gain(&p, en_passant),
+            evaluation::piece_value(Piece::Pawn),
+            "en passant still wins a pawn",
+        );
+    }
+
+    #[test]
+    fn optimistic_gain_counts_a_promotion_as_the_difference() {
+        // A promotion replaces the pawn, so the gain is queen minus pawn and not the queen's whole
+        // value — the pawn was already on the board and already counted in `stand_pat`. Reading it
+        // as the full value would over-estimate the bound, which prunes less than it could; the
+        // error is in the safe direction, which is exactly why it would never be noticed.
+        // The black king is on h8 and not e8: on e8 the promotion square would be occupied *by
+        // the king*, `e7e8` would not be a legal move at all, and `optimistic_gain` would
+        // correctly return `INF` for a king capture — which is how the first version of this
+        // test failed, on its own fixture rather than on the code.
+        let p = Position::from_fen("7k/4P3/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let promotes = p.move_from_uci("e7e8q").expect("a legal move");
+        assert_eq!(
+            optimistic_gain(&p, promotes),
+            evaluation::piece_value(Piece::Queen) - evaluation::piece_value(Piece::Pawn),
+            "a promotion is worth the difference, the pawn being already counted",
+        );
+
+        // And a promotion that also captures wins both.
+        let both = Position::from_fen("3rk3/4P3/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let captures_and_promotes = both.move_from_uci("e7d8q").expect("a legal move");
+        assert_eq!(
+            optimistic_gain(&both, captures_and_promotes),
+            evaluation::piece_value(Piece::Rook) + evaluation::piece_value(Piece::Queen)
+                - evaluation::piece_value(Piece::Pawn),
+            "capturing while promoting wins the rook and the difference",
+        );
+    }
+
+    #[test]
+    fn optimistic_gain_refuses_to_bound_a_king_capture() {
+        // `piece_value(King)` is **0** in the evaluation, because both sides always have exactly
+        // one and it never shifts the balance. A bound built from it would read 0 for a king
+        // capture — an *under*-estimate, the one direction that prunes a move it must not.
+        //
+        // No legal move list contains a king capture, so this is unreachable through the search.
+        // It is tested rather than argued because `Move` is constructible: a later caller of this
+        // function need not come from `legal_moves`, and the failure would be silent.
+        let p = Position::from_fen("4k3/8/8/8/4K3/8/8/8 w - - 0 1").unwrap();
+        let takes_king = Move { from: Square::E4, to: Square::E8, promotion: None };
+        assert_eq!(
+            evaluation::piece_value(Piece::King),
+            0,
+            "precondition: this is why the guard exists",
+        );
+        assert_eq!(optimistic_gain(&p, takes_king), INF, "a king capture is never bounded");
+    }
+
+    #[test]
+    fn a_capture_that_cannot_reach_alpha_is_skipped_and_one_that_can_is_not() {
+        // Both sides of the decision, on the same position and the same move, `alpha` apart. The
+        // cut is a statement about `alpha`, not about the move.
+        let p = Position::from_fen("4k3/8/8/3p4/4P3/8/8/4K3 w - - 0 1").unwrap();
+        let takes_pawn = p.move_from_uci("e4d5").expect("a legal move");
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
+
+        let stand_pat = 0;
+        let gain = optimistic_gain(&p, takes_pawn);
+        assert_eq!(gain, 100, "precondition on the fixture: it wins exactly a pawn");
+
+        // Just too far: 0 + 100 + 100 <= 201.
+        assert!(
+            s.delta_cut(&p, takes_pawn, stand_pat, 201),
+            "winning a pawn cannot close a 201 centipawn gap, margin included",
+        );
+        // Just close enough: 0 + 100 + 100 > 199.
+        assert!(
+            !s.delta_cut(&p, takes_pawn, stand_pat, 199),
+            "it can close a 199 centipawn gap, so the move must be searched",
+        );
+        // And exactly at the boundary, which is where a threshold fails if it fails.
+        assert!(
+            s.delta_cut(&p, takes_pawn, stand_pat, 200),
+            "the comparison is `<=`, so exactly 200 is hopeless",
+        );
+    }
+
+    #[test]
+    fn no_delta_cut_when_the_side_to_move_is_in_check() {
+        // Same reason the exchange filter is disabled in check: a side in check has no choice, so
+        // pruning its replies by material could drop the only legal escape from a mate threat.
+        // Here the only capture is also the only way out.
+        let p = Position::from_fen("4k3/8/8/8/8/8/5PPP/6rK w - - 0 1").unwrap();
+        assert!(p.in_check(), "precondition: White is in check");
+        let takes_rook = p.move_from_uci("h1g1").expect("a legal move");
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
+        assert!(
+            !s.delta_cut(&p, takes_rook, -900, 900),
+            "in check, no capture is ever skipped however hopeless it looks",
+        );
+    }
+
+    #[test]
+    fn a_node_whose_every_capture_is_hopeless_returns_the_static_evaluation() {
+        // AC#3, and it is the failure mode that would be worst: pruning the whole move list must
+        // be a statement about `alpha`, never about the position. The loop's `best` starts at
+        // `stand_pat`, so an emptied list returns the static evaluation — not a mate score, and
+        // not the zero that means "draw".
+        //
+        // Driven through `quiescence` rather than by reasoning about the loop, because that is the
+        // claim: the caller sees `stand_pat` back.
+        let p = Position::from_fen("4k3/8/8/3p4/4P3/8/8/4K3 w - - 0 1").unwrap();
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
+        let stand_pat = evaluate(&p);
+        // An `alpha` far above anything a pawn capture could reach, with `beta` above it so the
+        // stand-pat cut at the top does not fire first.
+        let alpha = stand_pat + 5_000;
+        let got = s.quiescence(&p, alpha, alpha + 1, 0);
+        assert!(s.delta_cuts > 0, "precondition: the cut actually fired here");
+        assert_eq!(got, stand_pat, "an emptied move list returns the static evaluation");
+    }
+
+    #[test]
+    fn a_real_search_fires_the_delta_cut() {
+        // AC#4. Every other test here drives `delta_cut` or `optimistic_gain` directly, which says
+        // the pieces work but not that the search uses them — and a heuristic wired to nothing
+        // passes every unit test it owns. This one runs the path `Engine::search` runs and checks
+        // the gate opened. A brick that never fires reads `1.0000` at the node bench, and that
+        // number means "the gate never opened", not "the brick is free".
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
+        assert_eq!(s.delta_cuts, 0, "precondition: nothing cut yet");
+        let stats = deepen(&Position::initial(), Request::new(Limits::depth(7)), &mut s);
+        assert!(stats.best.is_some(), "precondition: the search returns a move");
+        assert!(
+            s.delta_cuts > 0,
+            "a depth-7 search from the initial position must skip at least one hopeless capture",
+        );
+    }
+
+    #[test]
+    fn the_delta_cut_can_be_switched_off_inside_one_binary() {
+        // The measurement baseline. The criterion is "fewer nodes than without", so the baseline
+        // has to be reachable from inside the same binary — comparing across two builds picks up
+        // every other difference between them.
+        let p = Position::from_fen("4k3/8/8/3p4/4P3/8/8/4K3 w - - 0 1").unwrap();
+        let takes_pawn = p.move_from_uci("e4d5").expect("a legal move");
+        let table = Table::new();
+        let mut s = Searcher::new(MoveOrder::Full, None, &table);
+        assert!(s.delta_cut(&p, takes_pawn, 0, 500), "precondition: hopeless with the cut on");
+        s.allow_delta_pruning = false;
+        assert!(!s.delta_cut(&p, takes_pawn, 0, 500), "switched off, nothing is ever skipped");
+    }
+
+    #[test]
+    fn the_delta_cut_keeps_what_the_search_saw() {
+        // **The control this brick needs, and the assertion was written from the numbers rather
+        // than guessed.** Unlike ordering, pruning changes what the search concludes: a capture
+        // skipped here is never examined. So the question is not "is it faster" but "does it still
+        // see what it saw".
+        //
+        // Ten tactical positions at two depths, six of them forced mates. Measured:
+        //
+        //   scores differing : 1 of 20 — Kiwipete at depth 7, 35 against 15, not a mate
+        //   nodes            : 474 941 with, 585 290 without — ratio 0.8115
+        //
+        // So the trade is 19 % of the tree on tactical positions against a 20 centipawn drift on
+        // one quiet score. The exchange filter (#57) drifted on none, which makes this cut the
+        // more aggressive of the two — stated rather than hidden, because it is the cost.
+        //
+        // Three claims, weakest to strongest. **No mate is lost**: that is the one that would make
+        // the brick unshippable, and it is asserted exactly rather than as "still a mate" — a mate
+        // in 3 becoming a mate in 5 is also a loss of sight. **The drift is bounded** on the quiet
+        // scores. **The tree shrinks**, which is the whole point.
+        let mut mates = 0;
+        let mut drifted = 0;
+        let mut worst_drift = 0;
+        let (mut with, mut without) = (0u64, 0u64);
+        for fen in TACTICS {
+            let p = Position::from_fen(fen).unwrap();
+            for depth in 6..=7u32 {
+                let (cut, nodes_cut) = quiescence_delta(&p, depth, true);
+                let (plain, nodes_plain) = quiescence_delta(&p, depth, false);
+                let a = cut.expect("a move at the root").1;
+                let b = plain.expect("a move at the root").1;
+                with += nodes_cut;
+                without += nodes_plain;
+
+                if b.abs() > MATE_THRESHOLD {
+                    mates += 1;
+                    assert_eq!(
+                        a, b,
+                        "{fen} at depth {depth}: the cut lost a forced mate, {a} against {b}",
+                    );
+                }
+                if a != b {
+                    drifted += 1;
+                    worst_drift = worst_drift.max((a - b).abs());
+                }
+            }
+        }
+        assert!(
+            mates >= 6,
+            "precondition: this set must contain forced mates for the test to prove anything, \
+             found {mates}",
+        );
+        assert!(
+            drifted <= 2 && worst_drift <= 50,
+            "the cut drifted on {drifted} of 20 scores, worst {worst_drift} cp — it is trading \
+             more sight than measured",
+        );
+        let ratio = with as f64 / without as f64;
+        assert!(
+            ratio < 0.90,
+            "the cut must shed at least a tenth of the tree on tactical positions, read {ratio:.4}",
+        );
     }
 
 }
