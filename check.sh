@@ -68,9 +68,16 @@ run() {
 # #70 leaked four French lines into this very script.
 #
 # THE HOLE THIS OPENS, stated rather than left to be discovered: a line carrying the marker is not
-# scanned, so French could be hidden behind it. That is deliberate and it is auditable -- there is
-# exactly one such line, and `grep LANG-GATE-PATTERN check.sh` shows every one of them. The
-# alternative was excluding this whole file, which is the file French actually leaked into.
+# scanned, so French could be hidden behind it. That is deliberate and it is auditable -- exactly
+# **two** lines carry it, and they are the two immediately below: the marker's own definition and
+# the word list. The alternative was excluding this whole file, which is the file French actually
+# leaked into.
+#
+# AND THIS COMMENT DELIBERATELY DOES NOT SPELL THE MARKER OUT. An earlier version did, in prose,
+# to give the reader a `grep` to run -- which exempted this very line from all three gates. The
+# comment documenting the hole was inside it, and it announced the wrong count as well: three
+# lines carried the marker while the text claimed one. A sentence about a pattern must not match
+# it. To audit, grep for the value assigned just below.
 GATE_MARKER='LANG-GATE-PATTERN'
 
 # French words with no accent, matched word-wise and case-insensitively. See the note above for what
