@@ -88,11 +88,17 @@ use crate::search::{Limits, search_timed};
 // one place its blind spots are least likely to be. The seed is in the source, so the set is
 // reproducible to the position -- which is what AC#1 asks for.
 //
-// They are then **stratified by phase**, on the same four bands `banc.sh` uses, so a figure here
-// can be laid beside a figure from the bench without a conversion. The stratification is not
+// They are then **stratified by phase**, into four bands of the value [`phase`] returns: 20-24,
+// 16-19, 11-15 and 0-10, from a full board down to a thin endgame. The stratification is not
 // cosmetic: mobility is a lookup per minor piece and passed pawns are a mask per pawn, so both
 // terms cost different amounts at different moments of a game, and an unstratified average would
 // hide exactly the variation that decides whether the breakdown generalises.
+//
+// Those four cuts are the ones the project's node bench uses, so a figure here can be laid beside
+// one from the bench without a conversion. That bench lives outside this repository -- it holds
+// compiled binaries and a third-party arbiter -- which is why the bands are spelled out above
+// rather than only referred to: a reader of this file has to be able to check the boundaries
+// without it. The same holds wherever the comments below name a script.
 
 /// How many pieces stand on the board. Reported beside the phase because the phase counts material
 /// weight and the loop in `evaluate` counts *squares*: a board of eight pawns and two kings has a
@@ -101,7 +107,8 @@ fn occupied_count(pos: &Position) -> usize {
     Square::ALL.iter().filter(|&&sq| pos.piece_on(sq).is_some()).count()
 }
 
-/// The four phase bands, named as `banc.sh` names them, from a full board down to a thin endgame.
+/// The four phase bands, from a full board down to a thin endgame. Named as the node bench names
+/// them, so its tables and this one can be read side by side.
 const STRATA: [(&str, i32, i32); 4] = [
     ("opening     (20-24)", 20, 24),
     ("middle high (16-19)", 16, 19),
@@ -430,10 +437,11 @@ struct Reading {
 
 /// Time every copy of every variant, alternating between them round after round.
 ///
-/// Alternation and median rather than a mean of consecutive runs, for the reason `cpu-cost.sh`
-/// gives: a machine drifts over the seconds a measurement takes -- another process starts, the
-/// clock boosts and settles -- and a drift that lands entirely on the variant timed last reads as
-/// that variant being slower.
+/// Alternation and median rather than a mean of consecutive runs, and the reason is the one the
+/// project's cost-per-node script already runs on: a machine drifts over the seconds a measurement
+/// takes -- another process starts, the clock boosts and settles -- and a drift that lands entirely
+/// on the variant timed last reads as that variant being slower. Stated here rather than referred
+/// to, since that script is outside this repository.
 fn measure(rows: &Rows, positions: &[Position]) -> Vec<Reading> {
     // **Calibrated per variant, not once for the stratum.** A single `reps` taken from `full` gives
     // the cheap rows points far under [`POINT`] -- `bare walk` is 2.4x cheaper, so its points came
