@@ -818,10 +818,6 @@ struct Searcher<'a> {
     rfp_taken: u64,
     #[cfg(test)]
     rfp_considered: u64,
-    /// How many quiet moves were **skipped** without being played, and how many were
-    /// **considered**. **Tests only** — the same pair as the reverse cut, and for the same reason:
-    /// a gate that never opens makes a brick read a node ratio of 1.0000 exactly, which is
-    /// indistinguishable from a brick that costs nothing.
     /// How many static evaluations this searcher paid for **at interior nodes**. **Tests only**,
     /// and it is the number that says whether the forward cut is cheap: it must stay at one per
     /// node, never one per move, or the economy #66 already paid for is spent twice.
@@ -833,6 +829,10 @@ struct Searcher<'a> {
     /// stays narrow because what it guards is one gate and not the engine's evaluation bill.
     #[cfg(test)]
     evals: u64,
+    /// How many quiet moves were **skipped** without being played, and how many were
+    /// **considered**. **Tests only** — the same pair as the reverse cut, and for the same reason:
+    /// a gate that never opens makes a brick read a node ratio of 1.0000 exactly, which is
+    /// indistinguishable from a brick that costs nothing.
     #[cfg(test)]
     ffp_pruned: u64,
     #[cfg(test)]
