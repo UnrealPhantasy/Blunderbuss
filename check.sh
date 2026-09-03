@@ -131,6 +131,18 @@ identity_strings() {
     git config --global user.name 2>/dev/null \
       | sed -E 's/([a-z])([A-Z])/\1\n\2/g' | tr -c 'A-Za-z\n' '\n' \
       | awk -v n="$IDENTITY_FLOOR_DERIVED" 'length($0) >= n'
+    # AND the run-together form, which the split alone cannot catch. Found by review, then
+    # reproduced: matched word-wise, the components are each caught in isolation, but the name
+    # written **exactly as `user.name` holds it** — components adjacent, no separator — is a single
+    # word under `-w` and equals none of them. That is not how a name appears in prose, which is
+    # why it looked safe; it is precisely what a copy-paste of the git identity produces, and this
+    # gate exists for the case nobody was thinking about.
+    #
+    # It costs nothing elsewhere: a run-together name is one long word, so the `-w` boundaries that
+    # keep `theorem`, `theory` and `theoretical` out are untouched, and a twelve-letter
+    # concatenation cannot collide with English text.
+    git config --global user.name 2>/dev/null | tr -cd 'A-Za-z' \
+      | awk -v n="$IDENTITY_FLOOR_DERIVED" 'length($0) >= n'
     # Explicit: one string per line, with the lower floor. See the note above for why it differs.
     [ -f .check-identity ] \
       && tr -c 'A-Za-z\n' '\n' < .check-identity \

@@ -195,6 +195,43 @@ else
 fi
 
 echo
+echo "── the run-together form of the name, which the split alone cannot catch"
+
+# Found by review and reproduced before being fixed: the derivation splits on camel case, so the
+# pattern holds the COMPONENTS. Matched word-wise, each component is caught in isolation, but the
+# name written exactly as `user.name` holds it — components adjacent, no separator — is a single
+# word under `-w` and equals none of them. Not how a name appears in prose, which is why it looked
+# safe; exactly what a copy-paste of the git identity produces.
+#
+# The fixture is derived, like every other one here: never written out.
+RUN_TOGETHER=$(git config --global user.name 2>/dev/null | tr -cd 'A-Za-z')
+# How many distinct strings the gate derives. The precondition is on this COUNT and not on a
+# length: a first version compared the concatenation's length against the longest string the gate
+# derives, which is wrong now that the gate derives the concatenation itself — the two were equal
+# and the test declared itself objectless while the hole was real. A single-word identity
+# concatenates to itself, `sort -u` folds the two, and the count is 1.
+DERIVED_COUNT=$(bash -c 'source /dev/stdin <<< "$(sed -n "/^identity_strings()/,/^}/p" check.sh)"; identity_strings' \
+                | wc -l)
+if [ -z "$RUN_TOGETHER" ]; then
+  bad "no global user.name: the run-together case cannot be tested"
+elif [ "$DERIVED_COUNT" -lt 2 ]; then
+  # Said rather than passed silently: an assertion with no object is worse than a missing one.
+  ok "the identity is a single word — the run-together case does not exist here, nothing to test"
+else
+  out=$(with_fixture "author: $RUN_TOGETHER")
+  if grep -q 'no real name' <<< "$out" && grep -q "$FIXTURE:1" <<< "$out"; then
+    ok "the run-together name is caught (${#RUN_TOGETHER} letters, ${DERIVED_COUNT} strings derived)"
+  else bad "the run-together name passed: the split-only pattern misses a pasted git identity"; fi
+
+  # Non-regression on the boundaries the whole gate depends on. A long concatenation is one word, so
+  # `-w` is untouched — but that is the claim, so it is asserted rather than argued.
+  out=$(with_fixture "a theorem, a theory, and something theoretical")
+  if grep -q "$FIXTURE" <<< "$out"; then
+    bad "adding the concatenation reintroduced the theorem/theory false positives"
+  else ok "theorem, theory and theoretical still do not trip it"; fi
+fi
+
+echo
 echo "── the explicit list bypasses the four-character floor"
 
 # The floor exists for the DERIVED half: `user.name` is split into fragments, and fragments of one
