@@ -822,9 +822,15 @@ struct Searcher<'a> {
     /// **considered**. **Tests only** — the same pair as the reverse cut, and for the same reason:
     /// a gate that never opens makes a brick read a node ratio of 1.0000 exactly, which is
     /// indistinguishable from a brick that costs nothing.
-    /// How many static evaluations this searcher paid for. **Tests only**, and it is the number
-    /// that says whether the forward cut is cheap: it must stay at one per node, never one per
-    /// move, or the economy #66 already paid for is spent twice.
+    /// How many static evaluations this searcher paid for **at interior nodes**. **Tests only**,
+    /// and it is the number that says whether the forward cut is cheap: it must stay at one per
+    /// node, never one per move, or the economy #66 already paid for is spent twice.
+    ///
+    /// **Not the count of calls to `evaluate`**, and the distinction cost a measurement to notice
+    /// (#92): the quiescence stand-pat calls it too, and does not pass through here. Over the four
+    /// natures at depth 8 the two together come to 0.66 calls per node, and this counter sees
+    /// about half of them. `evaluation::cost` keeps its own counter for the whole figure; this one
+    /// stays narrow because what it guards is one gate and not the engine's evaluation bill.
     #[cfg(test)]
     evals: u64,
     #[cfg(test)]
