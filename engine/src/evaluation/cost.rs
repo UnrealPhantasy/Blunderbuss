@@ -796,9 +796,16 @@ fn where_the_cost_of_a_node_goes() {
     // interior node paying for an evaluation -- moved the ratio from 0.656 to **0.727** and left
     // the assertion green. It was inert: `negamax_inner` returns through the transposition table
     // and through several cuts before it ever reaches the gate, so most interior nodes never call
-    // `evaluate` whatever the gate says. The property is real and belongs to
-    // `one_evaluation_per_node_and_never_one_per_move` in `search.rs`, which asserts it on the
-    // counter that can see it; here it was a sentence dressed as a check.
+    // `evaluate` whatever the gate says. The property is real and it is guarded, but **not** by
+    // `one_evaluation_per_node_and_never_one_per_move` -- that test stays green under the same
+    // mutation, since it asserts `evals <= nodes` and `considered > evals` and a gate that stops
+    // gating raises `evals` without breaking either. The three tests that actually go red were
+    // read off the mutation rather than reasoned about:
+    // `search::tests::a_node_in_check_is_never_evaluated`,
+    // `search::tests::the_gate_stops_at_the_deeper_of_the_two_ceilings`, and
+    // `search::tests::pruning_losing_captures_keeps_every_forced_mate` on its own precondition.
+    // Retiring the inert assertion is therefore safe; naming the wrong survivor would have been
+    // the same defect one layer up, in the comment that exists to record the defect.
     assert!(
         eval_time_total > 0.0 && eval_time_total < time_total,
         "{:.0} ns attributed to evaluate out of {:.0} ns of search: the two legs were measured in \
