@@ -784,10 +784,26 @@ fn where_the_cost_of_a_node_goes() {
          anything, re-run it with --test-threads=1 on a quiet machine",
     );
     assert!(nodes_total > 0 && calls_total > 0, "the search leg produced nothing to divide by");
+    // Dimensional coherence, and it is the only property of the search leg that can be asserted
+    // without pinning a number this measurement exists to discover: the time attributed to
+    // `evaluate` is a part of the search's time, so it cannot exceed it. What that catches is a
+    // cost per call measured in the wrong regime or in the wrong unit -- the two mistakes that
+    // would silently multiply the published share.
+    //
+    // **What it deliberately does not claim, having been checked by mutation.** An earlier version
+    // asserted `calls_per_node < 1.0`, on the reasoning that a ratio at one would mean the gate in
+    // `static_eval_for` had stopped gating. Running that mutation -- `usable = true`, every
+    // interior node paying for an evaluation -- moved the ratio from 0.656 to **0.727** and left
+    // the assertion green. It was inert: `negamax_inner` returns through the transposition table
+    // and through several cuts before it ever reaches the gate, so most interior nodes never call
+    // `evaluate` whatever the gate says. The property is real and belongs to
+    // `one_evaluation_per_node_and_never_one_per_move` in `search.rs`, which asserts it on the
+    // counter that can see it; here it was a sentence dressed as a check.
     assert!(
-        calls_per_node < 1.0,
-        "{calls_per_node:.3} calls per node: evaluate is supposed to run at every quiescence \
-         stand-pat and only at the interior nodes that can use a static score, so a ratio at or \
-         above one means the gate in `static_eval_for` has stopped gating",
+        eval_time_total > 0.0 && eval_time_total < time_total,
+        "{:.0} ns attributed to evaluate out of {:.0} ns of search: the two legs were measured in \
+         different units or in different regimes, and every share above is unreadable",
+        eval_time_total,
+        time_total,
     );
 }
