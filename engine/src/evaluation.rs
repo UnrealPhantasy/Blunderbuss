@@ -203,6 +203,30 @@ thread_local! {
     static SCALING: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
+// How many times `evaluate` has been called on this thread. **Tests only**, and it exists for one
+// measurement: the share of a node's cost that this function represents (#92). That share is
+// `calls_per_node * cost_per_call / cost_per_node`, and the first factor cannot be assumed to be
+// one -- `evaluate` runs at every quiescence stand-pat but only at the interior nodes that can use
+// a static score, so the ratio has to be read rather than guessed.
+//
+// A thread-local `Cell` and not an `AtomicU64` on purpose. The atomic would be a `lock xadd` in
+// the hottest function of the engine, tens of cycles against the one or two a thread-local
+// increment costs, and it would show up in the very figure being measured. The price of the
+// choice is that only the calling thread's calls are visible, which is exactly right here: every
+// instrument in this project runs on the single-threaded path, and `cost.rs` measures its own
+// thread.
+//
+// The increment is still not free, so `cost.rs` prices it rather than assuming it away -- see the
+// `no counter` row of its table.
+#[cfg(test)]
+thread_local! {
+    static EVAL_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The measurement harness for this module's cost, run explicitly with `--ignored`.
+#[cfg(test)]
+mod cost;
+
 /// Below this edge, a pawnless side cannot be assumed to be winning.
 ///
 /// A rook is the threshold because K+R against K **is** a win and K+B or K+N against K is not.
@@ -278,6 +302,9 @@ fn cannot_mate(pos: &Position, pawns: [u64; 2], balance: i32) -> bool {
 }
 
 pub fn evaluate(pos: &Position) -> i32 {
+    // Compiled out of production builds entirely -- see the thread-local above.
+    #[cfg(test)]
+    EVAL_CALLS.with(|n| n.set(n.get() + 1));
     // Two running scores — one reading the middlegame tables, one the endgame tables
     // — plus the phase, all accumulated in the **same** pass over the board.
     //
