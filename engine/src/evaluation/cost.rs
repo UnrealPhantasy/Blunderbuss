@@ -811,17 +811,34 @@ fn where_the_cost_of_a_node_goes() {
          per-band figures are above)",
     );
     println!("  -> evaluate is            {:.1} % of a node", 100.0 * share);
-    // The two rows are the same source; their difference is what `cfg(test)` adds to `evaluate`
-    // and to nothing else -- the call counter and the thread-local read of `SCALING`. It inflates
-    // the cost per node above by the same amount it inflates the cost per call, so the share is
-    // nearly unaffected; it is printed because "nearly" is a claim and this is its size.
+    // What `cfg(test)` adds to `evaluate` and to nothing else: the call counter and the
+    // thread-local read of `SCALING`. The two rows are the same source, so their difference is that
+    // overhead -- **and it does not cancel**, contrary to what this line claimed until a reviewer
+    // checked it. The numerator uses `full (copy)`, which deliberately mirrors the *production*
+    // function and carries neither; the overhead sits in the denominator alone, through the search
+    // leg, which runs the test build. It therefore biases the share **down** by about
+    // `share^2 x overhead`, computed below rather than described.
+    //
+    // Two warnings on how to read it. `evaluate` is the one row with a single compiled copy, so
+    // this is a median of one against a median of eight -- the comparison the rest of this module
+    // argues does not survive. And it comes out negative on some runs, the production function
+    // timing *faster* than a copy doing strictly less work, which is a reading below the floor
+    // rather than a result. Both are why the correction is stated and not applied.
     let test_overhead: f64 = readings
         .iter()
-        .map(|r| 100.0 * (r[0].ns - r[1].ns) / r[1].ns)
+        .map(|r| (r[0].ns - r[1].ns) / r[1].ns)
         .sum::<f64>()
         / readings.len() as f64;
+    let bias = 100.0 * share * share * test_overhead;
     println!(
-        "     (the test build's own counter and SCALING read cost {test_overhead:+.1} % of a          call, present in both terms of that ratio)",
+        "     (the test build's own counter and SCALING read cost {:+.1} % of a call, in the \
+         denominator only:\n      the share above is biased low by {bias:+.2} points. {})",
+        100.0 * test_overhead,
+        if test_overhead < 0.0 {
+            "Negative here, which is below the floor and not a result"
+        } else {
+            "One compiled copy against eight, so it is itself a reading near the floor"
+        },
     );
     println!(
         "  of which not incremental  {:.1} % (mobility, passed pawns and the scale read the \
