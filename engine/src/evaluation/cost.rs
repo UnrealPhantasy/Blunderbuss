@@ -920,11 +920,34 @@ fn where_the_cost_of_a_node_goes() {
          whole board)",
         100.0 * non_incremental,
     );
+    // **A bound and not a point estimate, and the difference is the whole conclusion.** The
+    // recoverable fraction is `share x (1 - non_incremental)`, and that second factor comes from
+    // the `material and PST` row -- which the body floor above says this harness can only *bound*,
+    // never price. So the point estimate swings between 0.0 and 0.3 % of a node from run to run,
+    // and reporting it to one decimal invites the reader to trust a digit that is not there.
+    //
+    // What survives a re-run is the ceiling: even if that term were worth the entire body floor --
+    // the largest value the harness cannot rule out -- the answer stays under an Elo. That is the
+    // form the conclusion should be quoted in.
     let recoverable = share * (1.0 - non_incremental).max(0.0);
+    let ceiling = share * body_floor / 100.0;
     println!(
-        "  -> ceiling of an incremental evaluation: {:.1} % of a node, worth {:.1} Elo anchored",
+        "  -> ceiling of an incremental evaluation: {:.1} % of a node this run, worth {:.1} Elo",
         100.0 * recoverable,
         elo_from_saving(recoverable),
+    );
+    println!(
+        "     and the figure to quote, because that one is below the body floor and moves between \
+         runs:\n     AT MOST {:.1} % of a node, {:.1} Elo -- material and PST worth the whole \
+         {body_floor:.1} % floor.",
+        100.0 * ceiling,
+        elo_from_saving(ceiling),
+    );
+    println!(
+        "     (the share itself carries the search leg's {search_blank:.1} % blank: {:.1} to \
+         {:.1} % of a node)",
+        100.0 * share / (1.0 + search_blank / 100.0),
+        100.0 * share * (1.0 + search_blank / 100.0),
     );
     println!(
         "  for scale: -10 % of a node is {:.1} Elo, -20 % is {:.1}, -40 % is {:.1}",
