@@ -415,6 +415,9 @@ struct Reading {
     /// The spread between its copies, as a percentage of `ns` -- how much recompiling the same
     /// source moves its cost.
     spread: f64,
+    /// How many repetitions of the position set one timed point of this variant took. Per
+    /// variant, not per stratum: see [`measure`].
+    reps: u32,
     /// The medians of the first and second half of the copies.
     ///
     /// **This is what the blank is made of, and the spread above is not.** A spread is the range of
@@ -431,7 +434,13 @@ struct Reading {
 /// gives: a machine drifts over the seconds a measurement takes -- another process starts, the
 /// clock boosts and settles -- and a drift that lands entirely on the variant timed last reads as
 /// that variant being slower.
-fn measure(rows: &Rows, positions: &[Position], reps: u32) -> Vec<Reading> {
+fn measure(rows: &Rows, positions: &[Position]) -> Vec<Reading> {
+    // **Calibrated per variant, not once for the stratum.** A single `reps` taken from `full` gives
+    // the cheap rows points far under [`POINT`] -- `bare walk` is 2.4x cheaper, so its points came
+    // out around 8 ms against the "few tens of milliseconds" this module documents as the floor for
+    // not measuring the scheduler. Each row now buys its own `reps`, which costs one calibration
+    // pass per variant and makes every point last the same wall time.
+    let reps: Vec<u32> = rows.iter().map(|(_, fs)| calibrate(fs[0], positions)).collect();
     let mut samples: Vec<Vec<Vec<f64>>> =
         rows.iter().map(|(_, fs)| vec![Vec::with_capacity(ROUNDS); fs.len()]).collect();
     // Every (variant, copy) pair that has to be timed, as a flat list. Shuffled anew each round,
@@ -452,12 +461,13 @@ fn measure(rows: &Rows, positions: &[Position], reps: u32) -> Vec<Reading> {
             order.swap(k, (rng.next() % (k as u64 + 1)) as usize);
         }
         for &(i, j) in &order {
-            samples[i][j].push(time_one(rows[i].1[j], positions, reps));
+            samples[i][j].push(time_one(rows[i].1[j], positions, reps[i]));
         }
     }
     samples
         .into_iter()
-        .map(|per_copy| {
+        .zip(reps)
+        .map(|(per_copy, reps)| {
             let copies: Vec<f64> = per_copy.into_iter().map(median).collect();
             let ns = median(copies.clone());
             let (lo, hi) = copies.iter().fold((f64::MAX, 0.0f64), |(l, h), &x| (l.min(x), h.max(x)));
@@ -469,6 +479,7 @@ fn measure(rows: &Rows, positions: &[Position], reps: u32) -> Vec<Reading> {
             };
             Reading {
                 ns,
+                reps,
                 spread: if copies.len() > 1 { 100.0 * (hi - lo) / ns } else { 0.0 },
                 halves,
             }
@@ -614,9 +625,9 @@ fn where_the_cost_of_a_node_goes() {
     // a *simplification*: it is what a later reader would do to make the code shorter.
     let all: Vec<Position> = sets.iter().flatten().cloned().collect();
     let one_row: Vec<Row> = vec![("full", full().to_vec())];
-    let concatenated = measure(&one_row, &all, calibrate(full()[0], &all))[0].ns;
+    let concatenated = measure(&one_row, &all)[0].ns;
     let per_stratum: Vec<Reading> = (0..STRATA.len())
-        .map(|i| measure(&one_row, &sets[i], calibrate(full()[0], &sets[i])).remove(0))
+        .map(|i| measure(&one_row, &sets[i]).remove(0))
         .collect();
     let mean_stratum: f64 =
         per_stratum.iter().map(|r| r.ns).sum::<f64>() / per_stratum.len() as f64;
@@ -639,8 +650,21 @@ fn where_the_cost_of_a_node_goes() {
         ("bare walk (no term)", bare_walk().to_vec()),
     ];
     let readings: Vec<Vec<Reading>> = (0..STRATA.len())
-        .map(|i| measure(&rows, &sets[i], calibrate(full()[0], &sets[i])))
+        .map(|i| measure(&rows, &sets[i]))
         .collect();
+
+    println!(
+        "\nCALIBRATION  every point lasts {} ms, each variant buying its own repetition count so \
+         the cheap rows\n  are not timed against the scheduler. {REPLICAS} compiled copies per \
+         variant, {ROUNDS} rounds in shuffled order,\n  median kept. Repetitions of the opening \
+         band, by row: {}",
+        POINT.as_millis(),
+        rows.iter()
+            .enumerate()
+            .map(|(j, (name, _))| format!("{}={}", short(name), readings[0][j].reps))
+            .collect::<Vec<_>>()
+            .join("  "),
+    );
 
     println!("\nBLANK, read before anything else");
     println!(
