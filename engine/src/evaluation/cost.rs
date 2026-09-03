@@ -586,6 +586,9 @@ fn every_variant_actually_changes_the_score_it_claims_to_drop() {
 /// The depth of the search leg. Deep enough that the transposition table and the pruning have all
 /// come into play, shallow enough that eight positions finish in seconds.
 const SEARCH_DEPTH: u32 = 8;
+/// How many times the search leg is repeated. Three, because it costs seconds rather than
+/// milliseconds and its counts are deterministic -- only the clock is being sampled.
+const SEARCH_ROUNDS: usize = 3;
 /// How many positions of each band the search leg uses. Two, because the figure it produces is a
 /// ratio over hundreds of thousands of nodes and not an average over positions.
 const SEARCH_POSITIONS: usize = 2;
@@ -797,29 +800,60 @@ fn where_the_cost_of_a_node_goes() {
     let (mut nodes_total, mut calls_total) = (0u64, 0u64);
     let (mut time_total, mut eval_time_total) = (0.0f64, 0.0f64);
     let mut calls_by_band = [0u64; STRATA.len()];
+    let mut search_blank = 0.0f64;
     for (i, (name, _, _)) in STRATA.iter().enumerate() {
-        let (mut n, mut c, mut t) = (0u64, 0u64, Duration::ZERO);
-        for p in sets[i].iter().take(SEARCH_POSITIONS) {
-            EVAL_CALLS.with(|x| x.set(0));
-            let start = Instant::now();
-            let stats = search_timed(p, Limits::depth(SEARCH_DEPTH));
-            t += start.elapsed();
-            n += stats.nodes;
-            c += EVAL_CALLS.with(|x| x.get());
+        // **Repeated, like every other leg of this harness.** It is the denominator of the headline
+        // share and it used to run once -- no rounds, no blank -- while the numerator got eight
+        // copies and five shuffled rounds. What makes a blank possible here is that the search is
+        // deterministic at fixed depth: the node and call counts MUST come out identical round to
+        // round, which is asserted, so the only thing that varies is the wall clock. Its spread is
+        // therefore a pure timing blank for this leg.
+        let (mut n, mut c) = (0u64, 0u64);
+        let mut times: Vec<f64> = Vec::with_capacity(SEARCH_ROUNDS);
+        for round in 0..SEARCH_ROUNDS {
+            let (mut rn, mut rc, mut t) = (0u64, 0u64, Duration::ZERO);
+            for p in sets[i].iter().take(SEARCH_POSITIONS) {
+                EVAL_CALLS.with(|x| x.set(0));
+                let start = Instant::now();
+                let stats = search_timed(p, Limits::depth(SEARCH_DEPTH));
+                t += start.elapsed();
+                rn += stats.nodes;
+                rc += EVAL_CALLS.with(|x| x.get());
+            }
+            if round == 0 {
+                (n, c) = (rn, rc);
+            } else {
+                assert_eq!(
+                    (rn, rc),
+                    (n, c),
+                    "{name}: the search leg is not reproducible ({rn} nodes and {rc} calls against \
+                     {n} and {c} on the first round), so its timing spread is not a blank and the \
+                     share below rests on nothing",
+                );
+            }
+            times.push(t.as_secs_f64() * 1e9);
         }
+        let (lo, hi) = times.iter().fold((f64::MAX, 0.0f64), |(l, h), &x| (l.min(x), h.max(x)));
+        let ns_total = median(times);
+        search_blank = search_blank.max(100.0 * (hi - lo) / ns_total);
         let ns_call = readings[i][1].ns;
-        let ns_node = t.as_secs_f64() * 1e9 / n as f64;
+        let ns_node = ns_total / n as f64;
         println!(
             "  {name:<20} {n:>11} {c:>11} {:>10.3} {ns_node:>9.1} {ns_call:>9.1} {:>8.1} %",
             c as f64 / n as f64,
-            100.0 * (c as f64 * ns_call) / (t.as_secs_f64() * 1e9),
+            100.0 * (c as f64 * ns_call) / ns_total,
         );
         nodes_total += n;
         calls_total += c;
         calls_by_band[i] = c;
-        time_total += t.as_secs_f64() * 1e9;
+        time_total += ns_total;
         eval_time_total += c as f64 * ns_call;
     }
+    println!(
+        "  {SEARCH_ROUNDS} rounds, median kept. Node and call counts identical across them by \
+         construction and by assertion,\n  so the spread of the wall clock is this leg's blank: \
+         {search_blank:.1} % at its worst band.",
+    );
 
     let calls_per_node = calls_total as f64 / nodes_total as f64;
     let ns_per_node = time_total / nodes_total as f64;
