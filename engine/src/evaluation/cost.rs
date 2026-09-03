@@ -955,18 +955,29 @@ fn where_the_cost_of_a_node_goes() {
     // the largest value the harness cannot rule out -- the answer stays under an Elo. That is the
     // form the conclusion should be quoted in.
     let recoverable = share * (1.0 - non_incremental).max(0.0);
-    let ceiling = share * body_floor / 100.0;
+    // The bound takes the reading most favourable to the term -- its best band, not its weighted
+    // mean -- and refuses to go below the body floor. Flooring alone was wrong and was caught by
+    // re-running after the per-variant calibration landed: that change tightened the floor to 1-3 %
+    // while `material and PST` started reading 3-4 % in the upper bands, so a bound that was only
+    // the floor would have published *less* than the measurement. A bound has to be at least the
+    // largest thing the harness saw, and at least the largest thing it cannot rule out.
+    let best_material_pst = readings
+        .iter()
+        .map(|r| 100.0 * (r[1].ns - r[5].ns) / r[1].ns)
+        .fold(f64::MIN, f64::max);
+    let ceiling = share * best_material_pst.max(body_floor) / 100.0;
     println!(
         "  -> ceiling of an incremental evaluation: {:.1} % of a node this run, worth {:.1} Elo",
         100.0 * recoverable,
         elo_from_saving(recoverable),
     );
     println!(
-        "     and the figure to quote, because that one is below the body floor and moves between \
-         runs:\n     AT MOST {:.1} % of a node, {:.1} Elo -- material and PST worth the whole \
-         {body_floor:.1} % floor.",
+        "     and the figure to quote, because that one moves between runs:\n     AT MOST {:.1} % \
+         of a node, {:.1} Elo -- material and PST worth {:.1} % of the function, the larger of \
+         its\n     best band ({best_material_pst:.1} %) and the body floor ({body_floor:.1} %).",
         100.0 * ceiling,
         elo_from_saving(ceiling),
+        best_material_pst.max(body_floor),
     );
     println!(
         "     (the share itself carries the search leg's {search_blank:.1} % blank: {:.1} to \
