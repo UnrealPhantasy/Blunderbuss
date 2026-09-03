@@ -103,11 +103,22 @@ fn occupied_count(pos: &Position) -> usize {
 
 /// The four phase bands, named as `banc.sh` names them, from a full board down to a thin endgame.
 const STRATA: [(&str, i32, i32); 4] = [
-    ("opening    (20-24)", 20, 24),
-    ("middle high(16-19)", 16, 19),
-    ("middle low (11-15)", 11, 15),
-    ("endgame    ( 0-10)", 0, 10),
+    ("opening     (20-24)", 20, 24),
+    ("middle high (16-19)", 16, 19),
+    ("middle low  (11-15)", 11, 15),
+    ("endgame     ( 0-10)", 0, 10),
 ];
+
+/// The short label a table column carries.
+///
+/// **Not `split_whitespace().next()`**, which is what the columns used until a reviewer read the
+/// report: both middle bands yield `middle`, so every table had two columns a reader could not tell
+/// apart -- in a breakdown whose stated purpose is to be laid beside the bench band by band. It
+/// only differed at all because `"middle high(16-19)"` was missing the space its neighbours had,
+/// which is to say by an accident of spelling.
+fn short(name: &str) -> String {
+    name.split('(').next().unwrap_or(name).trim().replace(' ', "-")
+}
 
 /// How many positions each band holds. 64 x 4 = 256 positions per timed pass, which is enough for
 /// one pass to cost tens of microseconds -- far above the resolution of `Instant`, and small enough
@@ -671,7 +682,7 @@ fn where_the_cost_of_a_node_goes() {
     println!("\nCOST OF ONE CALL, per phase band, ns");
     print!("  {:<26}", "variant");
     for (name, _, _) in STRATA.iter() {
-        print!(" {:>12}", name.split_whitespace().next().expect("a name is never empty"));
+        print!(" {:>12}", short(name));
     }
     println!();
     for (j, (name, _)) in rows.iter().enumerate() {
@@ -685,7 +696,7 @@ fn where_the_cost_of_a_node_goes() {
     println!("\nSHARE OF `evaluate` EACH TERM COSTS, per phase band, %");
     print!("  {:<26}", "term");
     for (name, _, _) in STRATA.iter() {
-        print!(" {:>12}", name.split_whitespace().next().expect("a name is never empty"));
+        print!(" {:>12}", short(name));
     }
     println!();
     // **The floor between two different bodies, read off the table's own impossibilities.**
