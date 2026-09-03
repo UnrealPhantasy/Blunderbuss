@@ -735,12 +735,20 @@ fn where_the_cost_of_a_node_goes() {
         .sum::<f64>()
         / calls_total as f64;
 
+    // The cost per call the share is actually built on, and it has to be this one rather than the
+    // mean of the four bands: the share weights each band by the evaluation calls the search made
+    // there, so an unweighted mean prints a chain that does not close. Measured difference on this
+    // set: 163.7 ns weighted against 157.5 unweighted, 3.8 % apart -- more than the blank this
+    // report opens with, and enough to make the reader who checks the arithmetic find 22.7 % where
+    // the line below says 23.5 %.
+    let ns_per_call = eval_time_total / calls_total as f64;
+
     println!("\nTHE ANSWER");
     println!("  cost of one node          {ns_per_node:.1} ns");
     println!("  calls to evaluate / node  {calls_per_node:.3}");
     println!(
-        "  cost of one call          {:.1} ns (band mean; the per-band figures are above)",
-        mean_stratum,
+        "  cost of one call          {ns_per_call:.1} ns (weighted by each band's calls; the \
+         per-band figures are above)",
     );
     println!("  -> evaluate is            {:.1} % of a node", 100.0 * share);
     // The two rows are the same source; their difference is what `cfg(test)` adds to `evaluate`
@@ -812,5 +820,27 @@ fn where_the_cost_of_a_node_goes() {
          different units or in different regimes, and every share above is unreadable",
         eval_time_total,
         time_total,
+    );
+    // **And the size of the hole it leaves, because a guard that does not state its own reach is
+    // half of one.** The assertion above only fires when the share reaches 1.0, so at a measured
+    // share it tolerates an error of `1 / share` -- about 4.3x here. Checked from both sides rather
+    // than assumed: a cost per call multiplied by three passes it and publishes "evaluate is
+    // 70.5 % of a node"; multiplied by five it fails. The mistake it is built for is a unit slip,
+    // which is a factor of a thousand; the mistake it cannot see is a regime or weighting slip,
+    // which is a factor of two or three, and that is the plausible one.
+    //
+    // Which is what the next assertion is for. It is not another dimensional check but an
+    // **algebraic identity**: the three numbers `THE ANSWER` prints above the share must reduce to
+    // the share exactly, since `calls/nodes x (eval_time/calls) / (time/nodes)` is `eval_time/time`
+    // by construction. It costs nothing and it closes precisely the hole above -- a cost per call
+    // taken from the wrong pass, or averaged without the weights it needs, breaks the identity
+    // while leaving the dimensional check green. That is the defect this very block shipped with
+    // and a reviewer found, and the reason it is now checked rather than described.
+    let chain = calls_per_node * ns_per_call / ns_per_node;
+    assert!(
+        (chain - share).abs() < 1e-9,
+        "the printed chain does not close: {calls_per_node:.6} x {ns_per_call:.4} / \
+         {ns_per_node:.4} = {chain:.9}, against a share of {share:.9}. The cost per call printed \
+         in THE ANSWER is not the one the share is built on",
     );
 }
