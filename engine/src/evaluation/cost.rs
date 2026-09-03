@@ -26,12 +26,30 @@
 //! Removing a term recompiles the function, and a recompiled function lands at another address with
 //! another register allocation and another unrolling decision. That difference is worth **several
 //! per cent** on its own, in either direction -- the first run of this harness had two variants
-//! come out *slower* with a term removed, which is not a thing that can happen physically.
+//! come out *slower* with a term removed, which is not a thing that can happen physically. That
+//! signature is not only a symptom: it is turned into the measurement of the third trap below.
 //!
 //! So a variant is not one function here, it is [`REPLICAS`] compiled copies of the same source at
 //! different addresses, and what the table reports is the median across them. The spread between
-//! replicas of the *same* source is the harness's real floor, and it is printed before anything
-//! else because no share smaller than it is a share.
+//! replicas of the *same* source is printed before anything else, because no share smaller than it
+//! is a share.
+//!
+//! # The third trap, and it is the one the replicas do NOT close
+//!
+//! That blank bounds **one source compiled twice**. Every row of the table compares **two different
+//! sources**, and a layout or inlining penalty attached to a body is systematic across all eight of
+//! its copies -- so the replicas average over addresses and register allocations *within* a body
+//! and cannot see it. The blank is therefore necessary and not sufficient: a lower bound on the
+//! error the table actually makes.
+//!
+//! The harness measures that second floor instead of arguing about it, and the table's own
+//! impossibilities are what measure it. **A negative share means removing code made the function
+//! slower**, which cannot be true of the work done; so the largest negative share is a floor for
+//! comparisons between bodies, produced by exactly the subtraction the real terms go through. On
+//! this engine it runs at 3 to 6 %, and the endgame-scale row -- a test on two bitboards that
+//! short-circuits on any position holding a pawn -- is negative in the lower bands on every run.
+//! Mobility and passed pawns clear that floor by an order of magnitude and are unaffected; the two
+//! small terms are **bounded, not priced**, and the report now says so on its own.
 //!
 //! Getting even that far took forcing the compiler's hand: with `lto = true` and
 //! `codegen-units = 1`, LLVM merges functions with identical bodies, so the first blank compared a
@@ -629,9 +647,16 @@ fn where_the_cost_of_a_node_goes() {
         );
     }
     println!(
-        "  {REPLICAS} compiled copies of the SAME source, split in two halves of {}. No share \
-         below the worst blank ({worst_blank:.1} %) is a share.",
+        "  {REPLICAS} compiled copies of the SAME source, split in two halves of {}. Worst: \
+         {worst_blank:.1} %.",
         REPLICAS / 2,
+    );
+    println!(
+        "  This bounds ONE source compiled twice. It is only a LOWER bound on the error between \
+         two DIFFERENT sources,\n  which is what every row below actually compares -- a layout or \
+         inlining penalty attached to a body is\n  systematic across all {REPLICAS} of its copies, \
+         so no number of replicas can average it out. The row after\n  the table measures that \
+         second floor.",
     );
     println!(
         "  For reference, the full spread between the {REPLICAS} copies of `full`: {}",
@@ -663,12 +688,47 @@ fn where_the_cost_of_a_node_goes() {
         print!(" {:>12}", name.split_whitespace().next().expect("a name is never empty"));
     }
     println!();
+    // **The floor between two different bodies, read off the table's own impossibilities.**
+    // A negative share means removing code made the function slower, which cannot be true of the
+    // work done and is therefore a pure artefact of how the two bodies were compiled. So the
+    // largest negative share in the table is a *measured* lower bound on the error between two
+    // different sources -- the quantity the blank above cannot see, produced by the same
+    // arithmetic the table applies to a real term. It is a lower bound rather than the floor
+    // itself: an artefact that happens to be positive is indistinguishable from a term.
+    let mut body_floor = 0.0f64;
     for (j, (name, _)) in rows.iter().enumerate().skip(2) {
         print!("  {:<26}", name.replace("minus ", ""));
         for r in readings.iter() {
-            print!(" {:>11.1} %", 100.0 * (r[1].ns - r[j].ns) / r[1].ns);
+            let share = 100.0 * (r[1].ns - r[j].ns) / r[1].ns;
+            // `bare walk` is excluded: it is not a term and its share is not a subtraction of one.
+            if j < rows.len() - 1 && share < 0.0 {
+                body_floor = body_floor.max(-share);
+            }
+            print!(" {share:>11.1} %");
         }
         println!();
+    }
+    println!(
+        "  BODY FLOOR {body_floor:.1} % -- the largest negative share above. Removing code cannot \
+         make the work smaller\n  and the function slower, so that reading is an artefact of \
+         compilation, measured by the same\n  subtraction the real terms go through. Any share \
+         under it is not readable, whatever the blank says.",
+    );
+    // A term is *priced* only where its share is positive AND above the floor. Taking the absolute
+    // value instead would let a term qualify on the strength of an impossible reading, which is the
+    // opposite of what the floor is for.
+    for (j, (name, _)) in rows.iter().enumerate().skip(2).take(rows.len() - 3) {
+        let best = readings
+            .iter()
+            .map(|r| 100.0 * (r[1].ns - r[j].ns) / r[1].ns)
+            .fold(f64::MIN, f64::max);
+        if best < body_floor {
+            println!(
+                "    -> `{}` never clears it in any band: this measurement cannot price that \
+                 term, only bound it under {body_floor:.1} % of the function.",
+                name.replace("minus ", ""),
+            );
+        }
     }
     println!(
         "  The last row is NOT the sum of the others and must not be read as one. With every term          off,\n  the optimiser also drops the plumbing they shared -- the colour lookup, the          square flip, the two\n  running scores -- so it is a lower bound on a walk that computes          nothing, not the walk's own cost.",
