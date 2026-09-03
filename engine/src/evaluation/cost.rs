@@ -731,10 +731,16 @@ fn where_the_cost_of_a_node_goes() {
         }
     }
     println!(
-        "  The last row is NOT the sum of the others and must not be read as one. With every term          off,\n  the optimiser also drops the plumbing they shared -- the colour lookup, the          square flip, the two\n  running scores -- so it is a lower bound on a walk that computes          nothing, not the walk's own cost.",
+        "  The last row is NOT the sum of the others and must not be read as one. With every term \
+         off,\n  the optimiser also drops the plumbing they shared -- the colour lookup, the \
+         square flip, the two\n  running scores -- so it is a lower bound on a walk that computes \
+         nothing, not the walk's own cost.",
     );
     println!(
-        "\n  What that row does say, and it is the one figure here that points somewhere: the          bare walk\n  costs {:.0}-{:.0} ns whatever the position holds, against {:.0} pieces on          the board in the opening\n  and {:.0} in the endgame band. It is a loop over 64 squares,          and most of those squares are empty.",
+        "\n  What that row does say, and it is the one figure here that points somewhere: the \
+         bare walk\n  costs {:.0}-{:.0} ns whatever the position holds, against {:.0} pieces on \
+         the board in the opening\n  and {:.0} in the endgame band. It is a loop over 64 squares, \
+         and most of those squares are empty.",
         readings.iter().map(|r| r[6].ns).fold(f64::MAX, f64::min),
         readings.iter().map(|r| r[6].ns).fold(0.0, f64::max),
         sets[0].iter().map(|p| occupied_count(p) as f64).sum::<f64>() / sets[0].len() as f64,
