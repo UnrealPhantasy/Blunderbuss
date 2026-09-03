@@ -216,8 +216,10 @@ thread_local! {
 // instrument in this project runs on the single-threaded path, and `cost.rs` measures its own
 // thread.
 //
-// The increment is still not free, so `cost.rs` prices it rather than assuming it away -- see the
-// `no counter` row of its table.
+// The increment is still not free, so `cost.rs` prices it rather than assuming it away. There is no
+// row of its own for it: what prices it is the `evaluate (production fn)` row against `full (copy)`,
+// two names for one source where only the first carries this increment and the thread-local read of
+// `SCALING`. Their difference is printed as the parenthesis under `-> evaluate is`.
 #[cfg(test)]
 thread_local! {
     static EVAL_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
