@@ -834,8 +834,20 @@ mod tests {
         // `index out of bounds: the len is 218 but the index is 218`, in the hottest loop in the
         // engine. Found in review, by running the mutation the test's own comment described.
         //
-        // So both sides are checked: the last length that must use the stack array, and the first
-        // that must not.
+        // So both lengths are checked: the last that must use the stack array, and the first that
+        // must not.
+        //
+        // **Both lengths, and only one of the two paths** -- the honest note, because the sentence
+        // above reads as more than the test can see. What is compared is the *order*, and the two
+        // paths produce the same order by construction, so which branch actually ran is not
+        // observable here. The mirror mutation says so: `n >= MAX_LEGAL_MOVES`, taking the fallback
+        // one case too early, leaves all 192 tests green.
+        //
+        // That asymmetry is not a gap to close, and instrumenting the branch to close it would be
+        // machinery for nothing: taking the fallback too early is *correct*, costing one allocation
+        // at a length no chess position reaches. Taking the stack array too late is a panic in the
+        // hottest loop in the engine. Only one of the two directions can fail, and it is the one
+        // this test now catches.
         let pos = Position::from_fen("R6R/3Q4/1Q4Q1/4Q3/2Q4Q/Q4Q2/pp1Q4/kBNN1KB1 w - - 0 1")
             .expect("test fixture must parse");
         let base = pos.legal_moves();
