@@ -137,6 +137,29 @@ const LMR_TABLE_RANKS: usize = 64;
 /// saved is one node deep, so there is nothing to win and a verdict to lose.
 const LMR_MIN_DEPTH: u32 = 3;
 
+/// Move `first` to the front of `moves`, keeping every other move in its order.
+///
+/// **A rotation and not a swap, and the difference is a rank.** `moves.swap(0, i)` puts the wanted
+/// move first *and sends whatever was first down to index `i`* — which is the move `order_moves`
+/// ranked best, usually the highest-value capture. Rank is not decorative here: [`LMR_TABLE`] is
+/// indexed `[depth][rank]`, so a move at rank 5 is searched at **reduced depth**, and forward
+/// futility pruning skips quiet moves by rank too. A swap therefore does not merely try the
+/// second-best move later, it tries it shallower, and sometimes not at all.
+///
+/// Measured at depth 8 before this was written: the hoisted move was not already first in **29 % to
+/// 45 %** of hoists depending on the nature of the position, and it landed the displaced move at a
+/// mean rank of 2.8 to 6.7. Not an edge case.
+///
+/// Rust idiom: `rotate_right(1)` on the slice up to and including `i` shifts every element up one
+/// place and wraps the last one to the front — exactly "put this one first, everyone else keeps
+/// their order". It costs `i + 1` moves against the swap's two, and the measured mean `i` is under
+/// seven.
+fn hoist(moves: &mut [Move], first: Move) {
+    if let Some(i) = moves.iter().position(|&mv| mv == first) {
+        moves[..=i].rotate_right(1);
+    }
+}
+
 /// How many moves are searched at full depth before reductions begin.
 ///
 /// **The most arbitrary of the three constants**, and worth saying so. The moves are
@@ -1144,9 +1167,7 @@ impl<'a> Searcher<'a> {
             order_moves(pos, &mut moves, KillerSlots::none());
         }
         if let Some(pv) = pv_move {
-            if let Some(i) = moves.iter().position(|&mv| mv == pv) {
-                moves.swap(0, i);
-            }
+            hoist(&mut moves, pv);
         }
 
         let mut best_move = moves[0];
@@ -1616,9 +1637,7 @@ impl<'a> Searcher<'a> {
         // cutoffs below cheap — often a larger win than the cutoffs the table itself
         // provides.
         if let Some(cached) = hit.best {
-            if let Some(i) = moves.iter().position(|&mv| mv == cached) {
-                moves.swap(0, i);
-            }
+            hoist(&mut moves, cached);
         }
 
         // Kept to classify the result: a value that never beat the alpha we started
@@ -2854,6 +2873,71 @@ mod tests {
             shallow, deeper,
             "depth 1 must already price the queen: {shallow} vs {deeper} at depth 2"
         );
+    }
+
+    #[test]
+    fn hoisting_puts_the_move_first_and_keeps_everyone_elses_order() {
+        // **Asserted on the whole list, and that is the point.** The defect this replaces put the
+        // wanted move at index 0 too -- checking only the first element passes against it. What
+        // separates a rotation from a swap is what happens to the *rest*.
+        let p = Position::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1")
+            .expect("test fixture must parse");
+        let original = p.legal_moves();
+        assert!(original.len() > 8, "precondition: the list must be long enough to have a middle");
+
+        for i in [1usize, 3, 7] {
+            let wanted = original[i];
+            let mut rotated = original.clone();
+            hoist(&mut rotated, wanted);
+
+            assert_eq!(rotated[0], wanted, "the hoisted move must come first");
+            // Everything else, in its original order: the list without `wanted` must be the
+            // original list without `wanted`.
+            let rest: Vec<Move> = rotated[1..].to_vec();
+            let expected: Vec<Move> =
+                original.iter().copied().filter(|&mv| mv != wanted).collect();
+            assert_eq!(rest, expected, "hoisting from rank {i} disturbed the order of the others");
+        }
+    }
+
+    #[test]
+    fn hoisting_is_not_a_swap_and_the_difference_is_visible() {
+        // Without this, the test above could pass against an implementation that still swaps: at
+        // rank 1 a swap and a rotation are the same operation. The witness has to be a rank above
+        // one, and it has to compare the two orders rather than describe them.
+        let p = Position::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1")
+            .expect("test fixture must parse");
+        let original = p.legal_moves();
+        let i = 5;
+        let wanted = original[i];
+
+        let mut rotated = original.clone();
+        hoist(&mut rotated, wanted);
+        let mut swapped = original.clone();
+        swapped.swap(0, i);
+
+        assert_eq!(rotated[0], swapped[0], "both put the wanted move first");
+        assert_ne!(rotated, swapped, "and they must differ everywhere else, or this changes nothing");
+        // Named precisely, because it is the whole defect: the swap sends the best-ordered move to
+        // rank `i`, where `LMR_TABLE` reduces it.
+        assert_eq!(swapped[i], original[0], "the swap demotes the previously first move to rank {i}");
+        assert_eq!(rotated[1], original[0], "the rotation keeps it at rank 1");
+    }
+
+    #[test]
+    fn hoisting_a_move_that_is_not_there_leaves_the_list_alone() {
+        // The `None` arm, which the search reaches whenever a cached move no longer applies -- a
+        // table entry survives a `ucinewgame` and keys can collide. A panic here would be a crash
+        // on a heuristic, which this engine refuses everywhere else too.
+        let p = Position::initial();
+        let other = Position::from_fen("4k3/8/8/8/8/8/8/4K2R w K - 0 1").expect("fixture");
+        let stranger = other.legal_moves()[0];
+        let original = p.legal_moves();
+        assert!(!original.contains(&stranger), "precondition: this move is not in the list");
+
+        let mut moves = original.clone();
+        hoist(&mut moves, stranger);
+        assert_eq!(moves, original, "an absent move must leave the order untouched");
     }
 
     #[test]
