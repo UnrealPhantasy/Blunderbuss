@@ -1047,6 +1047,31 @@ fn where_the_cost_of_a_node_goes() {
     // taken from the wrong pass, or averaged without the weights it needs, breaks the identity
     // while leaving the dimensional check green. That is the defect this very block shipped with
     // and a reviewer found, and the reason it is now checked rather than described.
+    // **And the half of the hole the identity below cannot close.** A *weighting* slip breaks the
+    // chain and is caught. A *regime* slip does not: a cost per call taken from the wrong pass
+    // enters `eval_time_total` and `ns_per_call` through the same reading, so it cancels inside the
+    // identity and leaves it exact. Measured, by substituting the concatenated 256-position set --
+    // the out-of-cache regime the WORKING-SET CONTROL at the top of this report exists to warn
+    // about, and the one substitution a later reader is most likely to make because it shortens the
+    // code: the report published **36.6 % of a node against 25 %**, a 45 % overstatement, with the
+    // whole suite green, the chain closed to 1e-9, and the control's own +65 % warning printed three
+    // screens earlier with nothing reading it.
+    //
+    // The harness already held what catches it. `ns_per_call` is a weighted mean of the per-band
+    // readings, so it must lie between the smallest and the largest of them -- a property of a
+    // weighted mean, not a threshold on a result, which is what lets it be asserted here at all.
+    // The out-of-cache figure sits far outside that range. This is what turns the control at the
+    // top from advice into a check.
+    let (lo, hi) = readings
+        .iter()
+        .map(|r| r[1].ns)
+        .fold((f64::MAX, f64::MIN), |(l, h), x| (l.min(x), h.max(x)));
+    assert!(
+        ns_per_call >= lo && ns_per_call <= hi,
+        "the cost per call ({ns_per_call:.1} ns) is outside the range of the per-band readings it \
+         is a weighted mean of ([{lo:.1}, {hi:.1}]): it was taken from another pass, in another \
+         regime, and the share above is inflated by whatever that regime costs",
+    );
     let chain = calls_per_node * ns_per_call / ns_per_node;
     assert!(
         (chain - share).abs() < 1e-9,
