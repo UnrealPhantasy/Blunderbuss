@@ -122,6 +122,15 @@ pub enum Status {
 
 // --- The position ---------------------------------------------------------
 
+/// The largest number of legal moves a chess position is known to admit.
+///
+/// Held by a constructed position rather than by anything reachable from the opening, which is why
+/// it is a bound and not an average — real positions offer about 39. Used to size the move buffer
+/// once instead of growing it, and as the ceiling of the stack array `ordering::order_moves` sorts
+/// in. `legal_moves_never_outgrows_the_buffer_it_reserved` pins it to that position, so lowering it
+/// by one goes red.
+pub const MAX_LEGAL_MOVES: usize = 218;
+
 /// A full chess position.
 ///
 /// Rust idiom: this is a *newtype* — a single-field `struct` wrapping `Board`.
@@ -217,7 +226,22 @@ impl Position {
     ///
     /// Used by move ordering to read a capture's victim and attacker while
     /// keeping `cozy-chess` confined to this module.
+    ///
+    /// **The occupancy test in front is the whole point of this wrapper.** The borrowed
+    /// implementation is `Piece::ALL.iter().find(|p| self.pieces(p).has(square))`, which walks up
+    /// to six bitboards — and walks *all six* precisely when the answer is `None`. That is the
+    /// common case here: `evaluate` visits all 64 squares of the board on every call, and about
+    /// half of them are empty in an opening and four fifths in an endgame. One test against the
+    /// occupancy answers those in a single read instead of six.
+    ///
+    /// It cannot change an answer. `occupied` is the union of the six piece boards by
+    /// construction, which `the_occupancy_is_exactly_the_union_of_the_piece_boards` asserts rather
+    /// than assumes — if the two ever parted company this would return `None` for occupied squares
+    /// and every evaluation would quietly lose material, with no panic anywhere.
     pub fn piece_on(&self, square: Square) -> Option<Piece> {
+        if !self.0.occupied().has(square) {
+            return None;
+        }
         self.0.piece_on(square)
     }
 
@@ -244,11 +268,6 @@ impl Position {
         cozy_chess::util::parse_uci_move(&self.0, s).ok()
     }
 
-    /// All legal moves in the position.
-    ///
-    /// First version: we fill a `Vec`. Move ordering and staged generation (not
-    /// producing everything at once) belong to the engine and will come later —
-    /// they are out of scope here.
     /// Every square currently holding a piece.
     pub fn occupied(&self) -> SquareSet {
         SquareSet(self.0.occupied())
@@ -322,7 +341,15 @@ impl Position {
     }
 
     pub fn legal_moves(&self) -> Vec<Move> {
-        let mut moves = Vec::new();
+        // **Reserved rather than grown**, and the size is not a guess: [`MAX_LEGAL_MOVES`] is the
+        // largest number of legal moves any chess position admits, so this vector never
+        // reallocates. `Vec::new()` followed by `extend` re-allocates and copies as it crosses 4,
+        // 8, 16, 32 and 64 moves — in the hottest loop in the engine, at about 39 moves a position.
+        //
+        // Rust idiom: `with_capacity` allocates the buffer once at the requested size and leaves
+        // the length at zero, so the vector still knows how many moves it actually holds. Capacity
+        // is the size of the allocation; length is what is in it.
+        let mut moves = Vec::with_capacity(MAX_LEGAL_MOVES);
         // cozy-chess idiom: generation is a *visitor*. We pass it an `FnMut`
         // closure that receives moves grouped by piece (`PieceMoves`, iterable
         // as `Move`). It returns a `bool`: `true` would stop generation, `false`
@@ -481,5 +508,81 @@ mod tests {
         assert_eq!(p.move_to_uci(castle), "e1g1");
         let after = p.try_play(castle).expect("kingside castling is legal here");
         assert_eq!(after.piece_on(Square::G1), Some(Piece::King));
+    }
+
+    /// Boards of different densities, so a property is checked over a range rather than over one
+    /// square: two openings, a middlegame, two endgames and a bare-king position — 20 % empty to
+    /// 95 % empty. The failure mode of a short-circuit is a *class* of square, and one example
+    /// cannot see a class.
+    const BOARDS: [&str; 6] = [
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 0 3",
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1",
+        "4k3/8/8/8/8/8/8/4K3 w - - 0 1",
+    ];
+
+    #[test]
+    fn piece_on_answers_exactly_what_a_full_scan_would() {
+        // The occupancy short-circuit is an optimisation that must be invisible, so it is checked
+        // against the thing it replaces: a scan of all six piece boards with no early exit, over
+        // every square of every board.
+        for fen in BOARDS {
+            let p = Position::from_fen(fen).expect("test fixture must parse");
+            for sq in Square::ALL {
+                let scanned = Piece::ALL.into_iter().find(|&piece| {
+                    (p.pieces_of(Color::White, piece).0 | p.pieces_of(Color::Black, piece).0)
+                        .has(sq)
+                });
+                assert_eq!(p.piece_on(sq), scanned, "{fen} at {sq}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_occupancy_is_exactly_the_union_of_the_piece_boards() {
+        // The premise the short-circuit rests on, asserted rather than assumed. If these two ever
+        // part company, `piece_on` returns `None` for occupied squares and every evaluation
+        // silently loses material — a failure with no panic and no other test anywhere.
+        for fen in BOARDS {
+            let p = Position::from_fen(fen).expect("test fixture must parse");
+            let union = Piece::ALL.into_iter().fold(cozy_chess::BitBoard::EMPTY, |acc, piece| {
+                acc | p.pieces_of(Color::White, piece).0 | p.pieces_of(Color::Black, piece).0
+            });
+            assert_eq!(union, p.occupied().0, "{fen}: occupancy and piece boards disagree");
+        }
+    }
+
+    #[test]
+    fn legal_moves_never_outgrows_the_buffer_it_reserved() {
+        // What `with_capacity` buys is a single allocation, and that only holds while the
+        // reservation is an upper bound. The second position is the constructed record holder at
+        // exactly `MAX_LEGAL_MOVES` moves, so lowering the constant by one fails this test.
+        for fen in [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "R6R/3Q4/1Q4Q1/4Q3/2Q4Q/Q4Q2/pp1Q4/kBNN1KB1 w - - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        ] {
+            let p = Position::from_fen(fen).expect("test fixture must parse");
+            let moves = p.legal_moves();
+            assert!(
+                moves.len() <= MAX_LEGAL_MOVES,
+                "{fen}: {} moves against a reservation of {MAX_LEGAL_MOVES}",
+                moves.len(),
+            );
+            assert_eq!(
+                moves.capacity(),
+                MAX_LEGAL_MOVES,
+                "{fen}: the vector reallocated, so the reservation bought nothing",
+            );
+        }
+        let record = Position::from_fen("R6R/3Q4/1Q4Q1/4Q3/2Q4Q/Q4Q2/pp1Q4/kBNN1KB1 w - - 0 1")
+            .expect("test fixture must parse");
+        assert_eq!(
+            record.legal_moves().len(),
+            MAX_LEGAL_MOVES,
+            "the position that pins the constant must produce exactly that many moves",
+        );
     }
 }
