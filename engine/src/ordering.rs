@@ -817,24 +817,40 @@ mod tests {
     }
 
     #[test]
-    fn the_sort_falls_back_rather_than_overflowing_its_stack_array() {
-        // The defensive branch, exercised. It cannot be reached through the rules -- no position
-        // offers more than `MAX_LEGAL_MOVES` moves -- so it is reached here by handing the
-        // function a longer slice than any board could produce. Without this, the branch is a
-        // claim with nothing behind it, and a future `MAX_LEGAL_MOVES` lowered for any reason
-        // would turn it into a silent out-of-bounds panic in the hottest loop in the engine.
+    fn the_sort_falls_back_at_exactly_one_move_past_the_bound() {
+        // The defensive branch, exercised **at its boundary and on both sides of it**. It cannot be
+        // reached through the rules -- no position offers more than `MAX_LEGAL_MOVES` moves -- so it
+        // is reached here by handing the function a longer slice than any board could produce.
+        //
+        // **The length matters, and an earlier version of this test got it wrong.** It passed twice
+        // the bound, which takes the fallback whether the guard reads `n > MAX_LEGAL_MOVES` or
+        // `n > MAX_LEGAL_MOVES + 1` -- so the off-by-one it exists to catch went straight through it
+        // and left all 192 tests green. At exactly `MAX_LEGAL_MOVES + 1` that mutation panics with
+        // `index out of bounds: the len is 218 but the index is 218`, in the hottest loop in the
+        // engine. Found in review, by running the mutation the test's own comment described.
+        //
+        // So both sides are checked: the last length that must use the stack array, and the first
+        // that must not.
         let pos = Position::from_fen("R6R/3Q4/1Q4Q1/4Q3/2Q4Q/Q4Q2/pp1Q4/kBNN1KB1 w - - 0 1")
             .expect("test fixture must parse");
         let base = pos.legal_moves();
         assert_eq!(base.len(), MAX_LEGAL_MOVES, "precondition: this is the record position");
-        let mut long: Vec<Move> = base.clone();
-        long.extend_from_slice(&base);
-        assert!(long.len() > MAX_LEGAL_MOVES, "precondition: the slice must exceed the bound");
 
-        let mut ours = long.clone();
-        order_moves(&pos, &mut ours, KillerSlots::none());
-        let mut theirs = long.clone();
-        theirs.sort_by_cached_key(|&mv| std::cmp::Reverse(score(&pos, mv, KillerSlots::none())));
-        assert_eq!(ours, theirs, "the fallback must order exactly as the fast path would");
+        for (len, path) in [(MAX_LEGAL_MOVES, "the stack array"), (MAX_LEGAL_MOVES + 1, "the fallback")]
+        {
+            let mut input: Vec<Move> = base.clone();
+            input.truncate(len.min(base.len()));
+            while input.len() < len {
+                input.push(base[0]);
+            }
+            assert_eq!(input.len(), len, "precondition: the slice must be exactly this long");
+
+            let mut ours = input.clone();
+            order_moves(&pos, &mut ours, KillerSlots::none());
+            let mut theirs = input.clone();
+            theirs
+                .sort_by_cached_key(|&mv| std::cmp::Reverse(score(&pos, mv, KillerSlots::none())));
+            assert_eq!(ours, theirs, "at {len} moves, {path} must order exactly as the other would");
+        }
     }
 }
