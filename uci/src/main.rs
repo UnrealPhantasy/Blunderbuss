@@ -1210,22 +1210,33 @@ mod tests {
 
     #[test]
     fn an_unfinished_iteration_is_not_reported() {
-        // The search discards an aborted iteration, so announcing its depth would mean
-        // walking the claim back — worse than saying nothing.
+        // **Retired, with its reason, because its precondition stopped being satisfiable.**
         //
-        // Measured, not assumed: Kiwipete's first iteration costs ~25 900 nodes against
-        // a 2048-node clock check, so a 1 ms budget always cuts it short and **nothing**
-        // completes. The log is therefore empty, and asserting emptiness is what makes
-        // this discriminating — an upper bound of one would also accept the single line
-        // a defective implementation emits.
-        let (mut uci, log) = uci_with_log();
-        uci.handle("position fen r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
-        uci.handle("go movetime 51");
-        assert!(
-            log.borrow().is_empty(),
-            "an aborted iteration must not be announced, got {:?}",
-            log.borrow()
-        );
+        // It read: give Kiwipete a 1 ms budget, and since its first iteration costs ~25 900 nodes
+        // against a 2048-node clock check, nothing completes and the log is empty. That held when
+        // it was written. #96 stopped quiescence searching castles, and Kiwipete's first iteration
+        // fell to **1059 nodes** — *below* the clock-check interval, so the clock is never read and
+        // no budget, however small, can interrupt it. The iteration now completes and is announced,
+        // correctly, and the test failed while the engine was right.
+        //
+        // It is not a matter of picking another position. Measured over the 60 positions of the
+        // node bench plus four constructed to be as tactical as possible, the most expensive first
+        // iteration is Kiwipete's 1059; the next is 437. **No position reaches the clock-check
+        // interval at depth 1 any more**, so this test cannot be repaired by choosing a fixture.
+        //
+        // What it guarded is guarded, deterministically, in two places that do not depend on how
+        // fast the engine runs:
+        //
+        //   * `engine::search::tests::the_reported_depth_is_the_last_completed_one_even_when_a_move_is_rescued`
+        //     cuts the search at an exact **node count** rather than a time, and asserts the
+        //     announced depths are `[1, 2]` in both the rescued and the discarded case — which is
+        //     this property, stated on the side that owns it;
+        //   * `every_completed_iteration_is_reported_in_order` above covers what this layer adds,
+        //     the translation into `info` lines, at a fixed depth.
+        //
+        // Left as an empty body with this comment rather than deleted outright: a test that
+        // disappears takes its reason with it, and the next person to notice the gap would have to
+        // rediscover why the obvious version cannot work.
     }
 
     #[test]
