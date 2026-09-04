@@ -12,7 +12,7 @@
 //! direct depth-N pass. [`best_move`] is a thin convenience wrapper over it.
 
 use crate::evaluation::{evaluate, phase};
-use crate::ordering::{is_capture, is_quiet, mvv_lva, order_moves, see, KillerSlots, Killers};
+use crate::ordering::{is_capture, is_quiet, order_moves, see, KillerSlots, Killers};
 use crate::position::{Move, Piece, Position};
 use crate::book::Book;
 use crate::transposition::{Bound, Table};
