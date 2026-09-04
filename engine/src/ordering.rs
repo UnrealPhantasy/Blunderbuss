@@ -320,6 +320,11 @@ pub fn order_moves(pos: &Position, moves: &mut [Move], killers: KillerSlots) {
         moves.sort_by_cached_key(|&mv| std::cmp::Reverse(score(pos, mv, killers)));
         return;
     }
+    // 872 bytes of stack (`[i32; 218]`), and the number is worth stating because the bound is what
+    // makes it safe and the bound is a `const` someone may raise. It is not a problem at this size:
+    // `order_moves` returns before the search recurses, so one frame holds it at a time, and even
+    // fully inlined at `MAX_DEPTH` plus quiescence it stays under 100 KB against a 2 MB thread
+    // stack. Raising `MAX_LEGAL_MOVES` by an order of magnitude would change that arithmetic.
     let mut keys = [0i32; MAX_LEGAL_MOVES];
     for (i, &mv) in moves.iter().enumerate() {
         keys[i] = score(pos, mv, killers);
