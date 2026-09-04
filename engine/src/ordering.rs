@@ -17,7 +17,7 @@
 //! positions at one ply usually share the same threat, so the refutation that
 //! worked next door tends to work here too.
 
-use crate::position::{Color, Move, Piece, Position, Square, SquareSet};
+use crate::position::{Color, MAX_LEGAL_MOVES, Move, Piece, Position, Square, SquareSet};
 use crate::search::MAX_DEPTH;
 
 // Piece values used *for ordering only* (not for evaluation): only their relative
@@ -296,13 +296,55 @@ fn score(pos: &Position, mv: Move, killers: KillerSlots) -> i32 {
 
 /// Sorts `moves` in place: best captures first, then the killers of this node,
 /// then the remaining quiet moves.
+///
+/// **Sorted without allocating**, which is the point of the hand-written loop below. The obvious
+/// spelling is `sort_by_cached_key`, and it is the right call in general: it computes each key
+/// once, where `sort_by_key` may recompute one on every comparison, and `score` is not free — it
+/// reads the board through `is_quiet`, then `mvv_lva`, then the killer slots. But it caches those
+/// keys in a **heap allocation of its own**, on every call, in the hottest loop in the engine.
+///
+/// So the keys go on the stack instead, bounded by [`MAX_LEGAL_MOVES`] — a bound the rules of
+/// chess supply, not an estimate — and the sort is done by hand.
+///
+/// **Insertion sort and not something asymptotically better**, deliberately. A list of moves is
+/// tens of items long, already partially ordered (the generator groups by piece), and the constant
+/// factor is what decides at that size; a merge sort would need the scratch buffer this exists to
+/// avoid. What matters far more than the algorithm is that it produces the *identical* order, move
+/// for move, which is what lets this brick claim it is invisible to the search.
 pub fn order_moves(pos: &Position, moves: &mut [Move], killers: KillerSlots) {
-    // Idiom: `sort_by_cached_key` computes each key **once** and sorts the keys, where
-    // `sort_by_key` is free to recompute a key on every comparison — and `score` is not free:
-    // it reads the board through `is_quiet`, then `mvv_lva`, then the killer slots.
-    //
-    // `Reverse` sorts by the key in *descending* order, so the highest score comes first.
-    moves.sort_by_cached_key(|&mv| std::cmp::Reverse(score(pos, mv, killers)));
+    let n = moves.len();
+    // Defensive, and unreachable through the rules: no position offers more moves than the bound.
+    // `sort_by_cached_key` is kept as the fallback rather than a panic, because an ordering that
+    // allocates is a slow search and an ordering that panics is a lost game.
+    if n > MAX_LEGAL_MOVES {
+        moves.sort_by_cached_key(|&mv| std::cmp::Reverse(score(pos, mv, killers)));
+        return;
+    }
+    // 872 bytes of stack (`[i32; 218]`), and the number is worth stating because the bound is what
+    // makes it safe and the bound is a `const` someone may raise. It is not a problem at this size:
+    // `order_moves` returns before the search recurses, so one frame holds it at a time, and even
+    // fully inlined at `MAX_DEPTH` plus quiescence it stays under 100 KB against a 2 MB thread
+    // stack. Raising `MAX_LEGAL_MOVES` by an order of magnitude would change that arithmetic.
+    let mut keys = [0i32; MAX_LEGAL_MOVES];
+    for (i, &mv) in moves.iter().enumerate() {
+        keys[i] = score(pos, mv, killers);
+    }
+    // Descending by key, and **stable**: the comparison is strict, so a move never moves past one
+    // with an equal key and ties keep the generator's order. That is not a nicety here --
+    // `sort_by_cached_key` is stable too, and reproducing its output exactly is what keeps the node
+    // count identical. A `<=` on the line below would reverse every tie and change which nodes the
+    // search visits, while leaving every score in this module correct.
+    for i in 1..n {
+        let (key, mv) = (keys[i], moves[i]);
+        let mut j = i;
+        while j > 0 && keys[j - 1] < key {
+            keys[j] = keys[j - 1];
+            moves[j] = moves[j - 1];
+            j -= 1;
+        }
+        keys[j] = key;
+        moves[j] = mv;
+    }
 }
 
 #[cfg(test)]
@@ -707,4 +749,125 @@ mod tests {
     }
 
 
+
+    /// A xorshift64, so the sweep below draws its positions rather than having them chosen by the
+    /// author of the sort — the one place a hand-picked list is least likely to look.
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    #[test]
+    fn the_hand_written_sort_produces_the_same_order_as_the_library_one() {
+        // **The property the whole brick rests on.** `order_moves` no longer calls
+        // `sort_by_cached_key`; if the replacement produced a different order for any position,
+        // the search would visit different nodes and every "the node count is identical" claim
+        // this brick makes would be false — while every score in this module stayed correct and
+        // every other test stayed green.
+        //
+        // So the two orders are compared move for move, over positions from pseudo-random play,
+        // with killers actually set: the score function has three bands (captures, killers, the
+        // rest) and a comparison run with `KillerSlots::none()` would never exercise the middle
+        // one, nor the ties between a killer and a quiet move that the stability rule decides.
+        let mut rng = Xorshift(0x0FDE_2109);
+        let mut compared = 0;
+        let mut with_ties = 0;
+        for game in 0..200u64 {
+            let mut pos = Position::initial();
+            for _ in 0..(4 + game % 40) {
+                let moves = pos.legal_moves();
+                if moves.is_empty() {
+                    break;
+                }
+                pos = pos.play(moves[(rng.next() % moves.len() as u64) as usize]);
+            }
+            let moves = pos.legal_moves();
+            if moves.is_empty() {
+                continue;
+            }
+            // Two killers drawn from this position's own quiet moves, so the middle band is
+            // populated on most iterations rather than on none.
+            let mut killers = Killers::new();
+            for &mv in moves.iter().filter(|&&mv| is_quiet(&pos, mv)).take(2) {
+                killers.record(&pos, 0, mv);
+            }
+            let slots = killers.at(0);
+
+            let mut ours = moves.clone();
+            order_moves(&pos, &mut ours, slots);
+            let mut theirs = moves.clone();
+            theirs.sort_by_cached_key(|&mv| std::cmp::Reverse(score(&pos, mv, slots)));
+
+            assert_eq!(ours, theirs, "orders differ on {}", pos.to_fen());
+            compared += 1;
+            // Ties are what the stability rule decides, so the sweep has to contain some or the
+            // assertion above is passing on positions where any sort would agree.
+            let keys: Vec<i32> = ours.iter().map(|&mv| score(&pos, mv, slots)).collect();
+            if keys.windows(2).any(|w| w[0] == w[1]) {
+                with_ties += 1;
+            }
+        }
+        assert!(compared > 100, "precondition: the sweep must reach positions, got {compared}");
+        assert!(
+            with_ties > 50,
+            "precondition: only {with_ties} of {compared} positions had two moves of equal score, \
+             so the stability of the sort is barely being tested",
+        );
+    }
+
+    #[test]
+    fn the_sort_falls_back_at_exactly_one_move_past_the_bound() {
+        // The defensive branch, exercised **at its boundary and on both sides of it**. It cannot be
+        // reached through the rules -- no position offers more than `MAX_LEGAL_MOVES` moves -- so it
+        // is reached here by handing the function a longer slice than any board could produce.
+        //
+        // **The length matters, and an earlier version of this test got it wrong.** It passed twice
+        // the bound, which takes the fallback whether the guard reads `n > MAX_LEGAL_MOVES` or
+        // `n > MAX_LEGAL_MOVES + 1` -- so the off-by-one it exists to catch went straight through it
+        // and left all 192 tests green. At exactly `MAX_LEGAL_MOVES + 1` that mutation panics with
+        // `index out of bounds: the len is 218 but the index is 218`, in the hottest loop in the
+        // engine. Found in review, by running the mutation the test's own comment described.
+        //
+        // So both lengths are checked: the last that must use the stack array, and the first that
+        // must not.
+        //
+        // **Both lengths, and only one of the two paths** -- the honest note, because the sentence
+        // above reads as more than the test can see. What is compared is the *order*, and the two
+        // paths produce the same order by construction, so which branch actually ran is not
+        // observable here. The mirror mutation says so: `n >= MAX_LEGAL_MOVES`, taking the fallback
+        // one case too early, leaves all 192 tests green.
+        //
+        // That asymmetry is not a gap to close, and instrumenting the branch to close it would be
+        // machinery for nothing: taking the fallback too early is *correct*, costing one allocation
+        // at a length no chess position reaches. Taking the stack array too late is a panic in the
+        // hottest loop in the engine. Only one of the two directions can fail, and it is the one
+        // this test now catches.
+        let pos = Position::from_fen("R6R/3Q4/1Q4Q1/4Q3/2Q4Q/Q4Q2/pp1Q4/kBNN1KB1 w - - 0 1")
+            .expect("test fixture must parse");
+        let base = pos.legal_moves();
+        assert_eq!(base.len(), MAX_LEGAL_MOVES, "precondition: this is the record position");
+
+        for (len, path) in [(MAX_LEGAL_MOVES, "the stack array"), (MAX_LEGAL_MOVES + 1, "the fallback")]
+        {
+            let mut input: Vec<Move> = base.clone();
+            input.truncate(len.min(base.len()));
+            while input.len() < len {
+                input.push(base[0]);
+            }
+            assert_eq!(input.len(), len, "precondition: the slice must be exactly this long");
+
+            let mut ours = input.clone();
+            order_moves(&pos, &mut ours, KillerSlots::none());
+            let mut theirs = input.clone();
+            theirs
+                .sort_by_cached_key(|&mv| std::cmp::Reverse(score(&pos, mv, KillerSlots::none())));
+            assert_eq!(ours, theirs, "at {len} moves, {path} must order exactly as the other would");
+        }
+    }
 }

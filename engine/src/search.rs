@@ -1775,11 +1775,33 @@ impl<'a> Searcher<'a> {
             return 0; // value ignored: the whole iteration is thrown away
         }
 
-        // Generate every legal move, not just the captures: it is the only way to
-        // tell mate and stalemate from a merely quiet position, and scoring a mate
-        // as a material count is exactly the lie this function exists to remove.
-        let mut moves = pos.legal_moves();
-        if moves.is_empty() {
+        // **Only the moves this function can be interested in**, which is a small fraction of the
+        // legal ones. It used to generate every legal move — about 39 a position — and throw most
+        // of them away one filter later, and it did so for one reason: an empty list is how mate
+        // and stalemate were told apart from a merely quiet position, and scoring a mate as a
+        // material count is exactly the lie this function exists to remove.
+        //
+        // That verdict is still reached, and by the same reasoning — it has simply stopped being
+        // paid for at every node. If any tactical move exists, the position is neither mate nor
+        // stalemate and no further question arises. Only when none exists does the terminal case
+        // become possible, and `has_any_legal_move` settles it at the first move it finds instead
+        // of building a list nobody reads.
+        //
+        // `tactical_moves` is deliberately a **superset**: the `retain` below is unchanged and
+        // still decides what quiescence searches, so the outcome is exactly what generating
+        // everything and filtering would have given, move for move and node for node.
+        //
+        // **En passant is the case that makes "superset" non-obvious**, and it is not a hole. Its
+        // destination square is *empty*, so it belongs to none of the three target groups and the
+        // narrow generation never emits it. It is preserved anyway, because `mvv_lva` scores it 0
+        // by its own documentation — the captured pawn is not on `mv.to` — so the `retain` two
+        // lines down dropped it before this change as well. The behaviour matches because **both
+        // paths exclude it**, not because the mask covers it. A reader checking this by reasoning
+        // alone will find the mask apparently too narrow; what settles it is
+        // `quiescence_searches_exactly_the_moves_it_did_before`, which compares the two paths on
+        // positions drawn from pseudo-random play rather than on an argument.
+        let mut moves = pos.tactical_moves();
+        if moves.is_empty() && !pos.has_any_legal_move() {
             return if pos.in_check() { -(MATE - ply) } else { 0 };
         }
 
@@ -2832,6 +2854,82 @@ mod tests {
             shallow, deeper,
             "depth 1 must already price the queen: {shallow} vs {deeper} at depth 2"
         );
+    }
+
+    #[test]
+    fn quiescence_still_tells_mate_and_stalemate_from_a_quiet_position() {
+        // **The verdict the narrow generation could silently lose**, and the reason the empty-list
+        // branch survives at all. Quiescence no longer builds every legal move, so an empty
+        // tactical list no longer means the position is terminal — it usually means the position
+        // is quiet. Three shapes, and each returns something different:
+        //
+        //   mate       a mate score, not a material count
+        //   stalemate  exactly zero, not the stand-pat
+        //   quiet      the stand-pat, not a draw score
+        //
+        // The stalemate case is the trap. Black is a queen down there, so the stand-pat is deeply
+        // negative and a rewrite that returned it instead of zero would report a lost position as
+        // lost -- plausible, wrong, and invisible to any test that only checks a sign.
+        let mated = Position::from_fen("7k/5KQ1/8/8/8/8/8/8 b - - 0 1").unwrap();
+        assert!(mated.in_check(), "precondition: the mated side must be in check");
+        assert!(mated.legal_moves().is_empty(), "precondition: it must be mate");
+        assert!(
+            quiesce(&mated) < -MATE_THRESHOLD,
+            "a mate must score as a mate, got {}",
+            quiesce(&mated),
+        );
+
+        let stalemated = Position::from_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1").unwrap();
+        assert!(!stalemated.in_check(), "precondition: a stalemated side is not in check");
+        assert!(stalemated.legal_moves().is_empty(), "precondition: it must be stalemate");
+        assert_eq!(quiesce(&stalemated), 0, "a stalemate is a draw, whatever the material says");
+        assert!(
+            evaluate(&stalemated) < -800,
+            "precondition: the stand-pat here is deeply negative ({}), so returning it instead of \
+             zero would be visible",
+            evaluate(&stalemated),
+        );
+
+        // And a quiet position with no capture available, which is the case the other two must not
+        // be confused with: it has legal moves, none of them tactical, and its answer is the
+        // stand-pat.
+        let quiet = Position::from_fen("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1").unwrap();
+        assert!(!quiet.legal_moves().is_empty(), "precondition: this position is not terminal");
+        assert!(quiet.tactical_moves().is_empty(), "precondition: no capture and no promotion");
+        assert_eq!(quiesce(&quiet), evaluate(&quiet), "a quiet position answers its stand-pat");
+    }
+
+    #[test]
+    fn quiescence_searches_exactly_the_moves_it_did_before() {
+        // The narrow generation is a superset of what the filter keeps, so what quiescence
+        // searches must be unchanged. Asserted against the old path -- generate everything, then
+        // filter -- on positions from pseudo-random play, because this is the property that makes
+        // the whole brick claim to be invisible to the search.
+        let mut rng = Xorshift(0x9D1E_5CE1);
+        let mut compared = 0;
+        for game in 0..200u64 {
+            let mut pos = Position::from_fen(
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            )
+            .unwrap();
+            for _ in 0..(2 + game % 50) {
+                let moves = pos.legal_moves();
+                if moves.is_empty() {
+                    break;
+                }
+                pos = pos.play(moves[(rng.next() % moves.len() as u64) as usize]);
+            }
+            let keep = |p: &Position, mv: &Move| {
+                crate::ordering::mvv_lva(p, *mv) > 0 || is_queen_promotion(*mv)
+            };
+            let mut narrow = pos.tactical_moves();
+            narrow.retain(|mv| keep(&pos, mv));
+            let mut wide = pos.legal_moves();
+            wide.retain(|mv| keep(&pos, mv));
+            assert_eq!(narrow, wide, "on {}", pos.to_fen());
+            compared += 1;
+        }
+        assert!(compared > 150, "precondition: the sweep must reach positions, got {compared}");
     }
 
     #[test]

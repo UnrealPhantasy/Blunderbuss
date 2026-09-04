@@ -122,6 +122,15 @@ pub enum Status {
 
 // --- The position ---------------------------------------------------------
 
+/// The largest number of legal moves a chess position is known to admit.
+///
+/// Held by a constructed position rather than by anything reachable from the opening, which is why
+/// it is a bound and not an average — real positions offer about 39. Used to size the move buffer
+/// once instead of growing it, and as the ceiling of the stack array `ordering::order_moves` sorts
+/// in. `legal_moves_never_outgrows_the_buffer_it_reserved` pins it to that position, so lowering it
+/// by one goes red.
+pub const MAX_LEGAL_MOVES: usize = 218;
+
 /// A full chess position.
 ///
 /// Rust idiom: this is a *newtype* — a single-field `struct` wrapping `Board`.
@@ -217,7 +226,22 @@ impl Position {
     ///
     /// Used by move ordering to read a capture's victim and attacker while
     /// keeping `cozy-chess` confined to this module.
+    ///
+    /// **The occupancy test in front is the whole point of this wrapper.** The borrowed
+    /// implementation is `Piece::ALL.iter().find(|p| self.pieces(p).has(square))`, which walks up
+    /// to six bitboards — and walks *all six* precisely when the answer is `None`. That is the
+    /// common case here: `evaluate` visits all 64 squares of the board on every call, and about
+    /// half of them are empty in an opening and four fifths in an endgame. One test against the
+    /// occupancy answers those in a single read instead of six.
+    ///
+    /// It cannot change an answer. `occupied` is the union of the six piece boards by
+    /// construction, which `the_occupancy_is_exactly_the_union_of_the_piece_boards` asserts rather
+    /// than assumes — if the two ever parted company this would return `None` for occupied squares
+    /// and every evaluation would quietly lose material, with no panic anywhere.
     pub fn piece_on(&self, square: Square) -> Option<Piece> {
+        if !self.0.occupied().has(square) {
+            return None;
+        }
         self.0.piece_on(square)
     }
 
@@ -244,11 +268,6 @@ impl Position {
         cozy_chess::util::parse_uci_move(&self.0, s).ok()
     }
 
-    /// All legal moves in the position.
-    ///
-    /// First version: we fill a `Vec`. Move ordering and staged generation (not
-    /// producing everything at once) belong to the engine and will come later —
-    /// they are out of scope here.
     /// Every square currently holding a piece.
     pub fn occupied(&self) -> SquareSet {
         SquareSet(self.0.occupied())
@@ -322,7 +341,15 @@ impl Position {
     }
 
     pub fn legal_moves(&self) -> Vec<Move> {
-        let mut moves = Vec::new();
+        // **Reserved rather than grown**, and the size is not a guess: [`MAX_LEGAL_MOVES`] is the
+        // largest number of legal moves any chess position admits, so this vector never
+        // reallocates. `Vec::new()` followed by `extend` re-allocates and copies as it crosses 4,
+        // 8, 16, 32 and 64 moves — in the hottest loop in the engine, at about 39 moves a position.
+        //
+        // Rust idiom: `with_capacity` allocates the buffer once at the requested size and leaves
+        // the length at zero, so the vector still knows how many moves it actually holds. Capacity
+        // is the size of the allocation; length is what is in it.
+        let mut moves = Vec::with_capacity(MAX_LEGAL_MOVES);
         // cozy-chess idiom: generation is a *visitor*. We pass it an `FnMut`
         // closure that receives moves grouped by piece (`PieceMoves`, iterable
         // as `Move`). It returns a `bool`: `true` would stop generation, `false`
@@ -332,6 +359,80 @@ impl Position {
             false
         });
         moves
+    }
+
+    /// The moves quiescence can be interested in: everything landing on an enemy piece, plus
+    /// everything landing on a promotion rank.
+    ///
+    /// **A superset, on purpose, and that is what makes it safe.** The caller still applies its own
+    /// filter — today `mvv_lva(..) > 0 || is_queen_promotion(..)` — so this only has to be a set no
+    /// wanted move can fall outside of. A capture lands on an enemy piece; a promotion lands on the
+    /// last rank. Nothing else is claimed: a rook stepping onto the eighth rank comes through here
+    /// and is dropped by the caller, which costs a filtered move and buys the guarantee that the
+    /// result is exactly what generating everything and filtering would have produced.
+    ///
+    /// **Why it exists.** `legal_moves` materialises every legal move — about 39 a position — and
+    /// quiescence then throws most of them away. It did so for one reason: an empty list is how
+    /// mate and stalemate were told apart from a quiet position. That verdict is needed at a
+    /// vanishing fraction of nodes, and [`Position::has_any_legal_move`] answers it far more
+    /// cheaply on the few where this returns nothing.
+    ///
+    /// The *order* is the same as the corresponding subsequence of [`Position::legal_moves`], since
+    /// the mask restricts which moves the generator emits and not the order it walks its pieces in.
+    /// That is not a detail: move ordering is stable, so a different order here would change which
+    /// nodes the search visits. `tactical_moves_are_the_filtered_legal_moves_in_the_same_order`
+    /// pins it.
+    pub fn tactical_moves(&self) -> Vec<Move> {
+        let us = self.0.side_to_move();
+        let them = self.0.colors(!us);
+        let promotion_rank = match us {
+            Color::White => cozy_chess::Rank::Eighth,
+            Color::Black => cozy_chess::Rank::First,
+        };
+        // **Our own rooks belong in the target set, and that is not a mistake.** cozy-chess spells
+        // castling as the king *capturing its own rook* (`e1h1`), so a castle lands on a friendly
+        // square — and `ordering::mvv_lva` therefore reads a rook on the destination and scores it
+        // as a capture. Quiescence consequently searches castling today.
+        //
+        // That is very probably a defect: a castle is not an exchange and has nothing to resolve
+        // in a quiescence search. But **fixing it here would change which nodes are visited**,
+        // which is exactly what this brick promises not to do, and it would take the node-equality
+        // control down with it. So the behaviour is preserved to the move, deliberately, and the
+        // defect is left to an issue that can measure it in Elo.
+        //
+        // No other move can land on a friendly square, so this widens the set by castles alone.
+        // Found by `tactical_moves_are_the_filtered_legal_moves_in_the_same_order`, not by
+        // reasoning — which is the whole reason that test compares against the old path.
+        let our_rooks = self.0.colors(us) & self.0.pieces(Piece::Rook);
+        let targets = them | promotion_rank.bitboard() | our_rooks;
+        let mut moves = Vec::with_capacity(MAX_LEGAL_MOVES);
+        // cozy-chess idiom: the mask `generate_moves_for` takes selects the **pieces** to move, not
+        // the squares to move to — its own example masks the knights. Destinations are narrowed by
+        // intersecting the `to` board of each group instead, which is why this reads as a full
+        // generation with a masked visitor rather than as a masked generation.
+        //
+        // What that saves, and it is the larger half: the attack sets are still computed, but the
+        // moves are no longer **materialised** — roughly 39 `Move` values built, pushed and later
+        // dropped at every quiescence node.
+        self.0.generate_moves(|mut group| {
+            group.to &= targets;
+            moves.extend(group);
+            false
+        });
+        moves
+    }
+
+    /// Whether the side to move has **any** legal move, without building the list.
+    ///
+    /// The distinction between a stalemate and a quiet position, and between a mate and a position
+    /// with no capture available. Quiescence needs that verdict, and needed a full move list to get
+    /// it; this stops at the first move found.
+    ///
+    /// cozy-chess idiom: the generation visitor returns a `bool`, and `true` means *stop*. The
+    /// generator then returns whether it was stopped — so a position with a legal move returns
+    /// `true` on its first group, and one without walks the (short) remainder and returns `false`.
+    pub fn has_any_legal_move(&self) -> bool {
+        self.0.generate_moves(|_| true)
     }
 
     /// Hands the turn to the opponent **without playing a move** — a position that
@@ -481,5 +582,166 @@ mod tests {
         assert_eq!(p.move_to_uci(castle), "e1g1");
         let after = p.try_play(castle).expect("kingside castling is legal here");
         assert_eq!(after.piece_on(Square::G1), Some(Piece::King));
+    }
+
+    /// Boards of different densities, so a property is checked over a range rather than over one
+    /// square: two openings, a middlegame, two endgames and a bare-king position — 20 % empty to
+    /// 95 % empty. The failure mode of a short-circuit is a *class* of square, and one example
+    /// cannot see a class.
+    const BOARDS: [&str; 6] = [
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 0 3",
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1",
+        "4k3/8/8/8/8/8/8/4K3 w - - 0 1",
+    ];
+
+    #[test]
+    fn piece_on_answers_exactly_what_a_full_scan_would() {
+        // The occupancy short-circuit is an optimisation that must be invisible, so it is checked
+        // against the thing it replaces: a scan of all six piece boards with no early exit, over
+        // every square of every board.
+        for fen in BOARDS {
+            let p = Position::from_fen(fen).expect("test fixture must parse");
+            for sq in Square::ALL {
+                let scanned = Piece::ALL.into_iter().find(|&piece| {
+                    (p.pieces_of(Color::White, piece).0 | p.pieces_of(Color::Black, piece).0)
+                        .has(sq)
+                });
+                assert_eq!(p.piece_on(sq), scanned, "{fen} at {sq}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_occupancy_is_exactly_the_union_of_the_piece_boards() {
+        // The premise the short-circuit rests on, asserted rather than assumed. If these two ever
+        // part company, `piece_on` returns `None` for occupied squares and every evaluation
+        // silently loses material — a failure with no panic and no other test anywhere.
+        for fen in BOARDS {
+            let p = Position::from_fen(fen).expect("test fixture must parse");
+            let union = Piece::ALL.into_iter().fold(cozy_chess::BitBoard::EMPTY, |acc, piece| {
+                acc | p.pieces_of(Color::White, piece).0 | p.pieces_of(Color::Black, piece).0
+            });
+            assert_eq!(union, p.occupied().0, "{fen}: occupancy and piece boards disagree");
+        }
+    }
+
+    #[test]
+    fn legal_moves_never_outgrows_the_buffer_it_reserved() {
+        // What `with_capacity` buys is a single allocation, and that only holds while the
+        // reservation is an upper bound. The second position is the constructed record holder at
+        // exactly `MAX_LEGAL_MOVES` moves, so lowering the constant by one fails this test.
+        for fen in [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "R6R/3Q4/1Q4Q1/4Q3/2Q4Q/Q4Q2/pp1Q4/kBNN1KB1 w - - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        ] {
+            let p = Position::from_fen(fen).expect("test fixture must parse");
+            let moves = p.legal_moves();
+            assert!(
+                moves.len() <= MAX_LEGAL_MOVES,
+                "{fen}: {} moves against a reservation of {MAX_LEGAL_MOVES}",
+                moves.len(),
+            );
+            assert_eq!(
+                moves.capacity(),
+                MAX_LEGAL_MOVES,
+                "{fen}: the vector reallocated, so the reservation bought nothing",
+            );
+        }
+        let record = Position::from_fen("R6R/3Q4/1Q4Q1/4Q3/2Q4Q/Q4Q2/pp1Q4/kBNN1KB1 w - - 0 1")
+            .expect("test fixture must parse");
+        assert_eq!(
+            record.legal_moves().len(),
+            MAX_LEGAL_MOVES,
+            "the position that pins the constant must produce exactly that many moves",
+        );
+    }
+
+
+    #[test]
+    fn tactical_moves_are_the_filtered_legal_moves_in_the_same_order() {
+        // **The property quiescence rests on.** `tactical_moves` is allowed to be a superset of
+        // what the caller keeps, but it must be exactly the subsequence of `legal_moves` that
+        // lands on the target squares -- same moves, same order. Move ordering is stable, so a
+        // different order would change which nodes the search visits while leaving every score
+        // correct, and no other test in the tree would see it.
+        //
+        // Swept over pseudo-random play rather than over chosen positions, and counted: a sweep
+        // that never reached a promotion or a position in check would be asserting on captures
+        // alone, which is the easy third of the problem.
+        let mut rng = Xorshift(0x7AC7_1CA1);
+        let (mut swept, mut in_check, mut with_promotion) = (0, 0, 0);
+        for game in 0..300u64 {
+            let mut pos = Position::initial();
+            for _ in 0..(2 + game % 60) {
+                let moves = pos.legal_moves();
+                if moves.is_empty() {
+                    break;
+                }
+                pos = pos.play(moves[(rng.next() % moves.len() as u64) as usize]);
+            }
+            let them = pos.0.colors(!pos.0.side_to_move());
+            let promotion_rank = match pos.0.side_to_move() {
+                Color::White => cozy_chess::Rank::Eighth,
+                Color::Black => cozy_chess::Rank::First,
+            };
+            let our_rooks = pos.0.colors(pos.0.side_to_move()) & pos.0.pieces(Piece::Rook);
+            let targets = them | promotion_rank.bitboard() | our_rooks;
+            let expected: Vec<Move> =
+                pos.legal_moves().into_iter().filter(|mv| targets.has(mv.to)).collect();
+            assert_eq!(pos.tactical_moves(), expected, "on {}", pos.to_fen());
+            swept += 1;
+            if pos.in_check() {
+                in_check += 1;
+            }
+            if expected.iter().any(|mv| mv.promotion.is_some()) {
+                with_promotion += 1;
+            }
+        }
+        assert!(swept > 250, "precondition: the sweep must reach positions, got {swept}");
+        assert!(in_check > 0, "precondition: the sweep never reached a position in check");
+        assert!(
+            with_promotion > 0,
+            "precondition: the sweep never reached a promotion, so the rank half of the target \
+             mask is untested",
+        );
+    }
+
+    #[test]
+    fn has_any_legal_move_agrees_with_building_the_list() {
+        // The cheap verdict against the expensive one, on the three shapes that matter: a mate
+        // (no move, in check), a stalemate (no move, not in check), and ordinary positions. The
+        // first two are what quiescence calls it for, and they are the only ones where it can
+        // return something the search then reports as a mate score.
+        for (fen, expected, name) in [
+            ("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", true, "opening"),
+            ("7k/5KQ1/8/8/8/8/8/8 b - - 0 1", false, "mate"),
+            ("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1", false, "stalemate"),
+            ("4k3/8/8/8/8/8/8/4K3 w - - 0 1", true, "bare kings"),
+        ] {
+            let p = Position::from_fen(fen).expect("test fixture must parse");
+            assert_eq!(p.has_any_legal_move(), expected, "{name}");
+            assert_eq!(
+                p.has_any_legal_move(),
+                !p.legal_moves().is_empty(),
+                "{name}: the cheap verdict and the list disagree",
+            );
+        }
+    }
+
+    /// A xorshift64, so the sweeps draw their positions instead of having them chosen by the
+    /// author of the code under test.
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
     }
 }
