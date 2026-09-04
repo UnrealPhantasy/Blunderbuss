@@ -1790,6 +1790,16 @@ impl<'a> Searcher<'a> {
         // `tactical_moves` is deliberately a **superset**: the `retain` below is unchanged and
         // still decides what quiescence searches, so the outcome is exactly what generating
         // everything and filtering would have given, move for move and node for node.
+        //
+        // **En passant is the case that makes "superset" non-obvious**, and it is not a hole. Its
+        // destination square is *empty*, so it belongs to none of the three target groups and the
+        // narrow generation never emits it. It is preserved anyway, because `mvv_lva` scores it 0
+        // by its own documentation — the captured pawn is not on `mv.to` — so the `retain` two
+        // lines down dropped it before this change as well. The behaviour matches because **both
+        // paths exclude it**, not because the mask covers it. A reader checking this by reasoning
+        // alone will find the mask apparently too narrow; what settles it is
+        // `quiescence_searches_exactly_the_moves_it_did_before`, which compares the two paths on
+        // positions drawn from pseudo-random play rather than on an argument.
         let mut moves = pos.tactical_moves();
         if moves.is_empty() && !pos.has_any_legal_move() {
             return if pos.in_check() { -(MATE - ply) } else { 0 };
