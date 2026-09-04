@@ -154,23 +154,39 @@ pub fn mvv_lva(pos: &Position, mv: Move) -> i32 {
     }
 }
 
+/// Whether `mv` takes an enemy piece off the board.
+///
+/// **Two traps, and both come from how a move is written rather than from chess.**
+///
+/// *En passant hides*: it captures a pawn standing on **another** square than the destination, so
+/// `piece_on(mv.to)` reads an empty square. A pawn changing file onto an empty square can only be
+/// an en-passant capture, which is what the `None` arm tests.
+///
+/// *Castling lies the other way*: `cozy-chess` spells it as the king **capturing its own rook**
+/// (`e1h1`), so the destination square holds a piece — a friendly one. Reading "a piece is on the
+/// destination" as "this is a capture" therefore calls a castle a capture, and that is exactly what
+/// this repository did until #96. It cost twice: quiescence searched castles, which resolve no
+/// exchange, and move ordering ranked them among the captures, ahead of every killer, where
+/// `Killers::record` then refused to remember them because they were "not quiet". Testing the
+/// *colour* on the destination rather than its emptiness is what separates the two.
+pub fn is_capture(pos: &Position, mv: Move) -> bool {
+    match pos.color_on(mv.to) {
+        // An enemy piece is a capture; one of ours can only be castling.
+        Some(colour) => colour != pos.side_to_move(),
+        None => pos.piece_on(mv.from) == Some(Piece::Pawn) && mv.from.file() != mv.to.file(),
+    }
+}
+
 /// Whether `mv` leaves the material on the board untouched.
 ///
 /// Only quiet moves are worth remembering as killers. A capture is already ranked
 /// by `mvv_lva`, and a promotion by the material it creates; spending one of the two
 /// slots on either would evict the quiet move the heuristic exists to find.
 ///
-/// The three ways a move touches material are tested separately because en passant
-/// is the one that hides: it captures a pawn standing on *another* square than the
-/// destination, so `piece_on(mv.to)` reads it as an empty square. A pawn changing
-/// file onto an empty square can only be an en-passant capture.
+/// Expressed through [`is_capture`] rather than repeating its two traps, since the pair has to
+/// agree by construction: a move is quiet exactly when it takes nothing and creates nothing.
 pub fn is_quiet(pos: &Position, mv: Move) -> bool {
-    if pos.piece_on(mv.to).is_some() || mv.promotion.is_some() {
-        return false;
-    }
-    let en_passant =
-        pos.piece_on(mv.from) == Some(Piece::Pawn) && mv.from.file() != mv.to.file();
-    !en_passant
+    !is_capture(pos, mv) && mv.promotion.is_none()
 }
 
 /// How many killer moves are kept per ply.
@@ -869,5 +885,94 @@ mod tests {
                 .sort_by_cached_key(|&mv| std::cmp::Reverse(score(&pos, mv, KillerSlots::none())));
             assert_eq!(ours, theirs, "at {len} moves, {path} must order exactly as the other would");
         }
+    }
+
+    /// A board where White may castle both ways, capture with the king, and capture en passant is
+    /// impossible — the three families of #96 need two positions, not one.
+    const CASTLING: &str = "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1";
+
+    fn uci(pos: &Position, s: &str) -> Move {
+        pos.move_from_uci(s).unwrap_or_else(|| panic!("{s} must parse on {}", pos.to_fen()))
+    }
+
+    #[test]
+    fn castling_is_quiet_although_its_destination_holds_a_piece() {
+        // **The defect #96 exists for, and no test in this repository saw it.** `cozy-chess` writes
+        // castling as the king capturing its own rook, so the destination square is occupied — by
+        // one of ours. Every predicate that asked "is a piece standing there" therefore called a
+        // castle a capture.
+        let p = Position::from_fen(CASTLING).expect("test fixture must parse");
+        for mv in ["e1g1", "e1c1"] {
+            let mv = uci(&p, mv);
+            assert!(
+                p.piece_on(mv.to).is_some(),
+                "precondition: the destination must hold a piece, or this test proves nothing",
+            );
+            assert_eq!(
+                p.color_on(mv.to),
+                Some(p.side_to_move()),
+                "precondition: and that piece must be ours -- it is the rook being castled with",
+            );
+            assert!(!is_capture(&p, mv), "castling takes no material");
+            assert!(is_quiet(&p, mv), "castling is a quiet move");
+        }
+    }
+
+    #[test]
+    fn a_king_capture_and_an_en_passant_capture_are_captures() {
+        // The two families the old predicate missed in the other direction. `mvv_lva` reads
+        // **-10 000** for a king taking a pawn (the attacker is worth 20 000) and **0** for en
+        // passant (the victim is not on the destination square), so a `> 0` test dropped both.
+        let king = Position::from_fen("4k3/8/8/8/8/8/3p4/4K3 w - - 0 1").expect("fixture");
+        let kxp = uci(&king, "e1d2");
+        assert!(mvv_lva(&king, kxp) < 0, "precondition: mvv_lva must score this one negative");
+        assert!(is_capture(&king, kxp), "a king taking a pawn takes material");
+        assert!(!is_quiet(&king, kxp));
+
+        let ep = Position::from_fen("rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 3")
+            .expect("fixture");
+        let exd = uci(&ep, "e5d6");
+        assert_eq!(mvv_lva(&ep, exd), 0, "precondition: mvv_lva must score this one zero");
+        assert!(ep.piece_on(exd.to).is_none(), "precondition: the destination is empty");
+        assert!(is_capture(&ep, exd), "en passant takes material, on another square");
+        assert!(!is_quiet(&ep, exd));
+    }
+
+    #[test]
+    fn castling_can_now_be_remembered_as_a_killer() {
+        // A behaviour change and not a side effect, so it gets its own test. `Killers::record`
+        // refuses anything not quiet, so before #96 a castle could never occupy a killer slot --
+        // while simultaneously being ranked among the captures by `score`, ahead of every killer.
+        // Whether ranking it as a quiet move is *better* is what the Elo measurement decides; that
+        // it is now possible is behaviour, and behaviour gets a test.
+        let p = Position::from_fen(CASTLING).expect("test fixture must parse");
+        let castle = uci(&p, "e1g1");
+        let mut killers = Killers::new();
+        killers.record(&p, 0, castle);
+        assert!(
+            killers.at(0).contains(castle),
+            "castling must now be recordable as a killer",
+        );
+    }
+
+    #[test]
+    fn castling_is_ordered_with_the_quiet_moves_and_no_longer_among_the_captures() {
+        // The consequence in the main search, which is the half of #96 that is not about
+        // quiescence. `score` reads `is_quiet`, so a castle used to score `CAPTURE_BASE + 30 000`
+        // -- above every real capture on this board, since it "takes" a rook with a king.
+        let p = Position::from_fen("r3k2r/8/8/8/8/8/6p1/R3K2R w KQkq - 0 1").expect("fixture");
+        let castle = uci(&p, "e1g1");
+        let real_capture = uci(&p, "h1h8");
+        assert!(is_capture(&p, real_capture), "precondition: h1h8 takes a rook");
+        assert!(
+            score(&p, real_capture, KillerSlots::none()) > score(&p, castle, KillerSlots::none()),
+            "a real capture must outrank a castle, which takes nothing",
+        );
+        let quiet = uci(&p, "a1b1");
+        assert_eq!(
+            score(&p, castle, KillerSlots::none()),
+            score(&p, quiet, KillerSlots::none()),
+            "and a castle must score as what it is: a quiet move",
+        );
     }
 }

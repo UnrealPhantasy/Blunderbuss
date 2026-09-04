@@ -389,22 +389,30 @@ impl Position {
             Color::White => cozy_chess::Rank::Eighth,
             Color::Black => cozy_chess::Rank::First,
         };
-        // **Our own rooks belong in the target set, and that is not a mistake.** cozy-chess spells
-        // castling as the king *capturing its own rook* (`e1h1`), so a castle lands on a friendly
-        // square — and `ordering::mvv_lva` therefore reads a rook on the destination and scores it
-        // as a capture. Quiescence consequently searches castling today.
+        // **The en-passant square belongs in the target set, and it is the one target that holds no
+        // piece.** An en-passant capture lands on an empty square — the pawn it takes stands beside
+        // it — so no board of occupied squares contains it and it has to be added by name.
         //
-        // That is very probably a defect: a castle is not an exchange and has nothing to resolve
-        // in a quiescence search. But **fixing it here would change which nodes are visited**,
-        // which is exactly what this brick promises not to do, and it would take the node-equality
-        // control down with it. So the behaviour is preserved to the move, deliberately, and the
-        // defect is left to an issue that can measure it in Elo.
+        // It was absent until #96, and correctly so: the filter of the day scored en passant 0
+        // through `mvv_lva` and dropped it anyway, so both paths excluded it and the behaviour
+        // matched. Now that quiescence resolves it, the generation has to offer it.
         //
-        // No other move can land on a friendly square, so this widens the set by castles alone.
-        // Found by `tactical_moves_are_the_filtered_legal_moves_in_the_same_order`, not by
-        // reasoning — which is the whole reason that test compares against the old path.
-        let our_rooks = self.0.colors(us) & self.0.pieces(Piece::Rook);
-        let targets = them | promotion_rank.bitboard() | our_rooks;
+        // cozy-chess idiom: `en_passant()` returns the **file** of the pawn that just advanced two
+        // squares, not a square — the rank is implied by whose turn it is, since only the side to
+        // move can make the capture.
+        let en_passant = self.0.en_passant().map_or(cozy_chess::BitBoard::EMPTY, |file| {
+            let rank = match us {
+                Color::White => cozy_chess::Rank::Sixth,
+                Color::Black => cozy_chess::Rank::Third,
+            };
+            cozy_chess::Square::new(file, rank).bitboard()
+        });
+        // **Our own rooks are deliberately absent**, and that absence is the point of #96. cozy-chess
+        // spells castling as the king capturing its own rook, so a castle lands on a friendly
+        // square; including it here is what made quiescence search castles, which resolve no
+        // exchange. `ordering::is_capture` now tests the *colour* on the destination rather than its
+        // presence, so the filter drops castles and the mask has no reason to offer them.
+        let targets = them | promotion_rank.bitboard() | en_passant;
         let mut moves = Vec::with_capacity(MAX_LEGAL_MOVES);
         // cozy-chess idiom: the mask `generate_moves_for` takes selects the **pieces** to move, not
         // the squares to move to — its own example masks the knights. Destinations are narrowed by
@@ -688,8 +696,14 @@ mod tests {
                 Color::White => cozy_chess::Rank::Eighth,
                 Color::Black => cozy_chess::Rank::First,
             };
-            let our_rooks = pos.0.colors(pos.0.side_to_move()) & pos.0.pieces(Piece::Rook);
-            let targets = them | promotion_rank.bitboard() | our_rooks;
+            let en_passant = pos.0.en_passant().map_or(cozy_chess::BitBoard::EMPTY, |file| {
+                let rank = match pos.0.side_to_move() {
+                    Color::White => cozy_chess::Rank::Sixth,
+                    Color::Black => cozy_chess::Rank::Third,
+                };
+                cozy_chess::Square::new(file, rank).bitboard()
+            });
+            let targets = them | promotion_rank.bitboard() | en_passant;
             let expected: Vec<Move> =
                 pos.legal_moves().into_iter().filter(|mv| targets.has(mv.to)).collect();
             assert_eq!(pos.tactical_moves(), expected, "on {}", pos.to_fen());

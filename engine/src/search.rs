@@ -12,7 +12,7 @@
 //! direct depth-N pass. [`best_move`] is a thin convenience wrapper over it.
 
 use crate::evaluation::{evaluate, phase};
-use crate::ordering::{is_quiet, mvv_lva, order_moves, see, KillerSlots, Killers};
+use crate::ordering::{is_capture, is_quiet, order_moves, see, KillerSlots, Killers};
 use crate::position::{Move, Piece, Position};
 use crate::book::Book;
 use crate::transposition::{Bound, Table};
@@ -1823,7 +1823,7 @@ impl<'a> Searcher<'a> {
         // pawn stepping onto an empty back rank scores 0 like any quiet move. Hence the
         // explicit promotion test: without it the leaf is evaluated as if the queen
         // about to appear did not exist.
-        moves.retain(|&mv| mvv_lva(pos, mv) > 0 || is_queen_promotion(mv));
+        moves.retain(|&mv| is_capture(pos, mv) || is_queen_promotion(mv));
         // Then drop the captures that lose material. Unlike the ordering use of the same
         // evaluation, this **changes what the search concludes**: a capture removed here is
         // never examined, so a sacrifice that wins two moves later is invisible to quiescence.
@@ -2900,18 +2900,21 @@ mod tests {
     }
 
     #[test]
-    fn quiescence_searches_exactly_the_moves_it_did_before() {
-        // The narrow generation is a superset of what the filter keeps, so what quiescence
-        // searches must be unchanged. Asserted against the old path -- generate everything, then
-        // filter -- on positions from pseudo-random play, because this is the property that makes
-        // the whole brick claim to be invisible to the search.
+    fn the_narrow_generation_offers_every_move_the_filter_keeps() {
+        // **The property that survives #96, and it is the one that matters.** This test used to
+        // assert that quiescence searched *exactly the moves it did before* -- correct for #94,
+        // whose whole claim was that it changed nothing, and wrong now: #96 deliberately changes
+        // which moves are kept. What must still hold is the structural half: `tactical_moves` is a
+        // superset of what the filter keeps, so narrowing the generation never loses a move the
+        // filter would have accepted.
+        //
+        // Asserted against the wide path -- generate everything, then filter -- on positions from
+        // pseudo-random play, and counted, because a sweep that never reached a castle or an
+        // en-passant capture would be checking the easy case only.
         let mut rng = Xorshift(0x9D1E_5CE1);
-        let mut compared = 0;
-        for game in 0..200u64 {
-            let mut pos = Position::from_fen(
-                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-            )
-            .unwrap();
+        let (mut compared, mut with_castle, mut with_ep) = (0, 0, 0);
+        for game in 0..300u64 {
+            let mut pos = Position::initial();
             for _ in 0..(2 + game % 50) {
                 let moves = pos.legal_moves();
                 if moves.is_empty() {
@@ -2920,7 +2923,7 @@ mod tests {
                 pos = pos.play(moves[(rng.next() % moves.len() as u64) as usize]);
             }
             let keep = |p: &Position, mv: &Move| {
-                crate::ordering::mvv_lva(p, *mv) > 0 || is_queen_promotion(*mv)
+                crate::ordering::is_capture(p, *mv) || is_queen_promotion(*mv)
             };
             let mut narrow = pos.tactical_moves();
             narrow.retain(|mv| keep(&pos, mv));
@@ -2928,9 +2931,77 @@ mod tests {
             wide.retain(|mv| keep(&pos, mv));
             assert_eq!(narrow, wide, "on {}", pos.to_fen());
             compared += 1;
+            // The two families the mask has to get right, counted so their absence is loud.
+            if pos.legal_moves().iter().any(|mv| pos.color_on(mv.to) == Some(pos.side_to_move())) {
+                with_castle += 1;
+            }
+            if pos
+                .legal_moves()
+                .iter()
+                .any(|mv| pos.piece_on(mv.to).is_none() && crate::ordering::is_capture(&pos, *mv))
+            {
+                with_ep += 1;
+            }
         }
         assert!(compared > 150, "precondition: the sweep must reach positions, got {compared}");
+        assert!(with_castle > 0, "precondition: the sweep never reached a castling position");
+        assert!(with_ep > 0, "precondition: the sweep never reached an en-passant capture");
     }
+
+    #[test]
+    fn quiescence_no_longer_searches_castling() {
+        // AC#2, pinned on the **node count** and not on a score: a score cannot see which moves
+        // were searched. White has both castles available and no capture, so before #96 quiescence
+        // played out two castles and everything beneath them; now it stands pat.
+        let p = Position::from_fen("r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQkq - 0 1")
+            .expect("test fixture must parse");
+        let castles: Vec<Move> = p
+            .legal_moves()
+            .into_iter()
+            .filter(|mv| p.color_on(mv.to) == Some(p.side_to_move()))
+            .collect();
+        assert_eq!(castles.len(), 2, "precondition: both castles must be available here");
+        assert!(
+            castles.iter().all(|&mv| crate::ordering::mvv_lva(&p, mv) > 0),
+            "precondition: the old filter kept these -- otherwise this test proves nothing",
+        );
+        let searched = p.tactical_moves();
+        assert!(
+            !searched.iter().any(|mv| p.color_on(mv.to) == Some(p.side_to_move())),
+            "the narrow generation must not even offer a castle",
+        );
+        let (_, nodes) = quiescence_only(&p, true);
+        assert_eq!(nodes, 1, "with no capture available, quiescence must visit this node alone");
+    }
+
+    #[test]
+    fn quiescence_now_resolves_a_king_recapture_and_an_en_passant_capture() {
+        // AC#3, and each is asserted through the **score**, because what was lost was the
+        // resolution of an exchange rather than a move in a list.
+        //
+        // A king recapturing a pawn: `mvv_lva` reads -10 000 for it, so the old filter dropped it
+        // and quiescence returned the stand-pat of a position a pawn down. Now it takes the pawn
+        // back and the score reflects it.
+        let king = Position::from_fen("4k3/8/8/8/8/8/3p4/4K3 w - - 0 1").expect("fixture");
+        let stand_pat = evaluate(&king);
+        assert!(stand_pat < 0, "precondition: White is a pawn down before the recapture");
+        assert!(
+            quiesce(&king) > stand_pat,
+            "quiescence must resolve the king's recapture: {} against a stand-pat of {stand_pat}",
+            quiesce(&king),
+        );
+
+        // En passant: `mvv_lva` reads 0 for it because the captured pawn is not on the destination
+        // square, so the old filter dropped it too.
+        let ep = Position::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 2").expect("fixture");
+        let exd = ep.move_from_uci("e5d6").expect("the en-passant capture must parse");
+        assert_eq!(crate::ordering::mvv_lva(&ep, exd), 0, "precondition: mvv_lva scores it zero");
+        assert!(
+            ep.tactical_moves().contains(&exd),
+            "the narrow generation must offer the en-passant capture",
+        );
+    }
+
 
     #[test]
     fn a_capture_promotion_is_still_searched() {
