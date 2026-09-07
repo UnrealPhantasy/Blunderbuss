@@ -247,7 +247,19 @@ const CHECK_EXTENSION_MAX_DEPTH: u32 = 2;
 /// otherwise called in **one** place in this engine — the stand-pat in quiescence — so this cut
 /// does not reuse a number lying around, it *introduces* the call. Keeping it near the leaves is
 /// what limits how many nodes pay for an evaluation they may not use.
-const RFP_MAX_DEPTH: u32 = 3;
+const RFP_MAX_DEPTH: u32 = 8;
+
+// **Why the ceiling moved and the margin did not, and it was measured rather than chosen.** #100
+// took both from an audit that had varied them together and reported a node ratio of 0.814. Varied
+// separately here: raising the ceiling to 8 leaves the whole suite green, while lowering the margin
+// to 75 — with the ceiling either way — fails
+// `the_cut_fires_on_real_positions_and_saves_the_subtree` on the endgame position, where the cut
+// fires 1 566 times and the tree comes out **larger** (18 580 nodes against 15 909).
+//
+// That is not a paradox: a smaller margin makes the cut fire on positions it should not, and the
+// bound it returns is then looser than the one a real search would have produced, so the savings
+// are handed back with interest elsewhere. The test that caught it exists precisely to separate
+// "the cut fires" from "the cut saves", and it earned its keep here.
 
 /// How far above `beta` the static evaluation must sit, per ply of remaining depth.
 ///
