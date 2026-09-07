@@ -342,8 +342,24 @@ fn variant<
                 Color::White => 1,
                 Color::Black => -1,
             };
-            middlegame += sign * mg;
-            endgame += sign * eg;
+            // **`black_box` on the accumulated term, and without it one row of the report is a
+            // lie.** With every term switched off, `mg` and `eg` are compile-time zeros, so
+            // `balance` is zero, so the whole function returns a constant — and LLVM deletes the
+            // loop, the board walk and the 64 `piece_on` calls with it. The `bare walk` row then
+            // reports **1.2 ns and 99 % of `evaluate`**, which reads as "the walk is the entire
+            // cost" and is in fact "there is no walk".
+            //
+            // It is invisible to every guard this module has: the blank compares copies of the same
+            // source, the BODY FLOOR only looks at *negative* shares, and 99 % is positive. Found
+            // in review, and only once #95 was in the same tree — its occupancy short-circuit in
+            // `piece_on` is what made the call transparent enough for LLVM to see through.
+            //
+            // The opaque barrier costs the same instruction in every variant, so it cancels in
+            // every difference the table reports; what it cannot do is cancel in the *absolute*
+            // nanoseconds, which are therefore a few per cent above production. Stated rather than
+            // corrected, because a correction would need its own measurement.
+            middlegame += black_box(sign * mg);
+            endgame += black_box(sign * eg);
         }
     }
 
