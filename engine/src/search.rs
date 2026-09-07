@@ -2954,44 +2954,36 @@ mod tests {
         // over-broad "castling is not a capture" is an engine that stops castling *altogether*, and
         // that failure is silent: inserting
         // `moves.retain(|mv| pos.color_on(mv.to) != Some(pos.side_to_move()))` after both
-        // `legal_moves()` calls in this file — so the engine can never castle — left **all 242
-        // tests green**. Found in review; nothing here saw it.
+        // `legal_moves()` calls in this file left **all 242 tests green**. Found in review.
         //
-        // Asserting that the search *plays* a castle does not work, and that was measured before
-        // this test took its present shape: over 30 plies of self-play at depth 6 this engine
-        // castles in none of them, and on three constructed positions it prefers a developing move
-        // at every depth from 4 to 8. Preferring is not the property. **Searching** is.
+        // **Two forms of this test were rejected by measurement before this one.** Self-play does
+        // not work: over 30 plies at depth 6 this engine castles in none of them. And comparing the
+        // node counts of the same position with and without the castling right does not work
+        // either — it stays green under the mutation, because the castling right is part of the
+        // Zobrist key, so the transposition table indexes differently and the counts differ whether
+        // or not a castle is ever searched. That version tested the hash, not the move.
         //
-        // So the same position is searched with and without the castling right. Nothing else
-        // differs — the evaluation never reads castling rights — so equal node counts would mean
-        // the castling move was never searched at all.
-        let with = Position::from_fen(
-            "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/2N2N2/PPPP1PPP/R1BQK2R w KQkq - 0 1",
+        // What works is a position where the search *chooses* to castle, which is stronger than
+        // either: it requires the move to be generated, searched, and to win its comparison.
+        let p = Position::from_fen(
+            "r3k2r/pppq1ppp/2npbn2/2b1p3/2B1P3/2NPBN2/PPPQ1PPP/R3K2R w KQkq - 0 1",
         )
         .expect("test fixture must parse");
-        let without = Position::from_fen(
-            "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/2N2N2/PPPP1PPP/R1BQK2R w kq - 0 1",
-        )
-        .expect("test fixture must parse");
-
-        // Castling is the only move that can land on a friendly square, which is this brick's whole
-        // subject. One and not two: the queenside rook is blocked by the bishop on c1.
-        let castles = |p: &Position| {
+        assert_eq!(
             p.legal_moves()
                 .into_iter()
                 .filter(|mv| p.color_on(mv.to) == Some(p.side_to_move()))
-                .count()
-        };
-        assert_eq!(castles(&with), 1, "precondition: White may castle kingside here");
-        assert_eq!(castles(&without), 0, "precondition: and not at all in the other position");
-
-        for depth in [5, 6] {
-            let a = search_timed(&with, Limits::depth(depth)).nodes;
-            let b = search_timed(&without, Limits::depth(depth)).nodes;
-            assert_ne!(
-                a, b,
-                "at depth {depth} the search visited {a} nodes with the castling right and {b} \
-                 without: the castling move was never searched",
+                .count(),
+            2,
+            "precondition: both castles must be legal here, or the test proves less than it says",
+        );
+        for depth in [1, 2] {
+            let (mv, _) = best_move(&p, depth).expect("the position is not terminal");
+            assert_eq!(
+                p.color_on(mv.to),
+                Some(p.side_to_move()),
+                "at depth {depth} the search played {}, not a castle",
+                p.move_to_uci(mv),
             );
         }
     }
