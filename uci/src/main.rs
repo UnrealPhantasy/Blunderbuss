@@ -1210,16 +1210,29 @@ mod tests {
 
     #[test]
     fn an_unfinished_iteration_is_not_reported() {
-        // The search discards an aborted iteration, so announcing its depth would mean
-        // walking the claim back — worse than saying nothing.
+        // The search discards an aborted iteration, so announcing its depth would mean walking the
+        // claim back — worse than saying nothing.
         //
-        // Measured, not assumed: Kiwipete's first iteration costs ~25 900 nodes against
-        // a 2048-node clock check, so a 1 ms budget always cuts it short and **nothing**
-        // completes. The log is therefore empty, and asserting emptiness is what makes
-        // this discriminating — an upper bound of one would also accept the single line
-        // a defective implementation emits.
+        // **The fixture is load-bearing, and it was chosen by measurement twice.** The test needs a
+        // first iteration costing more than the 2 048-node clock-check interval: below that the
+        // clock is never read and no budget can interrupt anything. Kiwipete used to cost ~25 900
+        // nodes and did the job; once #96 stopped quiescence searching castles it costs **1 059**,
+        // the iteration completes, and the test failed while the engine was right.
+        //
+        // The position below costs **16 285 nodes** at depth 1 on this head — eight times the
+        // interval, so it survives a tree that thins further.
+        //
+        // It replaced a *retirement* of this test, which I had justified with "no position reaches
+        // the interval any more" after checking sixty-four of them. Found in review by checking
+        // twelve thousand: **thirty-six do**, the largest at 16 285. Sixty-four positions are a
+        // sample, and a claim of the form "no position" is about the space. That is the same
+        // mistake as reading a suite of cumulative scores as if it were the space of them, which
+        // this project has paid for before.
+        //
+        // Asserting emptiness is what makes this discriminating — an upper bound of one would also
+        // accept the single line a defective implementation emits.
         let (mut uci, log) = uci_with_log();
-        uci.handle("position fen r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
+        uci.handle("position fen q3k3/r2np3/pr5b/1bp1Nppp/1p1P2nP/2PBP3/PPQ2P2/3RK2R w K - 2 20");
         uci.handle("go movetime 51");
         assert!(
             log.borrow().is_empty(),
