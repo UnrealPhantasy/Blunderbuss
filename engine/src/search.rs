@@ -41,12 +41,29 @@ pub const MATE_THRESHOLD: i32 = 20_000;
 // initial alpha/beta window.
 const INF: i32 = 40_000;
 
-/// How much shallower a null-move search runs than the node that spawned it.
+/// The floor of the null-move reduction, and the smallest depth at which a pass is attempted.
 ///
-/// Two is the usual choice: the pass only has to fail to find a rough refutation, so
-/// paying full depth for it would spend more than the cut saves. Larger values prune
-/// harder and miss more.
+/// The pass only has to fail to find a rough refutation, so paying full depth for it would spend
+/// more than the cut saves. Two was the whole reduction until #100; it is now the base of
+/// [`null_move_reduction`], which grows with depth.
 const NULL_MOVE_REDUCTION: u32 = 2;
+
+/// How much shallower a null-move search runs than the node that spawned it, **growing with the
+/// depth of that node**.
+///
+/// **Why it should grow, and it is not an analogy.** The pass asks "is this position so good that
+/// even giving the opponent a free move leaves it above beta". The deeper the node, the more the
+/// remaining subtree can absorb — so the answer holds with a shallower verification, and a fixed
+/// reduction pays full price for a question that gets cheaper. Every engine that reduces at all
+/// grows this; this one did not, and the constant was among the two most conservative in the
+/// search.
+///
+/// `3 + depth / 6` rather than a table: at depth 4 it is 3, at depth 12 it is 5, at depth 24 it is
+/// 7. The `saturating_sub` at the call site is what keeps a reduction larger than the depth from
+/// wrapping, and it is documented there by its two failure modes.
+fn null_move_reduction(depth: u32) -> u32 {
+    3 + depth / 6
+}
 
 /// Minimum [`phase`] for a null move to be attempted — the zugzwang guard.
 ///
@@ -1577,7 +1594,7 @@ impl<'a> Searcher<'a> {
         let can_null = can_null && self.allow_null_move;
         if can_null && self.null_move_allowed(pos, depth) {
             if let Some(passed) = pos.null_move() {
-                let reduced = depth.saturating_sub(1 + NULL_MOVE_REDUCTION);
+                let reduced = depth.saturating_sub(1 + null_move_reduction(depth));
                 // `-beta, -beta + 1` is a null window: we only ask "does it reach beta",
                 // never "by how much". `false` forbids a second pass in a row — two
                 // passes would skip a full move for both sides and prove nothing.
