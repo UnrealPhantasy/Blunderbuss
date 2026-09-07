@@ -2949,6 +2949,54 @@ mod tests {
     }
 
     #[test]
+    fn the_main_search_still_castles() {
+        // **AC#2, and it is the criterion this brick most needed.** The failure mode of an
+        // over-broad "castling is not a capture" is an engine that stops castling *altogether*, and
+        // that failure is silent: inserting
+        // `moves.retain(|mv| pos.color_on(mv.to) != Some(pos.side_to_move()))` after both
+        // `legal_moves()` calls in this file — so the engine can never castle — left **all 242
+        // tests green**. Found in review; nothing here saw it.
+        //
+        // Asserting that the search *plays* a castle does not work, and that was measured before
+        // this test took its present shape: over 30 plies of self-play at depth 6 this engine
+        // castles in none of them, and on three constructed positions it prefers a developing move
+        // at every depth from 4 to 8. Preferring is not the property. **Searching** is.
+        //
+        // So the same position is searched with and without the castling right. Nothing else
+        // differs — the evaluation never reads castling rights — so equal node counts would mean
+        // the castling move was never searched at all.
+        let with = Position::from_fen(
+            "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/2N2N2/PPPP1PPP/R1BQK2R w KQkq - 0 1",
+        )
+        .expect("test fixture must parse");
+        let without = Position::from_fen(
+            "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/2N2N2/PPPP1PPP/R1BQK2R w kq - 0 1",
+        )
+        .expect("test fixture must parse");
+
+        // Castling is the only move that can land on a friendly square, which is this brick's whole
+        // subject. One and not two: the queenside rook is blocked by the bishop on c1.
+        let castles = |p: &Position| {
+            p.legal_moves()
+                .into_iter()
+                .filter(|mv| p.color_on(mv.to) == Some(p.side_to_move()))
+                .count()
+        };
+        assert_eq!(castles(&with), 1, "precondition: White may castle kingside here");
+        assert_eq!(castles(&without), 0, "precondition: and not at all in the other position");
+
+        for depth in [5, 6] {
+            let a = search_timed(&with, Limits::depth(depth)).nodes;
+            let b = search_timed(&without, Limits::depth(depth)).nodes;
+            assert_ne!(
+                a, b,
+                "at depth {depth} the search visited {a} nodes with the castling right and {b} \
+                 without: the castling move was never searched",
+            );
+        }
+    }
+
+    #[test]
     fn quiescence_no_longer_searches_castling() {
         // AC#2, pinned on the **node count** and not on a score: a score cannot see which moves
         // were searched. White has both castles available and no capture, so before #96 quiescence
