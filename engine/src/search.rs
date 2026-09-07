@@ -247,19 +247,26 @@ const CHECK_EXTENSION_MAX_DEPTH: u32 = 2;
 /// otherwise called in **one** place in this engine — the stand-pat in quiescence — so this cut
 /// does not reuse a number lying around, it *introduces* the call. Keeping it near the leaves is
 /// what limits how many nodes pay for an evaluation they may not use.
-const RFP_MAX_DEPTH: u32 = 8;
+const RFP_MAX_DEPTH: u32 = 3;
 
-// **Why the ceiling moved and the margin did not, and it was measured rather than chosen.** #100
-// took both from an audit that had varied them together and reported a node ratio of 0.814. Varied
-// separately here: raising the ceiling to 8 leaves the whole suite green, while lowering the margin
-// to 75 — with the ceiling either way — fails
-// `the_cut_fires_on_real_positions_and_saves_the_subtree` on the endgame position, where the cut
-// fires 1 566 times and the tree comes out **larger** (18 580 nodes against 15 909).
+// **Both halves of an audit's proposal for this constant were tried and both were rejected, by
+// measurement rather than by argument.** #100 took "ceiling 8, margin 75" from an audit that had
+// varied the two together and reported a node ratio of 0.814. Varied separately:
 //
-// That is not a paradox: a smaller margin makes the cut fire on positions it should not, and the
-// bound it returns is then looser than the one a real search would have produced, so the savings
-// are handed back with interest elsewhere. The test that caught it exists precisely to separate
-// "the cut fires" from "the cut saves", and it earned its keep here.
+//   * **margin 90 → 75 fails an existing test.** With the ceiling either way,
+//     `the_cut_fires_on_real_positions_and_saves_the_subtree` goes red on the endgame position: the
+//     cut fires 1 566 times and the tree comes out *larger*, 18 580 nodes against 15 909. Not a
+//     paradox — a smaller margin makes the cut fire where it should not, the bound it returns is
+//     looser than a real search would have produced, and the saving is handed back with interest.
+//     That test exists precisely to separate "the cut fires" from "the cut saves".
+//   * **ceiling 3 → 8 does nothing at all.** Whole suite green, and the node ratio on the
+//     persistent-table sequence reads **1.0023** — 0.2 % the wrong way, inside the blank. The
+//     reason is structural and was measured on the way: the tree is exponential, so almost every
+//     interior node already sits below depth 3, and widening to 8 reaches only the sparse nodes at
+//     depths 4-8.
+//
+// So this constant stays at 3, and the audit's 0.814 belonged entirely to the margin it also
+// changed — which is what varying two things at once costs.
 
 /// How far above `beta` the static evaluation must sit, per ply of remaining depth.
 ///
