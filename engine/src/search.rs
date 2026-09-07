@@ -3033,6 +3033,46 @@ mod tests {
     }
 
     #[test]
+    fn the_main_search_still_castles() {
+        // **AC#2, and it is the criterion this brick most needed.** The failure mode of an
+        // over-broad "castling is not a capture" is an engine that stops castling *altogether*, and
+        // that failure is silent: inserting
+        // `moves.retain(|mv| pos.color_on(mv.to) != Some(pos.side_to_move()))` after both
+        // `legal_moves()` calls in this file left **all 242 tests green**. Found in review.
+        //
+        // **Two forms of this test were rejected by measurement before this one.** Self-play does
+        // not work: over 30 plies at depth 6 this engine castles in none of them. And comparing the
+        // node counts of the same position with and without the castling right does not work
+        // either — it stays green under the mutation, because the castling right is part of the
+        // Zobrist key, so the transposition table indexes differently and the counts differ whether
+        // or not a castle is ever searched. That version tested the hash, not the move.
+        //
+        // What works is a position where the search *chooses* to castle, which is stronger than
+        // either: it requires the move to be generated, searched, and to win its comparison.
+        let p = Position::from_fen(
+            "r3k2r/pppq1ppp/2npbn2/2b1p3/2B1P3/2NPBN2/PPPQ1PPP/R3K2R w KQkq - 0 1",
+        )
+        .expect("test fixture must parse");
+        assert_eq!(
+            p.legal_moves()
+                .into_iter()
+                .filter(|mv| p.color_on(mv.to) == Some(p.side_to_move()))
+                .count(),
+            2,
+            "precondition: both castles must be legal here, or the test proves less than it says",
+        );
+        for depth in [1, 2] {
+            let (mv, _) = best_move(&p, depth).expect("the position is not terminal");
+            assert_eq!(
+                p.color_on(mv.to),
+                Some(p.side_to_move()),
+                "at depth {depth} the search played {}, not a castle",
+                p.move_to_uci(mv),
+            );
+        }
+    }
+
+    #[test]
     fn quiescence_no_longer_searches_castling() {
         // AC#2, pinned on the **node count** and not on a score: a score cannot see which moves
         // were searched. White has both castles available and no capture, so before #96 quiescence
