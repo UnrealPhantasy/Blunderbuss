@@ -2412,9 +2412,29 @@ mod tests {
         //
         // Two separate properties, because they hold on different domains. **That it
         // prunes at all** is true from the floor upwards and is what a regression would
-        // break. **How much** grows sharply with depth — measured with this test's own
-        // protocol: **4.5 % at depth 5, 30.7 % at depth 6, 41.6 % at depth 7** — since the
-        // deeper the tree, the larger the share of nodes with enough depth left to pass. A
+        // break. **How much** varies sharply with depth, and the shape moved with #101 —
+        // measured with this test's own protocol, the growing schedule against the fixed 2:
+        //
+        // | depth | reduction `2` (pre-#101) | `3 + depth / 6` (today) |
+        // |-------|--------------------------|-------------------------|
+        // | 5     | 4 %                      | **31 %**                |
+        // | 6     | 26 %                     | 11 %                    |
+        // | 7     | 37 %                     | **41 %**                |
+        //
+        // The figures this comment carried until 2026-09-09 — 4.5 / 30.7 / 41.6 % — were taken
+        // before #101 *and* before the evaluation moved, so they described a tree the engine no
+        // longer searches. Remeasured above rather than adjusted.
+        //
+        // **The threshold stays at 20 % rather than being raised to match**, and the reason is
+        // that raising it would buy nothing here. Review noted that the margin over the floor
+        // grew (37 % → 41 % at the peak) and that the assertion therefore discriminates less. It
+        // does — but it never discriminated *this* brick: reverting the schedule to a fixed 2
+        // still peaks at 37 %, comfortably over 20 %, so the test passed either way both before
+        // and after. What guards the schedule is
+        // `the_reduction_schedule_is_pinned_at_the_depths_the_engine_reaches`, which reddens on
+        // all three mutations review tried. This test keeps the job its name claims — that the
+        // pass prunes substantially *somewhere* — and a floor that survives an evaluation change
+        // serves that job better than one recalibrated to today's peak. A
         // sevenfold rise between two adjacent depths is the whole point, and it is why
         // asserting the amplitude across the sweep would only pin the weakest depth.
         //
