@@ -2260,6 +2260,62 @@ mod tests {
     }
 
     #[test]
+    fn the_reduction_schedule_is_pinned_at_the_depths_the_engine_reaches() {
+        // Ce que la brique #101 EST, epingle valeur par valeur. Sans lui, la suite ne distingue
+        // pas ce bareme de la constante qu'il remplace : trois mutations mesurees en review
+        // (`2`, `3 + depth / 3`, `10 + depth`) laissaient l'arbre aller de 1,000 a 0,566 — un
+        // ecart de 43 % — sans qu'aucun test ne rougisse.
+        //
+        // Les valeurs sont celles du commentaire de `null_move_reduction`, deliberement : une
+        // doc et un test qui se contredisent laissent le lecteur choisir.
+        assert_eq!(null_move_reduction(4), 3, "le plancher, atteint des la profondeur minimale");
+        assert_eq!(null_move_reduction(6), 4);
+        assert_eq!(null_move_reduction(12), 5);
+        assert_eq!(null_move_reduction(24), 7);
+        // La croissance est monotone et LENTE : un pli de reduction en plus tous les six plis de
+        // profondeur. C'est le second assert qui separe ce bareme d'une croissance deux fois plus
+        // rapide, et le premier ne suffirait pas — `3 + depth / 3` coincide a la profondeur 6.
+        for depth in 4..64u32 {
+            let r = null_move_reduction(depth);
+            assert!(r >= null_move_reduction(depth - 1), "depth {depth}: la croissance recule");
+            assert_eq!(r, 3 + depth / 6, "depth {depth}");
+        }
+    }
+
+    #[test]
+    fn the_gate_admits_depth_four_where_the_verification_is_a_bare_quiescence() {
+        // CE QUE LE GARDE FAIT, et non ce que son nom promettait. Releve en review sur #101.
+        //
+        // `null_move_allowed` s'ecrivait `depth > NULL_MOVE_REDUCTION + 1` a l'epoque ou cette
+        // constante ETAIT la reduction : le garde signifiait alors « il reste au moins un pli a
+        // verifier ». Depuis #101 la reduction croit et vaut 3 des la profondeur 4, donc a cette
+        // profondeur `reduced = depth - 1 - R = 0` : la passe est verifiee par une quiescence
+        // nue, sans un seul pli de recherche.
+        //
+        // C'est un choix agressif ASSUME, pas un defaut — `saturating_sub` le rend sur, et les
+        // 16 800 parties du duel l'ont mesure a +17 +- 4. Ce test existe pour que le choix soit
+        // ecrit plutot que deduit, et pour qu'un bareme qui le deplacerait soit vu.
+        let p = Position::initial();
+        let table = Table::new();
+        let s = Searcher::new(MoveOrder::Full, None, &table);
+        assert!(!s.null_move_allowed(&p, 3), "profondeur 3 : sous le seuil du garde");
+        assert!(s.null_move_allowed(&p, 4), "profondeur 4 : le garde laisse passer");
+        assert_eq!(
+            4u32.saturating_sub(1 + null_move_reduction(4)),
+            0,
+            "et a cette profondeur la verification ne recherche rien : quiescence nue",
+        );
+        // Des la profondeur 5 il reste un pli, et il en reste ensuite toujours au moins un. C'est
+        // cette borne qui tombe sous une reduction qui croitrait aussi vite que la profondeur.
+        for depth in 5..64u32 {
+            assert!(
+                depth.saturating_sub(1 + null_move_reduction(depth)) >= 1,
+                "depth {depth}: la verification ne recherche plus rien",
+            );
+        }
+    }
+
+    #[test]
     fn no_null_move_when_the_reduction_would_leave_nothing() {
         // Below `1 + R` there is no subtree left to prune, so the pass costs more than
         // it saves.
