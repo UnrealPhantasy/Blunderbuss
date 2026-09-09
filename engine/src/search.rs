@@ -2282,72 +2282,71 @@ mod tests {
 
     #[test]
     fn the_reduction_schedule_is_pinned_at_the_depths_the_engine_reaches() {
-        // Ce que la brique #101 EST, epingle valeur par valeur. Sans lui, la suite ne distingue
-        // pas ce bareme de la constante qu'il remplace : trois mutations mesurees en review
-        // (`2`, `3 + depth / 3`, `10 + depth`) laissaient l'arbre aller de 1,000 a 0,566 — un
-        // ecart de 43 % — sans qu'aucun test ne rougisse.
+        // What #101 *is*, pinned value by value. Without this, the suite does not distinguish
+        // the schedule from the constant it replaced: three mutations measured in review — `2`,
+        // `3 + depth / 3`, `10 + depth` — moved the tree from 1.000 down to 0.566, a 43 % spread,
+        // and every one of them left the whole suite green.
         //
-        // Les valeurs sont celles du commentaire de `null_move_reduction`, deliberement : une
-        // doc et un test qui se contredisent laissent le lecteur choisir.
-        assert_eq!(null_move_reduction(4), 3, "le plancher, atteint des la profondeur minimale");
+        // The values are the ones in `null_move_reduction`'s own doc comment, deliberately: a doc
+        // and a test that contradict each other leave the reader to pick.
+        assert_eq!(null_move_reduction(4), 3, "the floor, reached at the shallowest gated depth");
         assert_eq!(null_move_reduction(6), 4);
         assert_eq!(null_move_reduction(12), 5);
         assert_eq!(null_move_reduction(24), 7);
-        // La croissance est monotone et LENTE : un pli de reduction en plus tous les six plis de
-        // profondeur. C'est le second assert qui separe ce bareme d'une croissance deux fois plus
-        // rapide, et le premier ne suffirait pas — `3 + depth / 3` coincide a la profondeur 6.
+        // Monotone and *slow*: one more ply of reduction every six plies of depth. The second
+        // assertion is what separates this schedule from one growing twice as fast — the pinned
+        // values alone would not, since `3 + depth / 3` agrees with it at depth 6.
         for depth in 4..64u32 {
             let r = null_move_reduction(depth);
-            assert!(r >= null_move_reduction(depth - 1), "depth {depth}: la croissance recule");
+            assert!(r >= null_move_reduction(depth - 1), "depth {depth}: growth went backwards");
             assert_eq!(r, 3 + depth / 6, "depth {depth}");
         }
     }
 
     #[test]
     fn the_gate_admits_depth_four_where_the_verification_is_a_bare_quiescence() {
-        // CE QUE LE GARDE FAIT, et non ce que son nom promettait. Releve en review sur #101.
+        // What the gate *does*, rather than what its name used to promise. Raised in review.
         //
-        // `null_move_allowed` s'ecrivait `depth > NULL_MOVE_REDUCTION + 1` a l'epoque ou cette
-        // constante ETAIT la reduction : le garde signifiait alors « il reste au moins un pli a
-        // verifier ». Depuis #101 la reduction croit et vaut 3 des la profondeur 4, donc a cette
-        // profondeur `reduced = depth - 1 - R = 0` : la passe est verifiee par une quiescence
-        // nue, sans un seul pli de recherche.
+        // `null_move_allowed` read `depth > NULL_MOVE_REDUCTION + 1` back when that constant
+        // *was* the reduction, so the gate meant "at least one ply is left to verify with". Since
+        // #101 the reduction grows and already equals 3 at depth 4, so `reduced = depth - 1 - R`
+        // is **zero** there: the pass is verified by a bare quiescence call, without a single ply
+        // of search.
         //
-        // C'est un choix agressif ASSUME, pas un defaut — `saturating_sub` le rend sur, et les
-        // 16 800 parties du duel l'ont mesure a +17 +- 4. Ce test existe pour que le choix soit
-        // ecrit plutot que deduit, et pour qu'un bareme qui le deplacerait soit vu.
+        // This is a deliberate aggressive choice, not a defect — `saturating_sub` keeps it safe,
+        // and the 16 800-game duel measured it at +17 ± 4. The test exists so the choice is
+        // written down rather than inferred, and so a schedule that moved it would be seen.
         let p = Position::initial();
         let table = Table::new();
         let s = Searcher::new(MoveOrder::Full, None, &table);
-        assert!(!s.null_move_allowed(&p, 3), "profondeur 3 : sous le seuil du garde");
-        assert!(s.null_move_allowed(&p, 4), "profondeur 4 : le garde laisse passer");
+        assert!(!s.null_move_allowed(&p, 3), "depth 3 sits below the gate");
+        assert!(s.null_move_allowed(&p, 4), "depth 4 passes the gate");
         assert_eq!(
             4u32.saturating_sub(1 + null_move_reduction(4)),
             0,
-            "et a cette profondeur la verification ne recherche rien : quiescence nue",
+            "and at that depth the verification searches nothing: a bare quiescence",
         );
-        // Des la profondeur 5 il reste un pli, et il en reste ensuite toujours au moins un. C'est
-        // cette borne qui tombe sous une reduction qui croitrait aussi vite que la profondeur.
+        // From depth 5 on, one ply is left, and at least one always is. That bound is what
+        // breaks under a reduction growing as fast as the depth itself.
         for depth in 5..64u32 {
             assert!(
                 depth.saturating_sub(1 + null_move_reduction(depth)) >= 1,
-                "depth {depth}: la verification ne recherche plus rien",
+                "depth {depth}: the verification no longer searches anything",
             );
         }
     }
 
     #[test]
     fn the_gate_admits_exactly_the_depths_at_or_above_its_threshold() {
-        // RENOMME le 2026-09-09 sur review. Il s'appelait
-        // `no_null_move_when_the_reduction_would_leave_nothing` et son commentaire disait « Below
-        // `1 + R` there is no subtree left to prune » — deux affirmations que #101 a rendues
-        // fausses sans que ce test bouge, parce qu'il n'interroge que `null_move_allowed`, qui ne
-        // consulte pas la reduction. A la profondeur 4, `1 + R` vaut 4 : il ne reste donc rien, et
-        // la passe est tentee quand meme.
+        // RENAMED on 2026-09-09, in review. It was called
+        // `no_null_move_when_the_reduction_would_leave_nothing` and its comment read "Below
+        // `1 + R` there is no subtree left to prune" — two claims #101 made false without moving
+        // this test, because it only ever asks `null_move_allowed`, which does not consult the
+        // reduction. At depth 4, `1 + R` is 4: nothing is left, and the pass is attempted anyway.
         //
-        // Le nom promettait une garantie que le code ne donne plus. Ce test verifie desormais ce
-        // que le garde fait — un seuil, rien de plus — et la propriete que l'ancien nom
-        // revendiquait est reprise, corrigee, par
+        // The name promised a guarantee the code no longer gives. This test now checks what the
+        // gate actually does — a threshold, nothing more — and the property the old name claimed
+        // is taken up, corrected, by
         // `the_gate_admits_depth_four_where_the_verification_is_a_bare_quiescence`.
         let p = Position::initial();
         let table = Table::new();
