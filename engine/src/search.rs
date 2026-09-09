@@ -241,8 +241,8 @@ const CHECK_EXTENSION_PLY_BUDGET: i32 = 2;
 ///
 /// Two readings decide it. **The floor**: extending only at `depth == 1` finds nothing at
 /// all — it is not the same brick made cheaper, it is a different and empty one. **The
-/// ceiling**: extending everywhere multiplies a pawn endgame's tree by 2.6, about 1.1 plies
-/// of work handed back at an effective branching factor of 2.36, and a pawn endgame is
+/// ceiling**: extending everywhere multiplies a pawn endgame's tree by 2.6, which is roughly a
+/// ply of work handed back at this engine's effective branching factor, and a pawn endgame is
 /// exactly the phase where this engine already loses its half-points. The last two mates cost
 /// more than half of the remaining depth budget to buy.
 ///
@@ -1597,8 +1597,15 @@ impl<'a> Searcher<'a> {
         //
         // The opposite profile to an extension: the cost is one evaluation and one comparison,
         // the benefit is a whole subtree never searched. That matters here because the effective
-        // branching factor is 2.06, which is fat enough that techniques spending a fraction of a
-        // node to decide where to spend more cannot pay (see the singular extension measurement).
+        // branching factor is fat enough that techniques spending a fraction of a node to decide
+        // where to spend more cannot pay (see the singular extension measurement).
+        //
+        // **The number is deliberately not written here.** It read 2.06 until 2026-09-09, and the
+        // measured value has been 2.14 since 2026-09-03 — a figure that moves with every brick
+        // touching the tree is a debt owed at each one and forgotten at most of them. A *dated*
+        // measurement in a comment is a historical fact and does not rot; a figure in the present
+        // tense is a claim about the current engine and rots in silence, unless a test asserts it.
+        // The value lives in the KB, dated, where it is maintained once.
         // **Computed once, used by both cuts**, and that sharing is what makes the forward cut
         // nearly free: #66 already introduced this call at interior nodes, which was its whole
         // cost. Recomputing it in the move loop would pay for it twice and cancel the economy.
