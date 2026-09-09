@@ -2330,16 +2330,27 @@ mod tests {
     }
 
     #[test]
-    fn no_null_move_when_the_reduction_would_leave_nothing() {
-        // Below `1 + R` there is no subtree left to prune, so the pass costs more than
-        // it saves.
+    fn the_gate_admits_exactly_the_depths_at_or_above_its_threshold() {
+        // RENOMME le 2026-09-09 sur review. Il s'appelait
+        // `no_null_move_when_the_reduction_would_leave_nothing` et son commentaire disait « Below
+        // `1 + R` there is no subtree left to prune » — deux affirmations que #101 a rendues
+        // fausses sans que ce test bouge, parce qu'il n'interroge que `null_move_allowed`, qui ne
+        // consulte pas la reduction. A la profondeur 4, `1 + R` vaut 4 : il ne reste donc rien, et
+        // la passe est tentee quand meme.
+        //
+        // Le nom promettait une garantie que le code ne donne plus. Ce test verifie desormais ce
+        // que le garde fait — un seuil, rien de plus — et la propriete que l'ancien nom
+        // revendiquait est reprise, corrigee, par
+        // `the_gate_admits_depth_four_where_the_verification_is_a_bare_quiescence`.
         let p = Position::initial();
         let table = Table::new();
         let searcher = Searcher::new(MoveOrder::Full, None, &table);
         for depth in 0..NULL_MOVE_MIN_DEPTH {
             assert!(!searcher.null_move_allowed(&p, depth), "depth {depth} is too shallow");
         }
-        assert!(searcher.null_move_allowed(&p, NULL_MOVE_MIN_DEPTH));
+        for depth in NULL_MOVE_MIN_DEPTH..=NULL_MOVE_MIN_DEPTH + 4 {
+            assert!(searcher.null_move_allowed(&p, depth), "depth {depth} should pass the gate");
+        }
     }
 
     #[test]
