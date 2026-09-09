@@ -41,12 +41,26 @@ pub const MATE_THRESHOLD: i32 = 20_000;
 // initial alpha/beta window.
 const INF: i32 = 40_000;
 
-/// The floor of the null-move reduction, and the smallest depth at which a pass is attempted.
+/// The shallowest depth at which a null-move pass is attempted. **A gate threshold, and nothing
+/// else** — despite what the name it carried until #101 suggested.
 ///
-/// The pass only has to fail to find a rough refutation, so paying full depth for it would spend
-/// more than the cut saves. Two was the whole reduction until #100; it is now the base of
-/// [`null_move_reduction`], which grows with depth.
-const NULL_MOVE_REDUCTION: u32 = 2;
+/// **The rename is the point.** This was `NULL_MOVE_REDUCTION = 2` back when the constant *was*
+/// the reduction, and the gate read `depth > NULL_MOVE_REDUCTION + 1`. Since #101 the reduction
+/// is [`null_move_reduction`], a schedule that grows with depth, and its base is a literal `3`
+/// that does not reference this constant at all. The old doc claimed three things and review
+/// found none of them true: the floor of `3 + depth / 6` is **3**, not 2; the shallowest depth at
+/// which a pass is attempted is **4**, not 2; and the schedule is not "based" on it. A reader
+/// changing it expecting to reduce harder would have changed only *where* passes are attempted —
+/// close to the opposite.
+///
+/// **Its value is unchanged in effect**: `depth > 2 + 1` and `depth >= 4` admit the same depths,
+/// so the tree is identical and the 16 800 games of #101's duel still measure this code.
+///
+/// Why a gate at all: below it the verification has almost nothing left to search, so the pass
+/// costs more than the cut saves. At exactly 4 it already searches *nothing* — see
+/// `the_gate_admits_depth_four_where_the_verification_is_a_bare_quiescence`, which pins that as
+/// the deliberate choice it is.
+const NULL_MOVE_MIN_DEPTH: u32 = 4;
 
 /// How much shallower a null-move search runs than the node that spawned it, **growing with the
 /// depth of that node**.
@@ -1268,7 +1282,7 @@ impl<'a> Searcher<'a> {
     /// harmless move to make. The phase from the tapered evaluation (#34) already
     /// measures exactly that, so the guard costs one comparison and no new concept.
     fn null_move_allowed(&self, pos: &Position, depth: u32) -> bool {
-        depth > NULL_MOVE_REDUCTION + 1 && phase(pos) >= NULL_MOVE_MIN_PHASE
+        depth >= NULL_MOVE_MIN_DEPTH && phase(pos) >= NULL_MOVE_MIN_PHASE
     }
 
     /// The reverse futility cut, or `None` when it does not apply.
@@ -2322,10 +2336,10 @@ mod tests {
         let p = Position::initial();
         let table = Table::new();
         let searcher = Searcher::new(MoveOrder::Full, None, &table);
-        for depth in 0..=NULL_MOVE_REDUCTION + 1 {
+        for depth in 0..NULL_MOVE_MIN_DEPTH {
             assert!(!searcher.null_move_allowed(&p, depth), "depth {depth} is too shallow");
         }
-        assert!(searcher.null_move_allowed(&p, NULL_MOVE_REDUCTION + 2));
+        assert!(searcher.null_move_allowed(&p, NULL_MOVE_MIN_DEPTH));
     }
 
     #[test]
@@ -2382,7 +2396,7 @@ mod tests {
         // what found it: at depth 4 the pruning is provably unreachable — the shallowest
         // internal node sits at `depth - 1`, `null_move_allowed` wants `depth > R + 1`,
         // so nothing can pass below `R + 3` — and the two searches returned the identical
-        // node count. Deriving it means a change to `NULL_MOVE_REDUCTION` moves the floor
+        // node count. Deriving it means a change to `NULL_MOVE_MIN_DEPTH` moves the floor
         // with it instead of leaving a silently inert first iteration.
         //
         // Two separate properties, because they hold on different domains. **That it
@@ -2419,7 +2433,7 @@ mod tests {
         const DEEPEST: u32 = 7;
         let mut best_saving = 0.0_f64;
         let mut report = String::new();
-        for depth in (NULL_MOVE_REDUCTION + 3)..=DEEPEST {
+        for depth in (NULL_MOVE_MIN_DEPTH + 1)..=DEEPEST {
             let (with, without) = (nodes(true, depth), nodes(false, depth));
             assert!(
                 with < without,
