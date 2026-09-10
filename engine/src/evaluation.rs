@@ -3,22 +3,37 @@
 //! Two terms, both in **centipawns** (1 pawn = 100) and both from the
 //! side-to-move perspective:
 //!
-//! - **material** — how much each side has (pawn 100 … queen 900);
+//! - **material** — how much each side has;
 //! - **piece-square tables (PST)** — a bonus for *where* each piece sits, so the
 //!   engine develops toward the centre, advances central pawns, and keeps its
 //!   king safe instead of shuffling material-equal positions aimlessly.
 //!
-//! The PST values are the well-known standard "simplified" tables. They are ours
-//! to keep and tune (and, one day, to learn).
+//! The two are **not separately identifiable**, and it is worth knowing before
+//! reading either: `evaluate` adds `value(piece)` to every one of a table's 64
+//! squares, so only their sum has meaning. Splitting it back out is a readability
+//! choice — `value` carries the mean and the tables carry the deviation.
+//!
+//! The numbers were **fitted**, not chosen: the evaluation is linear in them, so
+//! "are they good" is a convex problem rather than an opinion. Sparse logistic
+//! regression against an unrestricted Stockfish, on quiescence-leaf positions drawn
+//! at most one per game from this engine's own games. They started life as the
+//! Chess Programming Wiki's "simplified" tables and no longer resemble them.
 //!
 //! # Tapered evaluation
 //!
-//! One square is worth different things at different moments of a game, and the
+//! One square is worth different things at different moments of a game — a rook is
+//! worth more once the files open, a pawn more the closer the endgame gets, and the
 //! king is the extreme case: sheltered in a corner while the queens are on, and
 //! marching to the centre once they are off. A single table cannot say both, so
-//! the king has two — [`KING_MG`] and [`KING_EG`] — and the score is
-//! **interpolated** between them according to how much material is left
-//! ([`phase`]).
+//! **every piece has two** — `PAWN_MG` and `PAWN_EG`, and so on to [`KING_MG`]
+//! and [`KING_EG`] — and the score is **interpolated** between them according to how
+//! much material is left ([`phase`]).
+//!
+//! Until these tables were fitted, five of the six pieces read the *same* array in
+//! both phases and only the king had two, so this whole mechanism moved nothing but
+//! the king. Measured when it was fixed: of the 3.03 % of held-out cross-entropy the
+//! refit bought, **0.51 points came from the taper and 2.52 from the levels**. The
+//! shared tables were a real defect, and a smaller one than the numbers themselves.
 //!
 //! Interpolating rather than switching at a threshold matters: a switch would make
 //! the evaluation of one position jump by tens of centipawns the moment a single
@@ -115,17 +130,31 @@ static PASSED_MASK: LazyLock<[[u64; 64]; 2]> = LazyLock::new(|| {
     masks
 });
 
-/// What a passed pawn is worth, by the rank it has reached from its own side's view — index
-/// 0 is the home rank, index 7 the promotion square.
+/// What being **passed** adjusts a pawn by, on top of its square, by the rank it has reached
+/// from its own side's view — index 0 is the home rank, index 7 the promotion square.
 ///
-/// Two schedules, read by the same phase interpolation as the piece-square tables, and the
-/// endgame one is far steeper. That difference *is* the term: in a middlegame a passed pawn
-/// is a long-term asset among many, while in an endgame it is often the whole position. The
-/// growth is faster than linear because a pawn two squares from queening is not twice a pawn
-/// four squares away — the defender's task changes in kind, not in degree.
+/// Two schedules, read by the same phase interpolation as the piece-square tables, and both
+/// are fitted rather than chosen. Ranks 0 and 7 are zero on purpose: a pawn cannot stand on its
+/// own home rank, and one that reaches the eighth is no longer a pawn.
 ///
-/// Ranks 0 and 7 are zero on purpose: a pawn cannot stand on its own home rank, and one that
-/// reaches the eighth is no longer a pawn.
+/// **The middlegame schedule is negative until the fifth rank, and that is a finding rather
+/// than noise.** These are the best-observed columns in the whole fit — 54 213 net occurrences
+/// at rank 2 against 17 376 at rank 7 — so the sign is not a small-sample artefact. A passed
+/// pawn that has not moved is a pawn on a half-open file: the file is a highway for the enemy
+/// rook, the pawn is a target, and the enemy pawns that are not in front of it are massed
+/// somewhere else. What the schedule says is that a passer only becomes an asset once it is
+/// close enough to run, which is the same statement the endgame schedule makes at every rank —
+/// it is above the middlegame one throughout, by 34 to 92 cp.
+///
+/// **What this does to the halving below, and it is worth stating because the sign flipped
+/// under it.** A blockaded passer has its adjustment divided by two. That was written when
+/// every value here was positive and read as "a blockaded passer keeps part of its bonus"; with
+/// negative ranks it now also reads as "a blockaded back passer is half as much of a liability".
+/// Both are the same rule — being passed matters half as much when the pawn cannot advance —
+/// and halving moves the adjustment toward zero whichever side of zero it starts on.
+///
+/// The values are forced **even** so that `bonus /= 2` on an `i32` is exact. An odd value would
+/// truncate toward zero and cost half a centipawn that the fit's model does not know about.
 const PASSED_MIDDLEGAME: [i32; 8] = [0, -30, -52, -50, -18, 64, 116, 0];
 const PASSED_ENDGAME: [i32; 8] = [0, 20, 12, 42, 66, 110, 138, 0];
 
@@ -160,25 +189,44 @@ fn is_passed(square: usize, color: Color, enemy_pawns: u64) -> bool {
 /// what losing looks like; one that holds in both is a blind spot. The sign says we are optimistic
 /// when our pieces are cramped.
 ///
-/// **Why only the minor pieces, and this was measured rather than reasoned.** The first version
-/// weighted rooks and queens too, and the tree **doubled** — 733 605 nodes against 371 194 at
-/// depth 10 on the start position. A queen's mobility swings between five squares and
+/// **Why only the minor pieces, and it was measured rather than reasoned (2026-08).** The first
+/// version weighted rooks and queens too, and the tree **doubled** — 733 605 nodes against
+/// 371 194 at depth 10 on the start position. A queen's mobility swings between five squares and
 /// twenty-five, and feeding that swing into the evaluation moves scores past the futility margins
-/// that decide whether a node is cut at all. The knights and bishops carry the signal; the heavy
-/// pieces carried noise, and the noise was expensive. Weights at zero for pawns and the king for
-/// the ordinary reasons — a pawn's "mobility" is two capture squares, and the king's is king
-/// safety, a different term that measured neutral here (#29).
+/// that decide whether a node is cut at all. The sweep that settled it, and its numbers are a
+/// historical record of that day rather than a description of the weights below:
 ///
-/// | weights (N,B,R,Q) | nodes, opening | nodes, ruy-lopez |
+/// | weights tried (N,B,R,Q), 2026-08 | nodes, opening | nodes, ruy-lopez |
 /// |---|---|---|
 /// | 4,4,3,2 | ×1.98 | ×1.02 |
 /// | 2,2,2,1 | ×1.28 | ×1.19 |
 /// | 1,1,1,1 | ×1.28 | ×1.61 |
-/// | **3,3,0,0** | **×0.98** | **×1.02** |
+/// | 3,3,0,0 — the hand-picked pair the fit replaced | ×0.98 | ×1.02 |
 ///
-/// **Why tapered.** Everything in this evaluation is. A queen's freedom matters less in a
-/// middlegame full of pieces than in an endgame where it decides; a rook's matters more once the
-/// files open.
+/// **What that decision costs, priced in 2026-09.** On 265 248 quiescence leaves, after removing
+/// the best *monotone* function of this evaluation — the part worth 0 Elo by construction — the
+/// net rook-and-queen mobility is **the largest single blind spot left**, and by a distance: a
+/// per-stratum constant on it removes **6.7 %** of the residual variance, against 0.6 % for the
+/// knights and bishops that are scored here and 0.03 % for the game phase. Measured with the same
+/// number of rooks and queens on both sides, so it is the pieces' freedom and not their count.
+/// The decision above is not overturned by that figure — it was about the size of the tree, which
+/// a static fit cannot see — but the trade is now priced, and a cheaper formulation deserves its
+/// own issue.
+///
+/// **The weights below are fitted, not chosen**, and the two surprises in them are recorded
+/// rather than smoothed. A **bishop**'s freedom is worth three times more with the pieces on than
+/// in an endgame: its mobility is what separates a good bishop from a bad one, and that is a
+/// question about a dense pawn structure. A **knight**'s is worth nothing at all in the
+/// middlegame and something in the endgame — a knight's reach is nearly a function of its square
+/// once own pieces are discounted, so the piece-square table already carries it, and only on an
+/// emptier board does the residual variation say anything. Zero for pawns and the king for the
+/// ordinary reasons: a pawn's "mobility" is two capture squares, and the king's is king safety, a
+/// different term that measured neutral here (#29).
+///
+/// The mobility feature was **centred** before fitting — `weight × mobility` splits into
+/// `weight × mean`, which is indistinguishable from material, plus `weight × (mobility − mean)`,
+/// which is the part that varies — and the mean was folded back into [`value`]. Without that
+/// split the fit moves piece value into this array and back out again at random.
 const MOBILITY_MIDDLEGAME: [i32; 6] = [0, 0, 18, 0, 0, 0];
 const MOBILITY_ENDGAME: [i32; 6] = [0, 8, 6, 0, 0, 0];
 
