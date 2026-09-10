@@ -210,8 +210,9 @@ const CHECK_EXTENSION_PLY_BUDGET: i32 = 2;
 ///
 /// Two readings decide it. **The floor**: extending only at `depth == 1` finds nothing at
 /// all — it is not the same brick made cheaper, it is a different and empty one. **The
-/// ceiling**: extending everywhere multiplies a pawn endgame's tree by 2.6, about 1.1 plies
-/// of work handed back at an effective branching factor of 2.36, and a pawn endgame is
+/// ceiling**: extending everywhere multiplies a pawn endgame's tree by 2.6, about 1.26 plies
+/// of work handed back at the effective branching factor of **2.14 measured on 2026-09-03**
+/// over 11 200 anchored games, and a pawn endgame is
 /// exactly the phase where this engine already loses its half-points. The last two mates cost
 /// more than half of the remaining depth budget to buy.
 ///
@@ -1547,8 +1548,9 @@ impl<'a> Searcher<'a> {
         //
         // The opposite profile to an extension: the cost is one evaluation and one comparison,
         // the benefit is a whole subtree never searched. That matters here because the effective
-        // branching factor is 2.06, which is fat enough that techniques spending a fraction of a
-        // node to decide where to spend more cannot pay (see the singular extension measurement).
+        // branching factor **measured on 2026-09-03** over 11 200 anchored games is **2.14**,
+        // which is fat enough that techniques spending a fraction of a node to decide where to
+        // spend more cannot pay (see the singular extension measurement).
         // **Computed once, used by both cuts**, and that sharing is what makes the forward cut
         // nearly free: #66 already introduced this call at interior nodes, which was its whole
         // cost. Recomputing it in the move loop would pay for it twice and cancel the economy.
