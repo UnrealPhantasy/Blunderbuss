@@ -273,11 +273,22 @@ const RFP_MAX_DEPTH: u32 = 3;
 //     paradox — a smaller margin makes the cut fire where it should not, the bound it returns is
 //     looser than a real search would have produced, and the saving is handed back with interest.
 //     That test exists precisely to separate "the cut fires" from "the cut saves".
-//   * **ceiling 3 → 8 does nothing at all.** Whole suite green, and the node ratio on the
-//     persistent-table sequence reads **1.0023** — 0.2 % the wrong way, inside the blank. The
-//     reason is structural and was measured on the way: the tree is exponential, so almost every
-//     interior node already sits below depth 3, and widening to 8 reaches only the sparse nodes at
-//     depths 4-8.
+//   * **ceiling 3 → 8 does nothing at all.** Whole suite green, and the node ratio on a
+//     persistent-table sequence is **indistinguishable from zero, with the sign unresolved**:
+//     +0.2 % on the sample measured on 2026-09-08, −0.7 % on a second sample of six sequences
+//     measured in review on 2026-09-10, whose six ratios all went the other way (total 0.9928,
+//     cold table 0.9916). Both readings sit inside the blank, so the decision — the ceiling is
+//     worth nothing and stays at 3 — is the same either way.
+//
+//     **The direction is deliberately not claimed**, and the earlier wording did claim it
+//     ("0.2 % the wrong way"). A sub-blank number given a decimal and a direction reads as a fact
+//     about the change, and a later reader weighing whether to revisit this constant would be
+//     told it made things slightly worse when the evidence says only that it does nothing. Same
+//     shape as the two present-tense branching factors deleted from this file on 2026-09-09.
+//
+//     The reason it does nothing is structural and was measured on the way: the tree is
+//     exponential, so almost every interior node already sits below depth 3, and widening to 8
+//     reaches only the sparse nodes at depths 4-8.
 //
 // So this constant stays at 3, and the audit's 0.814 belonged entirely to the margin it also
 // changed — which is what varying two things at once costs.
