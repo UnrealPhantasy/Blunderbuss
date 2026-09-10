@@ -523,7 +523,7 @@ pub fn evaluate(pos: &Position) -> i32 {
 /// a passed-looking central pawn is a middlegame asset, and an advanced pawn in an endgame
 /// is a promotion in the making. One shared table could say only one of the two.
 ///
-/// Mean over the squares a pawn can occupy: **100 cp in the middlegame, 111 in the endgame**, of which 105 is carried by `value()`.
+/// Mean over the squares a pawn can occupy: **114 cp in the middlegame, 111 in the endgame**, of which 105 is carried by `value()`.
 #[rustfmt::skip]
 const PAWN_MG: [i32; 64] = [
       0,   0,   0,   0,   0,   0,   0,   0, // rank 1 (a pawn can never stand here)
@@ -549,7 +549,7 @@ const PAWN_EG: [i32; 64] = [
 /// A knight is a middlegame piece: it needs outposts and support points, and an endgame
 /// with pawns on both wings is where it is worst. The two tables differ mostly in level.
 ///
-/// Mean over the squares a knight can occupy: **317 cp in the middlegame, 278 in the endgame**, of which 298 is carried by `value()`.
+/// Mean over the squares a knight can occupy: **307 cp in the middlegame, 278 in the endgame**, of which 298 is carried by `value()`.
 #[rustfmt::skip]
 const KNIGHT_MG: [i32; 64] = [
     -28, -18,  -8,  -8,  -8,  -8, -18, -28, // rank 1
@@ -575,7 +575,7 @@ const KNIGHT_EG: [i32; 64] = [
 /// A bishop gains as the board empties, which is the classic bishop-versus-knight
 /// asymmetry; here it is read off the corpus rather than asserted.
 ///
-/// Mean over the squares a bishop can occupy: **266 cp in the middlegame, 333 in the endgame**, of which 299 is carried by `value()`.
+/// Mean over the squares a bishop can occupy: **328 cp in the middlegame, 333 in the endgame**, of which 299 is carried by `value()`.
 #[rustfmt::skip]
 const BISHOP_MG: [i32; 64] = [
     11, 21, 21, 21, 21, 21, 21, 11, // rank 1
@@ -601,7 +601,7 @@ const BISHOP_EG: [i32; 64] = [
 /// A rook wants open files in the middlegame and the seventh rank at any time; its
 /// endgame level is the one that moves most against the hand-made table.
 ///
-/// Mean over the squares a rook can occupy: **511 cp in the middlegame, 515 in the endgame**, of which 513 is carried by `value()`.
+/// Mean over the squares a rook can occupy: **500 cp in the middlegame, 515 in the endgame**, of which 513 is carried by `value()`.
 #[rustfmt::skip]
 const ROOK_MG: [i32; 64] = [
     -13, -13, -13,  -8,  -8, -13, -13, -13, // rank 1
@@ -627,7 +627,7 @@ const ROOK_EG: [i32; 64] = [
 /// A queen is worth close to the same everywhere — which is itself worth knowing, since
 /// it means the piece the taper cannot help is the one it was least needed for.
 ///
-/// Mean over the squares a queen can occupy: **954 cp in the middlegame, 958 in the endgame**, of which 956 is carried by `value()`.
+/// Mean over the squares a queen can occupy: **897 cp in the middlegame, 958 in the endgame**, of which 956 is carried by `value()`.
 #[rustfmt::skip]
 const QUEEN_MG: [i32; 64] = [
     -76, -66, -66, -61, -61, -66, -66, -76, // rank 1
@@ -650,14 +650,27 @@ const QUEEN_EG: [i32; 64] = [
       -6,  -21,   41,   31,   36,   71,    8,   62,
      -59,  -37,  -30,  -20,  -18,  -20,  -27,  -24, // rank 8
 ];
-/// The king is the piece the old code already tapered, and the only one whose table is
-/// **zero-mean by construction**: both sides always have exactly one king, so adding a
-/// constant to all 64 squares adds `+C` for White and `-C` for Black and cancels. The
-/// loss is therefore exactly flat along that direction, and an ungauged fit drifts along
-/// it on noise alone. Re-centring changes no evaluation and makes the table readable as
-/// "this square against the average square".
+/// The king is the piece the old code already tapered, and the only one carrying a **free
+/// gauge**: both sides always have exactly one king, so adding a constant to all 64 squares
+/// adds `+C` for White and `-C` for Black and cancels. The loss is therefore exactly flat
+/// along that direction, an ungauged fit drifts along it on noise alone, and re-centring
+/// changes no evaluation while making the table readable as "this square against the average
+/// square".
 ///
-/// Mean over the squares a king can occupy: **-23 cp in the middlegame, -10 in the endgame** (the king carries no material value).
+/// **`KING_EG` sums to exactly zero. `KING_MG` sums to 12, and it cannot do better.** The
+/// fitted endgame table is emitted zero-sum: it is new, so the rounding residual can be spread
+/// over the squares nearest a tie at no cost. The middlegame table is the hand-made one and
+/// must not move square-against-square, so the only gauge available to it is a **uniform
+/// integer shift** — and no uniform integer shift zeroes it, because the original sums to
+/// −1460 and −1460 is not a multiple of 64. The shift applied is +23, leaving 12, or **0.19 cp
+/// per square**.
+///
+/// Spreading that residual is the trap, not the fix: it moves individual squares by 1 cp
+/// *relative to each other*, which is exactly what the gauge must not do. Measured while
+/// building the write-back control — forcing the sum with a spread residual made `evaluate()`
+/// differ on **29 766 of 265 248** positions, against zero for a uniform shift.
+///
+/// Mean over the squares a king can occupy: **0 cp in the middlegame, 0 in the endgame** (the king carries no material value).
 #[rustfmt::skip]
 const KING_MG: [i32; 64] = [
      43,  53,  33,  23,  23,  33,  53,  43, // rank 1
@@ -878,6 +891,39 @@ mod tests {
             queens * 4,
         );
         assert_eq!(phase(&many), MAX_PHASE, "the phase must never exceed its maximum");
+    }
+
+    #[test]
+    fn the_king_tables_carry_no_arbitrary_offset() {
+        // **The gauge, asserted rather than described.** A constant added to all 64 squares of a
+        // king table cancels between the two sides, so it is free — and an ungauged fit parks it
+        // anywhere. The hand-made tables carried −22.8 there, which reads as a fact about kings
+        // and is not one.
+        //
+        // Two different claims, because two different things are attainable. `KING_EG` is fitted
+        // and new, so its rounding residual can be spread and it is emitted **exactly**
+        // zero-sum. `KING_MG` is the hand-made table and must not move square-against-square, so
+        // its only gauge is a uniform integer shift; the original sums to −1460, which is not a
+        // multiple of 64, so **no uniform shift reaches zero**. The reachable claim is that the
+        // residual is smaller than one full shift, i.e. at most 32 — it is 12, or 0.19 cp a
+        // square.
+        assert_eq!(
+            KING_EG.iter().sum::<i32>(),
+            0,
+            "the fitted king table is emitted zero-sum; it is not",
+        );
+        let mg: i32 = KING_MG.iter().sum();
+        assert!(
+            mg.abs() <= 32,
+            "the middlegame king table's offset must be under one uniform shift: it sums to {mg}",
+        );
+        // And the residual is what it is by *rounding*, not by choice: shifting the whole table
+        // by one more centipawn either way must not get closer to zero. Without this the bound
+        // above would pass on a table nobody had gauged at all.
+        assert!(
+            (mg - 64).abs() > mg.abs() && (mg + 64).abs() > mg.abs(),
+            "a uniform shift of one more centipawn would centre this table better: {mg}",
+        );
     }
 
     #[test]
