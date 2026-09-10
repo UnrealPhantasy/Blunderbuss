@@ -245,7 +245,7 @@ const PAWNLESS_WIN_THRESHOLD: i32 = 500;
 /// median edge of +320 cp, and the most frequent final positions were a lone knight or a lone
 /// bishop against a bare king. `evaluate` was returning about +320 for those, so the search walked
 /// into them and then shuffled until the threefold repetition — 55% of all our draws.
-fn cannot_mate(pos: &Position, pawns: [u64; 2], balance: i32) -> bool {
+fn cannot_mate(pos: &Position, pawns: [u64; 2]) -> bool {
     // **No pawn anywhere on the board**, and the restriction is measured rather than cautious.
     // A first version asked only that the *strong* side be pawnless, which also caught a rook
     // against three pawns — an edge of 200 cp that is nothing like drawn, and three existing
@@ -256,7 +256,28 @@ fn cannot_mate(pos: &Position, pawns: [u64; 2], balance: i32) -> bool {
     if pawns[0] != 0 || pawns[1] != 0 {
         return false;
     }
-    let strong = if balance > 0 { Color::White } else { Color::Black };
+    // **The edge in MATERIAL, and not the tapered balance the caller is holding.** The
+    // threshold below is a statement about what the pieces can *do* — "a rook is the
+    // threshold because K+R against K is a win" — while the caller's balance also carries
+    // the two kings' square values and the phase interpolation. The two part company
+    // exactly where it matters: measured on this file before the tables were retuned,
+    // `8/8/8/3k4/8/8/8/K6R w` — a forced win — scored **52 cp**, because a bare king on d5
+    // and ours in the corner pushed the balance under 500 and the divisor fired. Widening
+    // the king tables made it fire on nearly every K+R against K, which is how it was
+    // found; but it was already firing before, and on `main`.
+    //
+    // Rust idiom: `iter().map(..).sum()` over a fixed array rather than four additions, so
+    // adding a piece type cannot be forgotten in one of the two places it appears. Pawns
+    // are not in the list because this function has already returned unless the board is
+    // pawnless.
+    let material: i32 = [Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen]
+        .iter()
+        .map(|&piece| {
+            value(piece)
+                * (pos.count(Color::White, piece) as i32 - pos.count(Color::Black, piece) as i32)
+        })
+        .sum();
+    let strong = if material > 0 { Color::White } else { Color::Black };
     // Rust idiom: `!color` is the `Not` operator cozy-chess implements on `Color`, so this reads as
     // "the other side" rather than as a match on two variants.
     let weak = !strong;
@@ -290,7 +311,7 @@ fn cannot_mate(pos: &Position, pawns: [u64; 2], balance: i32) -> bool {
     {
         return false;
     }
-    if balance.abs() < PAWNLESS_WIN_THRESHOLD {
+    if material.abs() < PAWNLESS_WIN_THRESHOLD {
         return true;
     }
     // Two knights and a bare king is the one drawn position above the threshold: 640 cp of
@@ -399,7 +420,7 @@ pub fn evaluate(pos: &Position) -> i32 {
     let scaling_on = SCALING.with(|s| s.get());
     #[cfg(not(test))]
     let scaling_on = true;
-    if scaling_on && cannot_mate(pos, pawns, balance) {
+    if scaling_on && cannot_mate(pos, pawns) {
         balance /= DRAWISH_DIVISOR;
     }
 
@@ -1249,10 +1270,23 @@ mod tests {
         // The control, and it is what stops the rule from being a wider net than the measurement
         // asked for. B+N against a bare king is a genuine win — long and technical, but a win —
         // and a factor that flattened it would throw away real games. Same for a rook.
+        //
+        // **The last three are where the rule used to break, and they broke on `main`.** The
+        // verdict was read off the *tapered* balance, which carries the two kings' square
+        // values as well as the material; a bare king in the centre and ours in a corner
+        // pushed a rook's edge under the 500 cp threshold and the divisor fired on a forced
+        // win. `8/8/8/3k4/8/8/8/K6R w` scored **52 cp** before `cannot_mate` was made to read
+        // material instead. Found while retuning the tables — widening the king tables made
+        // it fire on nearly every K+R against K rather than on the awkward ones — but the
+        // defect predates the retuning, which is why these cases are pinned here and not in
+        // the retuning's own tests.
         for (fen, name) in [
             ("4k3/8/8/8/8/8/8/1B1NK3 w - - 0 1", "K+B+N against K"),
             ("4k3/8/8/8/8/8/8/3RK3 w - - 0 1", "K+R against K"),
             ("4k3/8/8/8/8/8/8/3QK3 w - - 0 1", "K+Q against K"),
+            ("8/8/8/3k4/8/8/8/K6R w - - 0 1", "K+R against a centralised bare king"),
+            ("7k/8/8/8/8/8/8/R3K3 w - - 0 1", "K+R against K, kings far apart"),
+            ("8/8/8/3k4/8/8/8/KQ6 w - - 0 1", "K+Q against a centralised bare king"),
         ] {
             let p = Position::from_fen(fen).unwrap();
             assert!(
