@@ -175,10 +175,14 @@ impl Default for Killers {
 /// all. Sharing one table would have each side ranking its moves on the other's
 /// evidence.
 pub struct History {
-    /// `[colour][from][to]`. 8 KB, allocated once per search.
+    /// `[colour][from][to]`: 2 x 64 x 64 counters of `i32`, so **32 KB**, allocated once per
+    /// search. The arithmetic is spelled out because the figure was wrong here — it read 8 KB,
+    /// which is what this table would weigh with a one-byte counter, and a size claim nobody
+    /// can recompute from the line above it is a claim nobody checks.
     ///
     /// Idiom: a fixed-size nested array rather than a `HashMap` — the index is
     /// always in range, so there is nothing to look up and nothing to allocate.
+    /// `Box` because 32 KB has no business on the stack of a recursive search.
     counts: Box<[[[i32; 64]; 64]; 2]>,
 }
 
