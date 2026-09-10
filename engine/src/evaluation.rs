@@ -881,6 +881,88 @@ mod tests {
     }
 
     #[test]
+    fn the_endgame_tables_are_worth_something_different_from_the_middlegame_ones() {
+        // **The only guard on five of the six fitted tables, and it was missing.** Rewiring the
+        // five non-king entries of [`PST_ENDGAME`] to the middlegame arrays — undoing everything
+        // this file was retuned for except the king — left **all 249 tests in this crate
+        // green**. The two tests that catch the six-way rewiring are both king tests, so pawn,
+        // knight, bishop, rook and queen shipped with nothing watching them.
+        //
+        // What is asserted is the property the work was undertaken for and not the numbers it
+        // produced: a knight is worth clearly less once the board empties, a rook clearly more.
+        // Both are old chess and both are what a re-fit should reproduce; a re-fit that reverses
+        // either has said something worth stopping for.
+        //
+        // Measured on the shipped tables, `value(piece)` plus the mean over the squares the
+        // piece can occupy:
+        //
+        // | piece  | middlegame | endgame | delta |
+        // |--------|-----------:|--------:|------:|
+        // | pawn   |      113.8 |   110.6 |  −3.2 |
+        // | knight |      307.3 |   278.5 | −28.9 |
+        // | bishop |      327.8 |   332.9 |  +5.0 |
+        // | rook   |      500.5 |   514.5 | +14.1 |
+        // | queen  |      897.1 |   958.0 | +60.9 |
+        //
+        // Only the knight and the rook are asserted. The bishop's +5.0 is inside what a re-fit
+        // could move without meaning anything, and the queen's +60.9, while large and in the
+        // direction an opening board suggests, is not a claim this project has ever measured.
+        // Naming them here without asserting them is the point: the table is the record, the
+        // assertions are the contract.
+        //
+        // **The pawn goes the other way, and that is not the fit disagreeing with the chess.**
+        // The endgame value of a pawn went into [`PASSED_ENDGAME`], which moved from
+        // `[0, 8, 13, 21, 36, 60, 90, 0]` to `[0, 20, 12, 42, 66, 110, 138, 0]` — the base table
+        // stayed level and the passer schedule took the increase. Counted together, which is how
+        // the evaluation counts them, a pawn *is* worth clearly more in an endgame, and the last
+        // assertion below says so. This is the double-count hazard that ruled out borrowing
+        // PeSTO's tables, landing the right way round: a term this engine has separately must
+        // not be paid for twice.
+        // **Read through `PST_MIDDLEGAME` / `PST_ENDGAME`, never through the named
+        // constants.** A first draft of this test indexed `KNIGHT_EG` directly and stayed green
+        // under the very rewiring it was written to catch — the arrays are what `evaluate`
+        // reads, and the constants are only what they are built from. The same trap caught
+        // `the_endgame_king_table_peaks_in_the_centre_and_bottoms_in_the_corners`, which reads
+        // the constant on purpose because it is a claim about the table's shape; this one is a
+        // claim about what the evaluation does, so it goes through the wiring.
+        let piece_value = |tables: &[[i32; 64]; 6], piece: Piece| {
+            let table = &tables[piece as usize];
+            let squares: &[i32] = if piece == Piece::Pawn { &table[8..56] } else { &table[..] };
+            value(piece) + squares.iter().sum::<i32>() / squares.len() as i32
+        };
+        let knight = (
+            piece_value(&PST_MIDDLEGAME, Piece::Knight),
+            piece_value(&PST_ENDGAME, Piece::Knight),
+        );
+        assert!(
+            knight.1 + 15 < knight.0,
+            "a knight must be worth clearly less in an endgame: {} against {}",
+            knight.1,
+            knight.0,
+        );
+        let rook = (
+            piece_value(&PST_MIDDLEGAME, Piece::Rook),
+            piece_value(&PST_ENDGAME, Piece::Rook),
+        );
+        assert!(
+            rook.1 > rook.0,
+            "a rook must be worth more in an endgame: {} against {}",
+            rook.1,
+            rook.0,
+        );
+        // The pawn, counted with the passer schedule that carries its endgame value. Rank 5 of
+        // the schedule rather than the whole of it: one rank a pawn genuinely reaches, so the
+        // claim is about a position and not about an average.
+        let pawn_mg = piece_value(&PST_MIDDLEGAME, Piece::Pawn) + PASSED_MIDDLEGAME[4];
+        let pawn_eg = piece_value(&PST_ENDGAME, Piece::Pawn) + PASSED_ENDGAME[4];
+        assert!(
+            pawn_eg > pawn_mg + 15,
+            "a passed pawn must be worth clearly more in an endgame, base and schedule \
+             together: {pawn_eg} against {pawn_mg}",
+        );
+    }
+
+    #[test]
     fn the_endgame_king_table_peaks_in_the_centre_and_bottoms_in_the_corners() {
         // A structural check on the table itself, not on a position. A table entered
         // upside down, or shifted by a rank, still produces a plausible-looking
