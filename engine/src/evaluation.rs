@@ -1323,23 +1323,32 @@ mod tests {
         // Indices 0 and 7 are excluded: a pawn cannot stand on the first rank, and one that
         // reaches the eighth is no longer a pawn — both are zero by construction.
         //
-        // **Why the run starts at index 2 and not at index 1.** The two schedules are no
-        // longer a curve chosen on their own: they are fitted jointly with PAWN_MG / PAWN_EG,
-        // which are indexed by rank as well, so for a given square only the *sum* of the two
-        // is identified and the split between them is a presentation choice. Index 1 — a pawn
-        // still on its starting rank — is where that split is worst determined: such a pawn is
-        // rarely already passed, and it is the one entry the term is not about, since it is
-        // not running anywhere yet. As fitted in September 2026 the schedule steps *down*
-        // there, in both phases, and that is the only downward step either of them has.
+        // **Why one schedule starts its run at index 2 and the other at index 1.** The two are
+        // no longer a curve chosen on their own: they are fitted jointly with the pawn tables,
+        // which are indexed by rank as well, so for a given square only the *sum* is identified
+        // and the split between them is a presentation choice. Index 1 — a pawn still on its
+        // starting rank — is where that split is worst determined: such a pawn is rarely already
+        // passed, and it is the one entry the term is not about, since it is not running
+        // anywhere yet.
+        //
+        // As fitted in September 2026, `PASSED_ENDGAME` steps *down* there, 20 -> 12, and that
+        // is the only downward step it has. `PASSED_MIDDLEGAME` was not fitted — it is the
+        // hand-made schedule, byte for byte — and it steps *up*, 5 -> 10, so it keeps the full
+        // run from index 1 and gives up nothing. Exempting both would have been a schedule
+        // surrendering a check it satisfies, on a ground untrue of it.
+        //
         // Everything from the third rank on — the whole range in which "closer to promotion"
-        // means anything — still grows at every single step, which is the property this test
-        // exists for. The exempted entry is not left unchecked: the three assertions after the
-        // loop keep it from drifting into nonsense.
-        for table in [PASSED_MIDDLEGAME, PASSED_ENDGAME] {
-            for rank in 2..6 {
+        // means anything — grows at every single step in both. The exempted entry is not left
+        // unchecked: the three assertions after the loop keep it from drifting into nonsense,
+        // and they hold on both schedules.
+        for (name, table, first) in [
+            ("PASSED_MIDDLEGAME", PASSED_MIDDLEGAME, 1),
+            ("PASSED_ENDGAME", PASSED_ENDGAME, 2),
+        ] {
+            for rank in first..6 {
                 assert!(
                     table[rank + 1] > table[rank],
-                    "rank {rank} -> {} went {} -> {}",
+                    "{name} rank {rank} -> {} went {} -> {}",
                     rank + 1,
                     table[rank],
                     table[rank + 1],
@@ -1349,7 +1358,8 @@ mod tests {
             // not moved, whatever the fit did to the step between the first two entries.
             assert!(
                 table[4] > table[1],
-                "a passer on the fifth rank ({}) must beat one still on its starting rank ({})",
+                "{name}: a passer on the fifth rank ({}) must beat one still on its \
+                 starting rank ({})",
                 table[4],
                 table[1],
             );
@@ -1357,8 +1367,8 @@ mod tests {
             // the top of the schedule — noise at the least-observed entry, not a second slope.
             assert!(
                 table[1] - table[2] < table[6] - table[5],
-                "the dip off the starting rank ({} -> {}) is no longer smaller than the last \
-                 stride ({} -> {})",
+                "{name}: the dip off the starting rank ({} -> {}) is no longer smaller than \
+                 the last stride ({} -> {})",
                 table[1],
                 table[2],
                 table[5],
@@ -1369,11 +1379,11 @@ mod tests {
             // into a penalty would satisfy every check above.
             assert!(
                 table[6] > 0,
-                "a passer one rank from promoting is scored {}",
+                "{name}: a passer one rank from promoting is scored {}",
                 table[6],
             );
-            assert_eq!(table[0], 0, "a pawn cannot stand on the first rank");
-            assert_eq!(table[7], 0, "a pawn on the eighth rank has already promoted");
+            assert_eq!(table[0], 0, "{name}: a pawn cannot stand on the first rank");
+            assert_eq!(table[7], 0, "{name}: a pawn on the eighth rank has already promoted");
         }
     }
 
