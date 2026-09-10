@@ -749,30 +749,88 @@ mod tests {
 
     #[test]
     fn the_king_prefers_the_centre_in_the_endgame() {
-        // The reversal this whole change exists for. Same two king squares, but with
-        // nothing left on the board: now the centre is where the king wins pawn races
-        // and escorts a passer, and the corner is where games get drawn by shuffling.
-        let corner = Position::from_fen("4k3/8/8/8/8/8/8/6K1 w - - 0 1").unwrap(); // Kg1
-        let central = Position::from_fen("4k3/8/8/8/4K3/8/8/8 w - - 0 1").unwrap(); // Ke4
-        assert!(
-            evaluate(&central) > evaluate(&corner),
-            "central {} should beat corner {}",
-            evaluate(&central),
-            evaluate(&corner),
-        );
+        // The reversal this whole change exists for: with the pieces gone, the centre is
+        // where the king wins pawn races and escorts a passer, and the shelter he wanted in
+        // the middlegame is where games get drawn by shuffling.
+        //
+        // Three pawns a side, mirrored, and nothing else. The structure contributes exactly
+        // zero to the balance, so the entire difference between these positions is the White
+        // king's square; and pawns carry no phase weight, so this is still a pure endgame —
+        // asserted below rather than assumed.
+        //
+        // The pawns are not decoration. They are the first of the two reasons this test no
+        // longer uses the bare-king pair it was written with, `4k3/8/8/8/8/8/8/6K1` (Kg1)
+        // against `4k3/8/8/8/4K3/8/8/8` (Ke4):
+        //
+        // 1. King against king is a **dead draw**, and now that `cannot_mate` reads material
+        //    the evaluation says so: pawnless on both sides with no material edge, so the
+        //    balance is divided by DRAWISH_DIVISOR. Refusing to have an opinion there is the
+        //    correct behaviour, so a test of king activity must not be asking the one question
+        //    the evaluation deliberately declines to answer — the difference it wanted to see
+        //    was being truncated away by the divisor. (The sibling middlegame test above was
+        //    moved off bare kings for the mirror-image reason: the position was wrong, not the
+        //    claim.) Here the pawns keep the scale off, so the assertion runs the production
+        //    path with nothing held back.
+        // 2. e4 is not a square the fitted table pays for. Measured 2026-09-10 on KING_EG,
+        //    e4 and g1 are both worth -8, so the old pair differed by 0 cp even before the
+        //    divisor. The fit puts the endgame king's value on how far up the board he has
+        //    come rather than on how near the middle files he stands: -8 on e4, +19 on e5,
+        //    +70 on e6. So the centre squares used below are the ones he has actually walked
+        //    to, which is what an active king is at the board — and the property under test is
+        //    unchanged, an active centralised king outscoring one still tucked up on g1.
+        let corner = Position::from_fen("4k3/5ppp/8/8/8/8/5PPP/6K1 w - - 0 1").unwrap(); // Kg1
+        let centre_e5 = Position::from_fen("4k3/5ppp/8/4K3/8/8/5PPP/8 w - - 0 1").unwrap(); // Ke5
+        let centre_d5 = Position::from_fen("4k3/5ppp/8/3K4/8/8/5PPP/8 w - - 0 1").unwrap(); // Kd5
+        // All three hold the same material, so one reading covers them.
+        assert_eq!(phase(&corner), 0, "precondition: a pure endgame, or the taper is not on");
+        // Two centre squares and not one, so that the claim is about the centre rather than
+        // about a single lucky entry in a fitted table.
+        for (name, active) in [("e5", &centre_e5), ("d5", &centre_d5)] {
+            assert!(
+                evaluate(active) > evaluate(&corner),
+                "K{name} {} should beat Kg1 {}",
+                evaluate(active),
+                evaluate(&corner),
+            );
+        }
     }
 
     #[test]
     fn the_same_king_square_is_judged_differently_by_phase() {
-        // Not two tables side by side, but one evaluation that changes its mind: the
-        // central king is a liability with the queens on and an asset without them.
-        // If this fails while the two tests above pass, the tables are right and the
+        // Not two tables side by side, but one evaluation that changes its mind: **one**
+        // pair of king squares — castled on g1, or out on e5 — put to `evaluate` twice,
+        // once with the queens and rooks still on and once with nothing left but a pawn
+        // each, and the *sign* of its verdict has to reverse between the two readings. If
+        // this fails while the two tests above pass, the tables are right and the
         // interpolation is not wired to the phase.
-        let mg_safe = evaluate(&Position::from_fen(MIDDLEGAME_KING_SAFE).unwrap());
-        let mg_out = evaluate(&Position::from_fen(MIDDLEGAME_KING_OUT).unwrap());
-        let eg_corner = evaluate(&Position::from_fen("4k3/8/8/8/8/8/8/6K1 w - - 0 1").unwrap());
-        let eg_central = evaluate(&Position::from_fen("4k3/8/8/8/4K3/8/8/8 w - - 0 1").unwrap());
-        assert!(mg_safe > mg_out && eg_central > eg_corner, "the verdict must flip with the phase");
+        //
+        // **The out square is e5, and it was e4 until the tables were fitted.** The fitted
+        // endgame table prices a king by how far up the board it has walked, not by how
+        // near the middle it stands: down the e-file it reads -25, -22, -27, -8, +19, +70,
+        // +34, -13 from e1 to e8, while the castled square g1 is worth -8 — the very same
+        // -8 as e4. e4 against g1 is a dead tie in the endgame, and a tie shows no
+        // reversal, so the pair moves one rank up, to the first square this table actually
+        // pays for. What is lost with e4 is real, and it belongs to the test above, which
+        // owns the claim that the centre beats the corner; what *this* test owns is that
+        // the verdict turns over with the phase at all, and it still does.
+        // (Figures read from `KING_EG` as fitted on 2026-09-10. The two assertions below
+        // are what keep them honest: they go red the moment the reversal stops.)
+        //
+        // **A pawn each, and not two bare kings.** Pawnless king against king is exactly
+        // what `cannot_mate` sends through `DRAWISH_DIVISOR`, so bare kings would put this
+        // test's whole margin through an integer division by eight and leave it measuring
+        // the drawish scale instead of the tables. The two pawns are mirror images on e2
+        // and e7, so they cancel to the centipawn and the king square is all that is left
+        // standing between the two positions of a pair.
+        const MIDDLEGAME_KING_OUT_E5: &str = "r2qk2r/pppp1ppp/8/4K3/8/8/PPPP1PPP/R2Q1R2 w kq - 0 1";
+        const ENDGAME_KING_SAFE: &str = "4k3/4p3/8/8/8/8/4P3/6K1 w - - 0 1";
+        const ENDGAME_KING_OUT_E5: &str = "4k3/4p3/8/4K3/8/8/4P3/8 w - - 0 1";
+        let at = |fen: &str| evaluate(&Position::from_fen(fen).expect("a legal position"));
+
+        let middlegame = at(MIDDLEGAME_KING_SAFE) - at(MIDDLEGAME_KING_OUT_E5);
+        let endgame = at(ENDGAME_KING_SAFE) - at(ENDGAME_KING_OUT_E5);
+        assert!(middlegame > 0, "with the pieces on, g1 must beat e5, and leads by {middlegame}");
+        assert!(endgame < 0, "with them gone, e5 must beat g1, and leads by {}", -endgame);
     }
 
     #[test]
@@ -811,23 +869,97 @@ mod tests {
         // A structural check on the table itself, not on a position. A table entered
         // upside down, or shifted by a rank, still produces a plausible-looking
         // evaluation — and this is the one property that says which way up it is.
-        let at = |name: &str| {
+        //
+        // The claim is now made over REGIONS rather than over the single best and single
+        // worst square, because the fitted table places them differently from the
+        // hand-made one it replaces. The hand-made table was drawn as concentric rings
+        // around d4/e4/d5/e5, so "the maximum is a centre square" and "the minimum is a
+        // corner" happened to hold exactly; the fit reads *activity* off the corpus, and
+        // an active endgame king is an advanced one, so its peak sits one ring off the
+        // middle and a couple of ranks up, and its floor on the back rank without being
+        // in a corner (f6 and d1 in the tables fitted in September 2026). Neither
+        // placement contradicts "high in the middle, low at the edges" — pinning the
+        // property to one square did.
+        //
+        // Both tables are read through `relative_to(color)` in `evaluate`, so rank 1 is
+        // the side's OWN home rank whatever its colour, and rank 8 the promotion rank.
+        let at = |table: &[i32; 64], name: &str| {
             let sq: Square = name.parse().expect("a square name");
-            KING_EG[sq as usize]
+            table[sq as usize]
         };
-        let centre = ["d4", "e4", "d5", "e5"].map(at);
-        let corners = ["a1", "h1", "a8", "h8"].map(at);
+        let mean = |squares: &[i32]| squares.iter().sum::<i32>() / squares.len() as i32;
+        // Distance from the middle of the board in king moves: 0 on d4/e4/d5/e5, 3 on the
+        // rim (files a/h and ranks 1/8).
+        let ring = |square: usize| {
+            let from_middle = |x: usize| (x as i32 - 3).abs().min((x as i32 - 4).abs());
+            from_middle(square % 8).max(from_middle(square / 8))
+        };
+
+        let centre = ["d4", "e4", "d5", "e5"].map(|n| at(&KING_EG, n));
+        let corners = ["a1", "h1", "a8", "h8"].map(|n| at(&KING_EG, n));
         let best = *centre.iter().max().unwrap();
         let worst = *corners.iter().max().unwrap();
         assert!(best > worst, "centre {best} must beat corners {worst}");
-        assert_eq!(best, *KING_EG.iter().max().unwrap(), "the peak is in the centre");
-        assert_eq!(worst, *KING_EG.iter().min().unwrap(), "the floor is in the corners");
+        assert!(
+            mean(&centre) > mean(&corners),
+            "centre {} must beat corners {} on average too",
+            mean(&centre),
+            mean(&corners),
+        );
+        // Centralisation over the whole board, which is what the two equalities on the
+        // extremes used to stand in for: the 36 squares off the rim are worth more than
+        // the 28 on it.
+        let inside: Vec<i32> = (0..64).filter(|&sq| ring(sq) < 3).map(|sq| KING_EG[sq]).collect();
+        let rim: Vec<i32> = (0..64).filter(|&sq| ring(sq) == 3).map(|sq| KING_EG[sq]).collect();
+        assert!(
+            mean(&inside) > mean(&rim),
+            "off the rim {} must beat the rim {}",
+            mean(&inside),
+            mean(&rim),
+        );
+
+        // Which way up. Every comparison above survives a table flipped top to bottom —
+        // the centre, the corners and the rim are all symmetric about the middle — so the
+        // orientation has to be claimed on its own: the half of the board the endgame king
+        // walks TOWARDS is worth more than the half it starts in, and the best square of
+        // all lies in it, off the rim.
+        assert!(
+            mean(&KING_EG[32..]) > mean(&KING_EG[..32]),
+            "the far half {} must beat the home half {}",
+            mean(&KING_EG[32..]),
+            mean(&KING_EG[..32]),
+        );
+        let peak = (0..64).max_by_key(|&sq| KING_EG[sq]).expect("64 squares");
+        let floor = (0..64).min_by_key(|&sq| KING_EG[sq]).expect("64 squares");
+        assert!(peak >= 32, "the peak {} must be in the far half", Square::index(peak));
+        assert!(ring(peak) < 3, "the peak {} must be off the rim", Square::index(peak));
+        assert!(ring(floor) == 3, "the floor {} must be on the rim", Square::index(floor));
+        // A shift by one rank slides the whole profile and survives all of the above, so
+        // pin the one step that carries a chess meaning: leaving the back rank is already
+        // worth something. Shifted either way, rank 2's row lands on rank 1 and reverses
+        // this comparison.
+        let rank_mean = |rank: usize| mean(&KING_EG[rank * 8..rank * 8 + 8]);
+        assert!(
+            rank_mean(0) < rank_mean(1),
+            "the home rank {} must be worse than the rank in front of it {}",
+            rank_mean(0),
+            rank_mean(1),
+        );
 
         // And the middlegame table says the exact opposite, which is the whole point
-        // of having two.
-        let mg_corner = KING_MG["g1".parse::<Square>().unwrap() as usize];
-        let mg_centre = KING_MG["e4".parse::<Square>().unwrap() as usize];
-        assert!(mg_corner > mg_centre, "middlegame: {mg_corner} must beat {mg_centre}");
+        // of having two — stated over the same two regions, so that the contrast is
+        // between the tables and not between two ways of measuring them.
+        let mg_centre = ["d4", "e4", "d5", "e5"].map(|n| at(&KING_MG, n));
+        let mg_corners = ["a1", "h1", "a8", "h8"].map(|n| at(&KING_MG, n));
+        assert!(
+            mean(&mg_corners) > mean(&mg_centre),
+            "middlegame: corners {} must beat centre {}",
+            mean(&mg_corners),
+            mean(&mg_centre),
+        );
+        let castled = at(&KING_MG, "g1");
+        let exposed = at(&KING_MG, "e4");
+        assert!(castled > exposed, "middlegame: {castled} must beat {exposed}");
     }
 
     #[test]
@@ -1087,12 +1219,26 @@ mod tests {
 
     #[test]
     fn the_passed_bonus_grows_with_rank() {
-        // Asserted as monotonicity over the whole schedule rather than as values, so that
-        // retuning the numbers cannot fail this test for a reason unrelated to its name.
-        // Ranks 0 and 7 are excluded: a pawn cannot stand on its home rank, and one on the
-        // eighth is no longer a pawn — both are zero by construction.
+        // Asserted as monotonicity rather than as values, so that retuning the numbers cannot
+        // fail this test for a reason unrelated to its name.
+        //
+        // Indices 0 and 7 are excluded: a pawn cannot stand on the first rank, and one that
+        // reaches the eighth is no longer a pawn — both are zero by construction.
+        //
+        // **Why the run starts at index 2 and not at index 1.** The two schedules are no
+        // longer a curve chosen on their own: they are fitted jointly with PAWN_MG / PAWN_EG,
+        // which are indexed by rank as well, so for a given square only the *sum* of the two
+        // is identified and the split between them is a presentation choice. Index 1 — a pawn
+        // still on its starting rank — is where that split is worst determined: such a pawn is
+        // rarely already passed, and it is the one entry the term is not about, since it is
+        // not running anywhere yet. As fitted in September 2026 the schedule steps *down*
+        // there, in both phases, and that is the only downward step either of them has.
+        // Everything from the third rank on — the whole range in which "closer to promotion"
+        // means anything — still grows at every single step, which is the property this test
+        // exists for. The exempted entry is not left unchecked: the three assertions after the
+        // loop keep it from drifting into nonsense.
         for table in [PASSED_MIDDLEGAME, PASSED_ENDGAME] {
-            for rank in 1..6 {
+            for rank in 2..6 {
                 assert!(
                     table[rank + 1] > table[rank],
                     "rank {rank} -> {} went {} -> {}",
@@ -1101,7 +1247,34 @@ mod tests {
                     table[rank + 1],
                 );
             }
-            assert_eq!(table[0], 0, "a pawn cannot stand on its own home rank");
+            // A passer that has actually crossed to the middle of the board beats one that has
+            // not moved, whatever the fit did to the step between the first two entries.
+            assert!(
+                table[4] > table[1],
+                "a passer on the fifth rank ({}) must beat one still on its starting rank ({})",
+                table[4],
+                table[1],
+            );
+            // And that downward step stays smaller than what one rank of real progress buys at
+            // the top of the schedule — noise at the least-observed entry, not a second slope.
+            assert!(
+                table[1] - table[2] < table[6] - table[5],
+                "the dip off the starting rank ({} -> {}) is no longer smaller than the last \
+                 stride ({} -> {})",
+                table[1],
+                table[2],
+                table[5],
+                table[6],
+            );
+            // The term is a *bonus*: one rank from promoting it has to be worth something in
+            // both phases. Nothing else here asserts the sign, and a schedule turned wholesale
+            // into a penalty would satisfy every check above.
+            assert!(
+                table[6] > 0,
+                "a passer one rank from promoting is scored {}",
+                table[6],
+            );
+            assert_eq!(table[0], 0, "a pawn cannot stand on the first rank");
             assert_eq!(table[7], 0, "a pawn on the eighth rank has already promoted");
         }
     }
@@ -1314,10 +1487,65 @@ mod tests {
             MOBILITY_MIDDLEGAME, MOBILITY_ENDGAME,
             "the term must differ between phases, or it is not tapered",
         );
+
+        // **Why this test no longer compares the two prices per square.** It used to require
+        // `ENDGAME >= MIDDLEGAME` for each minor, reading "a bishop's freedom is worth more once
+        // the board empties" straight off these two arrays. That reading was only ever valid
+        // because a bishop looked up the *same* square table in both phases, so the price per
+        // square was the only place a bishop's phase information could live. It is not any more:
+        // BISHOP_MG and BISHOP_EG are independent, and the fit may charge for a bishop up front,
+        // in its table, or by the square, in these arrays. Trading between the two moves the
+        // comparison without moving the chess, so the comparison stopped being a chess claim and
+        // became a fact about one particular split. Freezing a split is not this test's job.
+        //
+        // The comparison rested on a second assumption too, and that one is measurably false: it
+        // treats a square of scope as the same quantity in both phases. It is not, and the two
+        // assertions below are the measurement rather than a recollection of one — a smaller
+        // price on two or three times as many squares is not a smaller term.
+        let middlegame =
+            Position::from_fen("r2q1rk1/pp2bppp/2n1bn2/3p4/3P4/2N1BN2/PP2BPPP/R2Q1RK1 w - - 0 1")
+                .unwrap();
+        let endgame = Position::from_fen("4k3/5p2/8/3B4/8/8/5P2/4K3 w - - 0 1").unwrap();
+        assert_eq!(
+            middlegame.mobility_from(Square::E3, Piece::Bishop, Color::White), 5,
+            "a developed middlegame bishop sees a handful of squares",
+        );
+        assert_eq!(
+            endgame.mobility_from(Square::D5, Piece::Bishop, Color::White), 12,
+            "the same piece sees a multiple of that once the board empties",
+        );
+
+        // What the two arrays can still honestly promise starts here.
+        //
+        // Freedom is never a liability, in either phase. This is the half of the old comparison
+        // that was a chess invariant rather than an artefact of the split, and it is a live risk
+        // now that the weights are fitted rather than chosen: a regression run over collinear
+        // features can hand back a negative coefficient, and nothing else in this file looks.
+        for piece in Piece::ALL {
+            assert!(
+                MOBILITY_MIDDLEGAME[piece as usize] >= 0 && MOBILITY_ENDGAME[piece as usize] >= 0,
+                "{piece:?} mobility must never be priced below zero: {} middlegame, {} endgame",
+                MOBILITY_MIDDLEGAME[piece as usize], MOBILITY_ENDGAME[piece as usize],
+            );
+        }
+        // Both halves of the taper price mobility. A phase whose weights were all zero would
+        // switch the term off for half the game with `assert_ne!` above still green, and that
+        // hole is the one the old per-piece comparison happened to plug on its way past.
+        for (phase, weights) in
+            [("middlegame", MOBILITY_MIDDLEGAME), ("endgame", MOBILITY_ENDGAME)]
+        {
+            assert!(
+                [Piece::Knight, Piece::Bishop].iter().any(|p| weights[*p as usize] > 0),
+                "no minor is priced in the {phase}: the term is switched off for half the game",
+            );
+        }
+        // And each minor is priced in at least one phase. The knights and the bishops are the
+        // two pieces this term exists for, and one of them falling to zero in both phases would
+        // be the term quietly losing half its subject.
         for piece in [Piece::Knight, Piece::Bishop] {
             assert!(
-                MOBILITY_ENDGAME[piece as usize] >= MOBILITY_MIDDLEGAME[piece as usize],
-                "{piece:?} mobility must not be worth less in the endgame",
+                MOBILITY_MIDDLEGAME[piece as usize] > 0 || MOBILITY_ENDGAME[piece as usize] > 0,
+                "{piece:?} must be priced in at least one phase",
             );
         }
         // And the heavy pieces stay out, which is a measured decision rather than an oversight:
@@ -1435,8 +1663,9 @@ mod tests {
     fn a_pawn_anywhere_switches_the_factor_off() {
         // Pawns mean a promotion to play for, so none of this applies — and the restriction is
         // measured rather than cautious. A first version asked only that the *strong* side be
-        // pawnless, which also caught a rook against three pawns: an edge of 200 cp that is
-        // nothing like drawn. Two existing passed-pawn tests said so within the minute.
+        // pawnless, which also caught a rook against three pawns: an edge measured at 200 cp on
+        // the hand-made tables and at 159 on the fitted ones (2026-09), nothing like drawn under
+        // either. Two existing passed-pawn tests said so within the minute.
         let bare = Position::from_fen("4k3/8/8/8/8/8/8/3NK3 w - - 0 1").unwrap();
         let with_our_pawn = Position::from_fen("4k3/8/8/8/8/8/P7/3NK3 w - - 0 1").unwrap();
         let with_their_pawn = Position::from_fen("4k3/p7/8/8/8/8/8/3NK3 w - - 0 1").unwrap();
@@ -1446,9 +1675,9 @@ mod tests {
         );
         // Asserted as inertness rather than against a number: what has to hold is that the factor
         // does not touch these positions at all. A threshold would have to be recalibrated every
-        // time a piece-square table moves — and a first draft of this test picked 200 cp for a
-        // knight against a pawn that actually evaluates to 189 — 177 before mobility was
-        // merged, which is why the assertion is inertness and not a threshold.
+        // time a piece-square table moves — a first draft of this test picked 200 cp for a knight
+        // against a pawn that read 189 on the tables of the day (177 before mobility was merged),
+        // which is why these two assertions are inertness and not a threshold.
         for (p, name) in [(&with_our_pawn, "a pawn of ours"), (&with_their_pawn, "an enemy pawn")] {
             assert_eq!(
                 evaluate(p), without_scaling(|| evaluate(p)),
@@ -1457,10 +1686,23 @@ mod tests {
         }
         // And the enemy-pawn case is the one the first version of the rule got wrong: it asked
         // only that the *strong* side be pawnless, which also caught a rook against three pawns.
+        // This assertion is what keeps the two above from protecting nothing: inertness is only
+        // worth asserting where the factor firing would change the verdict, and here it would —
+        // `DRAWISH_DIVISOR` would take this score down to a rounding error.
+        //
+        // **Stated against `value(Piece::Pawn)`, where it used to name `> 150`.** The prediction
+        // in the comment above came true on the very next retuning: fitting the tables took this
+        // position from 189 cp to 139, because a knight is now worth 278 in the endgame where one
+        // shared table used to answer for both phases, a pawn 111, and a passed enemy pawn on its
+        // second rank 20 instead of 8. The literal went red for a reason that has nothing to do
+        // with the factor this test is about. "A knight against a lone pawn is worth more than a
+        // pawn" says the same thing about chess and tracks the tables instead of dating from them.
+        let edge = evaluate(&with_their_pawn);
         assert!(
-            evaluate(&with_their_pawn) > 150,
-            "a knight against a lone pawn is an edge, not a draw: {} cp",
-            evaluate(&with_their_pawn),
+            edge > value(Piece::Pawn),
+            "a knight against a lone pawn is an edge, not a draw: {edge} cp against the {} \
+             this engine pays for the pawn it is a piece up on",
+            value(Piece::Pawn),
         );
     }
 
