@@ -1979,40 +1979,80 @@ mod tests {
 
     #[test]
     fn an_improvement_found_before_the_interruption_is_kept() {
-        // The case this whole change exists for. Cut at 1 000 nodes: iterations 1 and 2
-        // complete (c1d1), iteration 3 finds h2h3 better and is then interrupted.
-        // Without keeping it, the engine plays c1d1 — the move a deeper search had just
-        // rejected — despite having already found the replacement.
+        // The case this whole change exists for: an iteration finds something better than the
+        // move the engine was about to play, and is interrupted before it can finish. Without
+        // keeping that find, the engine plays the move a deeper search had just rejected,
+        // despite having already found the replacement.
         let p = Position::from_fen(CHANGES_ITS_MIND).unwrap();
-        // **Swept, and stated without naming a move.** Two things move under this test's feet:
-        // a node ceiling counts nodes, so any change to the tree relocates the interruption; and
-        // *which* move a partial iteration prefers is a fact about today's evaluation. The first
-        // version pinned both — 1 000 nodes and `h2h3` — and adding a mobility term made the
-        // engine prefer a different improvement, at a different count, with the rescue working
-        // exactly as before.
+        // The deepest iteration a swept search may open, and how many interruptions to try
+        // inside each iteration. They are the only two numbers this test picks; every node
+        // count below is measured from the engine itself.
+        const DEEPEST: u32 = 6;
+        const PROBES: u64 = 24;
+
+        // **Three things move under this test's feet, and the shape below is what it takes to
+        // survive all three.** A node ceiling counts nodes, so any change to the tree relocates
+        // the interruption. *Which* move a partial iteration prefers is a fact about today's
+        // evaluation. And *which iteration* disagrees with its predecessor is a third — that is
+        // the one the fitted piece-square tables broke: an earlier version compared every
+        // interrupted search against the complete **depth-2** result, which silently assumed the
+        // engine changes its mind at depth 3 or later. Against the ladder dated on the fixture
+        // above, where the disagreement sits between depths 1 and 2, that comparison saw nothing
+        // at any ceiling and the test went red while the rescue worked exactly as designed.
         //
-        // What the rescue is worth, stated so that neither can break it: there exists an
-        // interruption at which the engine plays a move the last *complete* iteration would not
-        // have played. That is the whole claim — a better move found part-way through, kept.
-        let complete = search_cut_at(&p, 2, u64::MAX).0.best.map(|(mv, _)| p.move_to_uci(mv));
-        assert!(complete.is_some(), "precondition: the depth-2 search must return a move");
-        let rescued = (200..=6_000).step_by(50).find_map(|ceiling| {
-            let st = search_cut_at(&p, 6, ceiling).0;
-            let mv = st.best.map(|(mv, _)| p.move_to_uci(mv));
-            (mv.is_some() && mv != complete).then(|| (ceiling, mv.unwrap(), st.depth))
+        // What the rescue is worth, stated so that none of the three can break it: there exists
+        // an interruption at which the engine plays a move the last iteration it actually
+        // *completed* would not have played. The reference is that iteration, whichever one it
+        // turns out to be — never a fixed depth.
+
+        // What a complete search to each depth costs, and what it ends up playing. `deepen` runs
+        // the same iterations in the same order whatever its ceiling, so an interrupted search
+        // with `d` iterations behind it stands exactly where a complete depth-`d` search ends:
+        // `complete[d - 1]` is both the node count at which iteration `d + 1` opens and the
+        // verdict the interrupted search has to be judged against.
+        let complete: Vec<(u64, Option<String>)> = (1..=DEEPEST)
+            .map(|d| {
+                let stats = search_cut_at(&p, d, u64::MAX).0;
+                (stats.nodes, stats.best.map(|(mv, _)| p.move_to_uci(mv)))
+            })
+            .collect();
+        assert!(complete[0].1.is_some(), "precondition: the depth-1 search must return a move");
+
+        // Interruptions spread *inside* each iteration, the only place a rescue can happen.
+        // Sampling each iteration's own interval instead of a fixed grid keeps the resolution
+        // proportional to what it is measuring: fine in the cheap early iterations, where the
+        // stretch over which an improvement is already in hand is a few dozen nodes wide, coarse
+        // in the deep ones, where it is thousands. The first hit ends the sweep, so the cost
+        // here is paid only when the property is broken.
+        let ceilings: Vec<u64> = (1..complete.len())
+            .flat_map(|d| {
+                let (opens, closes) = (complete[d - 1].0, complete[d].0);
+                (1..=PROBES).map(move |k| opens + (closes - opens) * k / PROBES)
+            })
+            .collect();
+        let rescued = ceilings.into_iter().find_map(|ceiling| {
+            let stats = search_cut_at(&p, DEEPEST, ceiling).0;
+            let mv = stats.best.map(|(mv, _)| p.move_to_uci(mv))?;
+            // Depth 0 is the *other* override — not one iteration finished, so a partial result
+            // comes back merely because it is legal. That is a different property, and
+            // `an_interruption_with_nothing_better_is_still_discarded` is where it is checked.
+            let last_completed = &complete.get(stats.depth.checked_sub(1)? as usize)?.1;
+            (Some(&mv) != last_completed.as_ref()).then_some((ceiling, mv, stats.depth))
         });
         let (ceiling, mv, depth) = rescued.expect(
-            "no interruption between 200 and 6 000 nodes returns a move the complete depth-2 \
-             search would not: the rescue is doing nothing",
+            "no interruption inside any iteration returns a move the last completed iteration \
+             would not: the rescue is doing nothing",
         );
-        // And it is a *partial* iteration that produced it — the reported depth is the last one
-        // completed, so a rescued move comes back with the depth of the iteration before it.
+        // And it came out of a *partial* iteration rather than a finished one: the depth reported
+        // is the last one completed, so the iterations the engine claims must fit under the
+        // ceiling that stopped it. A search advertising a depth it could not have paid for would
+        // hollow out the comparison above — it would be reading the wrong reference iteration.
         assert!(
-            depth >= 2,
-            "at {ceiling} nodes the engine played {mv} at depth {depth}, before any iteration \
-             completed: that is not a rescue, it is an unfinished search",
+            complete[depth as usize - 1].0 <= ceiling,
+            "the search played {mv} and reported depth {depth}, but a complete depth-{depth} \
+             search costs {} nodes and this one was stopped at {ceiling}",
+            complete[depth as usize - 1].0,
         );
-
     }
 
     #[test]
@@ -2846,16 +2886,50 @@ mod tests {
 
     #[test]
     fn the_recapture_is_seen_past_the_depth_limit() {
-        let p = Position::from_fen(HORIZON).unwrap();
-        let static_eval = evaluate(&p);
         // At depth 1 the capture is the very last ply, so its recapture falls exactly
         // one ply beyond the limit — the horizon effect in its purest form. The score
         // must not claim the pawn: taking it costs the queen.
-        let (_, score) = best_move(&p, 1).expect("a move");
+        //
+        // **Both reference points are computed from the position, and that is the whole
+        // repair.** This assertion used to read `score < evaluate(&p) + 100`: a pawn's worth
+        // added to the root's static score, on the reasoning that a search which missed the
+        // recapture would claim about a pawn more than that. The constant was a measurement of
+        // one set of tables wearing the clothes of a principle, and retuning moved the band it
+        // had to sit in until 100 fell below it — the test went red on a search that was
+        // answering correctly.
+        //
+        // So no constant. The two quantities the claim is actually about are read **off the
+        // position**: `blind`, what a search that stops before the recapture would report, and
+        // `honest`, the best that any other move can reach. The gap between them is the horizon
+        // effect this test exists to measure, the preconditon asserts it is non-empty, and the
+        // real search must land on the honest side of it. A later refit carries the yardstick
+        // with it and nothing here needs re-measuring.
+        //
+        let p = Position::from_fen(HORIZON).unwrap();
+        let qxd6 = p.move_from_uci("d1d6").expect("Qxd6 must be legal here");
+        let static_eval = evaluate(&p);
+        let blind = -evaluate(&p.play(qxd6));
+        let honest = p
+            .legal_moves()
+            .into_iter()
+            .filter(|&mv| mv != qxd6)
+            .map(|mv| -quiesce(&p.play(mv)))
+            .max()
+            .expect("precondition: White has moves other than the capture");
         assert!(
-            score < static_eval + 100,
-            "score {score} claims material over the static {static_eval}: the recapture was missed"
+            honest < blind,
+            "precondition: the horizon must be worth something here — a blind search reads \
+             {blind} where the honest answer is {honest}, over a static {static_eval}",
         );
+
+        let (mv, score) = best_move(&p, 1).expect("a move");
+        assert!(
+            score <= honest,
+            "score {score} beats every move that is not the losing capture ({honest}), so it \
+             was reached through Qxd6 and the recapture was missed: a blind search reads \
+             {blind} here, over a static {static_eval}",
+        );
+        assert_ne!(mv, qxd6, "depth 1 chose the capture that loses the queen");
     }
 
     #[test]
@@ -2872,12 +2946,83 @@ mod tests {
         // Black's a2 pawn queens next move. Before promotions were searched, the leaf
         // counted a pawn and the main search a queen — a 730 cp gap between depth 1
         // and depth 2 on the same position. Quiescence must close it.
+        //
+        // **Why the two depths are no longer compared with a bare `assert_eq!`.** They used to
+        // return the same number, and the check extension is the reason they stopped. After
+        // Kd1 or Kf1 the new queen lands on the first rank *with check*, the extension buys
+        // that line one more ply, and the king walks off the rank to a better square — so
+        // depth 2 reports the value of a three-ply line and depth 1 the value of a one-ply
+        // one. Nothing about the promotion changed; only whether the extra ply is worth
+        // anything. It was worth nothing while the king table was flat: on the hand-made one
+        // the five white king moves scored within 25 cp of each other and three of them —
+        // Kd2, Ke2, Kf2 — scored *identically*, so both depths settled on the same move at
+        // the same score. The fitted endgame table separates all five, 66 cp apart end to end
+        // (measured 2026-09), and the extension has something to find.
+        //
+        // So the equality is asserted where it is a statement about promotions and nothing
+        // else — with extensions held off — and the real search is held to the bound the
+        // horizon effect would break. A missed promotion is a queen; an extension is not.
         let p = Position::from_fen("4k3/8/8/8/8/8/p7/4K3 w - - 0 1").unwrap();
+
+        // What queening is worth *on the tables in force*, measured rather than named, so a
+        // later refit carries this test's yardstick with it. Same position with Black to
+        // move, read before and after a1=Q: `evaluate` is side-to-move relative and the move
+        // flips the side, hence the negation. It is a queen less a pawn less the passed-pawn
+        // bonus the pawn stops earning: 616 cp in 2026-09.
+        let black_to_move = Position::from_fen("4k3/8/8/8/8/8/p7/4K3 b - - 0 1").unwrap();
+        let queening = black_to_move
+            .legal_moves()
+            .into_iter()
+            .find(|mv| mv.promotion == Some(Piece::Queen))
+            .expect("precondition: the a2 pawn must be able to queen");
+        let promotion_worth = -evaluate(&black_to_move.play(queening)) - evaluate(&black_to_move);
+        assert!(
+            promotion_worth > 400,
+            "precondition: queening must be worth several pawns, or the bounds below measure \
+             nothing: {promotion_worth} cp",
+        );
+
+        // The original assertion, on a search whose depth 2 really is two plies. Equality here
+        // is not a coincidence to be re-measured after every retuning: a1=Q is the only move
+        // that matters and the position after it is quiet, so quiescence at the depth-1 leaf
+        // either plays it out — and then both depths take the same maximum over the same five
+        // king moves — or it does not, and they differ by a queen.
+        let unextended = |depth: u32| {
+            let table = Table::new();
+            let mut searcher = Searcher::new(MoveOrder::Full, None, &table);
+            searcher.allow_extensions = false;
+            deepen(&p, Request::new(Limits::depth(depth)), &mut searcher)
+                .best
+                .expect("a move")
+                .1
+        };
+        let (shallow_flat, deeper_flat) = (unextended(1), unextended(2));
+        assert_eq!(
+            shallow_flat, deeper_flat,
+            "depth 1 must already price the queen: {shallow_flat} vs {deeper_flat} at depth 2",
+        );
+
+        // And the search as it actually runs, extensions included: the deeper ply may disagree
+        // about which king move to make, but not about who is a queen up. A quarter of the
+        // promotion is far above what the extension moves (12 cp in 2026-09) and far below
+        // the whole queen a missed promotion costs.
         let shallow = best_move(&p, 1).expect("a move").1;
         let deeper = best_move(&p, 2).expect("a move").1;
-        assert_eq!(
-            shallow, deeper,
-            "depth 1 must already price the queen: {shallow} vs {deeper} at depth 2"
+        assert!(
+            (shallow - deeper).abs() < promotion_worth / 4,
+            "the depths disagree by a fraction of the {promotion_worth} cp queen: \
+             {shallow} at depth 1 against {deeper} at depth 2",
+        );
+
+        // Depth 1 alone, against the static score — which is exactly the position with the
+        // pawn counted and the queen not. A leaf that stops before the promotion returns
+        // something within a king move of the static score; this one must be half a queen
+        // below it.
+        let static_eval = evaluate(&p);
+        assert!(
+            shallow < static_eval - promotion_worth / 2,
+            "depth 1 scores {shallow} against a static {static_eval}: the promotion was not \
+             played out, only the pawn is counted",
         );
     }
 
@@ -3040,6 +3185,16 @@ mod tests {
 
     #[test]
     fn the_main_search_still_castles() {
+        // **This test is also why the fitted MIDDLEGAME tables were not shipped, and the
+        // arithmetic belongs here because it is what a reader will want the next time a
+        // retuning is proposed.** A first pass fitted all twelve tables. Its `ROOK_MG` scored
+        // h1 at -111 and g1 at -13, so a plain `Rh1-g1` banked +98 while `O-O` banked `KING_MG`
+        // e1->g1 (+31) plus `ROOK_MG` h1->f1 (+58) = +89. **`O-O` therefore trailed the rook lift
+        // by 9 cp in every position at once** -- the castling rules make f1 and g1 empty exactly
+        // when the lift is legal -- so this test went red with no fixture able to save it. A rook
+        // on g1 in a middlegame is a *symptom* of a healthy kingside, and the fit had priced the
+        // symptom. Only the endgame tables ship, so the arithmetic below is the hand-made one.
+        //
         // **AC#2, and it is the criterion this brick most needed.** The failure mode of an
         // over-broad "castling is not a capture" is an engine that stops castling *altogether*, and
         // that failure is silent: inserting
@@ -5029,13 +5184,55 @@ mod tests {
         // what the search concludes: a capture dropped here is never examined. So the question is
         // not "is it faster" but "does it still see what it saw".
         //
-        // Ten tactical positions at two depths, four of them forced mates. Every score and every
-        // move came back identical, which is why this test asserts equality of the **score** and
-        // not merely "a mate is still a mate" — the stronger claim is the one that was measured.
+        // Six tactical positions at two depths, four of them forced mates, so eight of the twelve
+        // measurements are mates. On those the claim is exact and it runs both ways: an equal
+        // score means an equal distance to mate, so pruning may neither lose a mate nor invent
+        // one the full search does not see.
+        //
+        // **Why the other four are a bound and not an equality.** Until the endgame tables were
+        // fitted, every score in this set came back identical pruned and unpruned, and this test
+        // asserted that — the stronger claim being the one that had been measured. It was a
+        // measurement, never a property: dropping candidate moves from a quiescence node moves
+        // that node's value by construction, and the sign it reaches the root with alternates
+        // with the ply. The fitted tables make one position exercise that freedom, the Kiwipete
+        // middlegame — the only position here that is not a mate hunt. Measured 2026-09-10 on the
+        // shipped tables, the largest gap over the twelve measurements is **18 cp**, at depth 7
+        // on that position. That is a shift in tree shape, not a loss.
+        //
+        // So the property is restated as the one the name always claimed: pruning must not change
+        // the **verdict**. A mate is a verdict and is held to the centipawn; a quiet middlegame
+        // score is held to half a pawn.
+        //
+        // That shape is not invented here. `see_pruning_sweep_over_pseudo_random_play` reached it
+        // for this same brick in #69 — no mate lost, divergence bounded — and says why in full: a
+        // heuristic that drops captures may return a different and equally valid bound, exactly
+        // as alpha-beta always could, so demanding an identical score is demanding
+        // reproducibility where the contract is a decision.
+        //
+        // **Fifty and not a hundred, and the three numbers that place it** (2026-09-10). The
+        // honest tables drift 18 cp; the exchange evaluation inverted — `see(pos, mv) <= 0`,
+        // keeping the losing captures and dropping the winning ones — drifts **117 cp** and turns
+        // this red. The bound therefore sits with better than a factor of two of clearance on
+        // each side, which is what stops it being either a change detector or a rubber stamp.
+        //
+        // What this bound genuinely gives up against the old equality is the *merely tightened*
+        // predicate, `see > 0` for `see >= 0`, whose drift is the same order as the honest one.
+        // That is not left uncovered: mutating it turns **seven** other tests red, among them
+        // `a_capture_promotion_is_still_searched` and `iterative_deepening_matches_direct_search`.
+        //
+        // The mate half is inert against *this* brick, which is worth writing down rather than
+        // leaving for the next reader to discover: all four mates come back identical under every
+        // mutation of the pruning tried, quiescence pruned to nothing included, because at these
+        // depths the main search reaches them without quiescence's help. It is not inert against
+        // the rest of the search — forcing the evaluation gate open in `static_eval_for`
+        // (`usable = true`) costs this set four of its eight mates and trips the precondition
+        // below, which is the failure `evaluation::cost` cites this test for.
         //
         // The score and not the move: a reordering may pick differently among equal values. Here
         // the moves happened to agree too, but asserting that would pin a coincidence.
+        const DRIFT: i32 = 50;
         let mut mates = 0;
+        let mut quiets = 0;
         for fen in TACTICS {
             let p = Position::from_fen(fen).unwrap();
             for depth in 6..=7u32 {
@@ -5043,12 +5240,21 @@ mod tests {
                 let (plain, _) = quiescence_pruned(&p, depth, false);
                 let a = pruned.expect("a move at the root").1;
                 let b = plain.expect("a move at the root").1;
-                assert_eq!(
-                    a, b,
-                    "{fen} at depth {depth}: pruning changed the score, {a} against {b}",
-                );
-                if a.abs() > MATE_THRESHOLD {
+                if a.abs() > MATE_THRESHOLD || b.abs() > MATE_THRESHOLD {
+                    assert_eq!(
+                        a, b,
+                        "{fen} at depth {depth}: a mate is involved and pruning moved the score, \
+                         {a} against {b}",
+                    );
                     mates += 1;
+                } else {
+                    let drift = (a - b).abs();
+                    assert!(
+                        drift <= DRIFT,
+                        "{fen} at depth {depth}: pruning moved the verdict by {drift} cp, more \
+                         than the {DRIFT} tolerated, {a} against {b}",
+                    );
+                    quiets += 1;
                 }
             }
         }
@@ -5057,6 +5263,13 @@ mod tests {
             "precondition: this set must contain forced mates for the test to prove anything, \
              found {mates}",
         );
+        // The second precondition, and it is here because the first one can swallow the set: if
+        // every measurement turned into a mate, the drift bound would be asserted zero times and
+        // would protect nothing without a single line of the test changing.
+        assert!(
+            quiets >= 2,
+            "precondition: the drift bound must be exercised, it was reached {quiets} times",
+        );
     }
 
     #[test]
@@ -5064,16 +5277,38 @@ mod tests {
         // What it buys, and it is the largest gain measured on this bench: 0.833 at depth 8, and
         // — unlike the ordering use of the same evaluation, which read 1.021 — it is *regular*:
         // 0.769 / 0.790 / 0.841 / 0.941 across the four natures, worst single position 1.09.
+        //
+        // **Asserted over the four natures together rather than one by one, since the endgame
+        // tables were fitted.** The per-nature claim was a measurement that happened to hold, not
+        // a property: pruning a quiescence node changes the bound it returns, so the cutoffs
+        // above it move and the tree can grow locally. Measured 2026-09-10 at depth 6 with the
+        // fitted endgame tables, the quiet middlegame reads **35 338 against 31 791** — pruning
+        // costs 11 % there — while the total across the four still falls clearly. That is a
+        // change of tree *shape*, which ADR-050 records the bench can even report with the wrong
+        // sign; it is not the brick failing.
+        //
+        // The total keeps the protective power the loop had: with the `retain` removed the two
+        // counts are equal to the node, and with the exchange evaluation inverted the tree grows.
+        // Both turn this red.
         const DEPTH: u32 = 6;
+        let (mut total_pruned, mut total_plain) = (0u64, 0u64);
+        let mut per_nature = String::new();
         for (nature, fen) in NATURES {
             let p = Position::from_fen(fen).unwrap();
             let (_, pruned) = quiescence_pruned(&p, DEPTH, true);
             let (_, plain) = quiescence_pruned(&p, DEPTH, false);
-            assert!(
-                pruned < plain,
-                "{nature}: pruning must shrink the tree, {pruned} against {plain}",
-            );
+            total_pruned += pruned;
+            total_plain += plain;
+            per_nature += &format!("\n  {nature}: {pruned} against {plain}");
         }
+        // Five per cent and not "any shrinkage at all": the brick is on the bench for 0.833, so a
+        // total that has crept up to 0.99 has stopped buying what it was merged for, and the
+        // per-nature breakdown in the message says which one moved.
+        assert!(
+            total_pruned * 100 < total_plain * 95,
+            "pruning must shrink the tree overall by at least 5 %: {total_pruned} against \
+             {total_plain}{per_nature}",
+        );
     }
 
     /// Runs **one** quiescence node on `pos`, returning its score and the nodes it spent.

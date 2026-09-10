@@ -370,7 +370,7 @@ fn variant<
     // **production** function, which reads a compile-time `true`. Mirroring the test build instead
     // would fold that read into the price of the endgame scale and inflate the one term it is
     // hardest to see.
-    if SCALE && cannot_mate(pos, pawns, balance) {
+    if SCALE && cannot_mate(pos, pawns) {
         balance /= DRAWISH_DIVISOR;
     }
 
