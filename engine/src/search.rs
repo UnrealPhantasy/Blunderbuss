@@ -41,12 +41,43 @@ pub const MATE_THRESHOLD: i32 = 20_000;
 // initial alpha/beta window.
 const INF: i32 = 40_000;
 
-/// How much shallower a null-move search runs than the node that spawned it.
+/// The shallowest depth at which a null-move pass is attempted. **A gate threshold, and nothing
+/// else** — despite what the name it carried until #101 suggested.
 ///
-/// Two is the usual choice: the pass only has to fail to find a rough refutation, so
-/// paying full depth for it would spend more than the cut saves. Larger values prune
-/// harder and miss more.
-const NULL_MOVE_REDUCTION: u32 = 2;
+/// **The rename is the point.** This was `NULL_MOVE_REDUCTION = 2` back when the constant *was*
+/// the reduction, and the gate read `depth > NULL_MOVE_REDUCTION + 1`. Since #101 the reduction
+/// is [`null_move_reduction`], a schedule that grows with depth, and its base is a literal `3`
+/// that does not reference this constant at all. The old doc claimed three things and review
+/// found none of them true: the floor of `3 + depth / 6` is **3**, not 2; the shallowest depth at
+/// which a pass is attempted is **4**, not 2; and the schedule is not "based" on it. A reader
+/// changing it expecting to reduce harder would have changed only *where* passes are attempted —
+/// close to the opposite.
+///
+/// **Its value is unchanged in effect**: `depth > 2 + 1` and `depth >= 4` admit the same depths,
+/// so the tree is identical and the 16 800 games of #101's duel still measure this code.
+///
+/// Why a gate at all: below it the verification has almost nothing left to search, so the pass
+/// costs more than the cut saves. At exactly 4 it already searches *nothing* — see
+/// `the_gate_admits_depth_four_where_the_verification_is_a_bare_quiescence`, which pins that as
+/// the deliberate choice it is.
+const NULL_MOVE_MIN_DEPTH: u32 = 4;
+
+/// How much shallower a null-move search runs than the node that spawned it, **growing with the
+/// depth of that node**.
+///
+/// **Why it should grow, and it is not an analogy.** The pass asks "is this position so good that
+/// even giving the opponent a free move leaves it above beta". The deeper the node, the more the
+/// remaining subtree can absorb — so the answer holds with a shallower verification, and a fixed
+/// reduction pays full price for a question that gets cheaper. Every engine that reduces at all
+/// grows this; this one did not, and the constant was among the two most conservative in the
+/// search.
+///
+/// `3 + depth / 6` rather than a table: at depth 4 it is 3, at depth 12 it is 5, at depth 24 it is
+/// 7. The `saturating_sub` at the call site is what keeps a reduction larger than the depth from
+/// wrapping, and it is documented there by its two failure modes.
+fn null_move_reduction(depth: u32) -> u32 {
+    3 + depth / 6
+}
 
 /// Minimum [`phase`] for a null move to be attempted — the zugzwang guard.
 ///
@@ -210,8 +241,8 @@ const CHECK_EXTENSION_PLY_BUDGET: i32 = 2;
 ///
 /// Two readings decide it. **The floor**: extending only at `depth == 1` finds nothing at
 /// all — it is not the same brick made cheaper, it is a different and empty one. **The
-/// ceiling**: extending everywhere multiplies a pawn endgame's tree by 2.6, about 1.1 plies
-/// of work handed back at an effective branching factor of 2.36, and a pawn endgame is
+/// ceiling**: extending everywhere multiplies a pawn endgame's tree by 2.6, which is roughly a
+/// ply of work handed back at this engine's effective branching factor, and a pawn endgame is
 /// exactly the phase where this engine already loses its half-points. The last two mates cost
 /// more than half of the remaining depth budget to buy.
 ///
@@ -231,6 +262,36 @@ const CHECK_EXTENSION_MAX_DEPTH: u32 = 2;
 /// does not reuse a number lying around, it *introduces* the call. Keeping it near the leaves is
 /// what limits how many nodes pay for an evaluation they may not use.
 const RFP_MAX_DEPTH: u32 = 3;
+
+// **Both halves of an audit's proposal for this constant were tried and both were rejected, by
+// measurement rather than by argument.** #100 took "ceiling 8, margin 75" from an audit that had
+// varied the two together and reported a node ratio of 0.814. Varied separately:
+//
+//   * **margin 90 → 75 fails an existing test.** With the ceiling either way,
+//     `the_cut_fires_on_real_positions_and_saves_the_subtree` goes red on the endgame position: the
+//     cut fires 1 566 times and the tree comes out *larger*, 18 580 nodes against 15 909. Not a
+//     paradox — a smaller margin makes the cut fire where it should not, the bound it returns is
+//     looser than a real search would have produced, and the saving is handed back with interest.
+//     That test exists precisely to separate "the cut fires" from "the cut saves".
+//   * **ceiling 3 → 8 does nothing at all.** Whole suite green, and the node ratio on a
+//     persistent-table sequence is **indistinguishable from zero, with the sign unresolved**:
+//     +0.2 % on the sample measured on 2026-09-08, −0.7 % on a second sample of six sequences
+//     measured in review on 2026-09-10, whose six ratios all went the other way (total 0.9928,
+//     cold table 0.9916). Both readings sit inside the blank, so the decision — the ceiling is
+//     worth nothing and stays at 3 — is the same either way.
+//
+//     **The direction is deliberately not claimed**, and the earlier wording did claim it
+//     ("0.2 % the wrong way"). A sub-blank number given a decimal and a direction reads as a fact
+//     about the change, and a later reader weighing whether to revisit this constant would be
+//     told it made things slightly worse when the evidence says only that it does nothing. Same
+//     shape as the two present-tense branching factors deleted from this file on 2026-09-09.
+//
+//     The reason it does nothing is structural and was measured on the way: the tree is
+//     exponential, so almost every interior node already sits below depth 3, and widening to 8
+//     reaches only the sparse nodes at depths 4-8.
+//
+// So this constant stays at 3, and the audit's 0.814 belonged entirely to the margin it also
+// changed — which is what varying two things at once costs.
 
 /// How far above `beta` the static evaluation must sit, per ply of remaining depth.
 ///
@@ -1232,7 +1293,7 @@ impl<'a> Searcher<'a> {
     /// harmless move to make. The phase from the tapered evaluation (#34) already
     /// measures exactly that, so the guard costs one comparison and no new concept.
     fn null_move_allowed(&self, pos: &Position, depth: u32) -> bool {
-        depth > NULL_MOVE_REDUCTION + 1 && phase(pos) >= NULL_MOVE_MIN_PHASE
+        depth >= NULL_MOVE_MIN_DEPTH && phase(pos) >= NULL_MOVE_MIN_PHASE
     }
 
     /// The reverse futility cut, or `None` when it does not apply.
@@ -1547,8 +1608,15 @@ impl<'a> Searcher<'a> {
         //
         // The opposite profile to an extension: the cost is one evaluation and one comparison,
         // the benefit is a whole subtree never searched. That matters here because the effective
-        // branching factor is 2.06, which is fat enough that techniques spending a fraction of a
-        // node to decide where to spend more cannot pay (see the singular extension measurement).
+        // branching factor is fat enough that techniques spending a fraction of a node to decide
+        // where to spend more cannot pay (see the singular extension measurement).
+        //
+        // **The number is deliberately not written here.** It read 2.06 until 2026-09-09, and the
+        // measured value has been 2.14 since 2026-09-03 — a figure that moves with every brick
+        // touching the tree is a debt owed at each one and forgotten at most of them. A *dated*
+        // measurement in a comment is a historical fact and does not rot; a figure in the present
+        // tense is a claim about the current engine and rots in silence, unless a test asserts it.
+        // The value lives in the KB, dated, where it is maintained once.
         // **Computed once, used by both cuts**, and that sharing is what makes the forward cut
         // nearly free: #66 already introduced this call at interior nodes, which was its whole
         // cost. Recomputing it in the move loop would pay for it twice and cancel the economy.
@@ -1577,7 +1645,7 @@ impl<'a> Searcher<'a> {
         let can_null = can_null && self.allow_null_move;
         if can_null && self.null_move_allowed(pos, depth) {
             if let Some(passed) = pos.null_move() {
-                let reduced = depth.saturating_sub(1 + NULL_MOVE_REDUCTION);
+                let reduced = depth.saturating_sub(1 + null_move_reduction(depth));
                 // `-beta, -beta + 1` is a null window: we only ask "does it reach beta",
                 // never "by how much". `false` forbids a second pass in a row — two
                 // passes would skip a full move for both sides and prove nothing.
@@ -2224,16 +2292,82 @@ mod tests {
     }
 
     #[test]
-    fn no_null_move_when_the_reduction_would_leave_nothing() {
-        // Below `1 + R` there is no subtree left to prune, so the pass costs more than
-        // it saves.
+    fn the_reduction_schedule_is_pinned_at_the_depths_the_engine_reaches() {
+        // What #101 *is*, pinned value by value. Without this, the suite does not distinguish
+        // the schedule from the constant it replaced: three mutations measured in review — `2`,
+        // `3 + depth / 3`, `10 + depth` — moved the tree from 1.000 down to 0.566, a 43 % spread,
+        // and every one of them left the whole suite green.
+        //
+        // The values are the ones in `null_move_reduction`'s own doc comment, deliberately: a doc
+        // and a test that contradict each other leave the reader to pick.
+        assert_eq!(null_move_reduction(4), 3, "the floor, reached at the shallowest gated depth");
+        assert_eq!(null_move_reduction(6), 4);
+        assert_eq!(null_move_reduction(12), 5);
+        assert_eq!(null_move_reduction(24), 7);
+        // Monotone and *slow*: one more ply of reduction every six plies of depth. The second
+        // assertion is what separates this schedule from one growing twice as fast — the pinned
+        // values alone would not, since `3 + depth / 3` agrees with it at depth 6.
+        for depth in 4..64u32 {
+            let r = null_move_reduction(depth);
+            assert!(r >= null_move_reduction(depth - 1), "depth {depth}: growth went backwards");
+            assert_eq!(r, 3 + depth / 6, "depth {depth}");
+        }
+    }
+
+    #[test]
+    fn the_gate_admits_depth_four_where_the_verification_is_a_bare_quiescence() {
+        // What the gate *does*, rather than what its name used to promise. Raised in review.
+        //
+        // `null_move_allowed` read `depth > NULL_MOVE_REDUCTION + 1` back when that constant
+        // *was* the reduction, so the gate meant "at least one ply is left to verify with". Since
+        // #101 the reduction grows and already equals 3 at depth 4, so `reduced = depth - 1 - R`
+        // is **zero** there: the pass is verified by a bare quiescence call, without a single ply
+        // of search.
+        //
+        // This is a deliberate aggressive choice, not a defect — `saturating_sub` keeps it safe,
+        // and the 16 800-game duel measured it at +17 ± 4. The test exists so the choice is
+        // written down rather than inferred, and so a schedule that moved it would be seen.
+        let p = Position::initial();
+        let table = Table::new();
+        let s = Searcher::new(MoveOrder::Full, None, &table);
+        assert!(!s.null_move_allowed(&p, 3), "depth 3 sits below the gate");
+        assert!(s.null_move_allowed(&p, 4), "depth 4 passes the gate");
+        assert_eq!(
+            4u32.saturating_sub(1 + null_move_reduction(4)),
+            0,
+            "and at that depth the verification searches nothing: a bare quiescence",
+        );
+        // From depth 5 on, one ply is left, and at least one always is. That bound is what
+        // breaks under a reduction growing as fast as the depth itself.
+        for depth in 5..64u32 {
+            assert!(
+                depth.saturating_sub(1 + null_move_reduction(depth)) >= 1,
+                "depth {depth}: the verification no longer searches anything",
+            );
+        }
+    }
+
+    #[test]
+    fn the_gate_admits_exactly_the_depths_at_or_above_its_threshold() {
+        // RENAMED on 2026-09-09, in review. It was called
+        // `no_null_move_when_the_reduction_would_leave_nothing` and its comment read "Below
+        // `1 + R` there is no subtree left to prune" — two claims #101 made false without moving
+        // this test, because it only ever asks `null_move_allowed`, which does not consult the
+        // reduction. At depth 4, `1 + R` is 4: nothing is left, and the pass is attempted anyway.
+        //
+        // The name promised a guarantee the code no longer gives. This test now checks what the
+        // gate actually does — a threshold, nothing more — and the property the old name claimed
+        // is taken up, corrected, by
+        // `the_gate_admits_depth_four_where_the_verification_is_a_bare_quiescence`.
         let p = Position::initial();
         let table = Table::new();
         let searcher = Searcher::new(MoveOrder::Full, None, &table);
-        for depth in 0..=NULL_MOVE_REDUCTION + 1 {
+        for depth in 0..NULL_MOVE_MIN_DEPTH {
             assert!(!searcher.null_move_allowed(&p, depth), "depth {depth} is too shallow");
         }
-        assert!(searcher.null_move_allowed(&p, NULL_MOVE_REDUCTION + 2));
+        for depth in NULL_MOVE_MIN_DEPTH..=NULL_MOVE_MIN_DEPTH + 4 {
+            assert!(searcher.null_move_allowed(&p, depth), "depth {depth} should pass the gate");
+        }
     }
 
     #[test]
@@ -2290,14 +2424,34 @@ mod tests {
         // what found it: at depth 4 the pruning is provably unreachable — the shallowest
         // internal node sits at `depth - 1`, `null_move_allowed` wants `depth > R + 1`,
         // so nothing can pass below `R + 3` — and the two searches returned the identical
-        // node count. Deriving it means a change to `NULL_MOVE_REDUCTION` moves the floor
+        // node count. Deriving it means a change to `NULL_MOVE_MIN_DEPTH` moves the floor
         // with it instead of leaving a silently inert first iteration.
         //
         // Two separate properties, because they hold on different domains. **That it
         // prunes at all** is true from the floor upwards and is what a regression would
-        // break. **How much** grows sharply with depth — measured with this test's own
-        // protocol: **4.5 % at depth 5, 30.7 % at depth 6, 41.6 % at depth 7** — since the
-        // deeper the tree, the larger the share of nodes with enough depth left to pass. A
+        // break. **How much** varies sharply with depth, and the shape moved with #101 —
+        // measured with this test's own protocol, the growing schedule against the fixed 2:
+        //
+        // | depth | reduction `2` (pre-#101) | `3 + depth / 6` (today) |
+        // |-------|--------------------------|-------------------------|
+        // | 5     | 4 %                      | **31 %**                |
+        // | 6     | 26 %                     | 11 %                    |
+        // | 7     | 37 %                     | **41 %**                |
+        //
+        // The figures this comment carried until 2026-09-09 — 4.5 / 30.7 / 41.6 % — were taken
+        // before #101 *and* before the evaluation moved, so they described a tree the engine no
+        // longer searches. Remeasured above rather than adjusted.
+        //
+        // **The threshold stays at 20 % rather than being raised to match**, and the reason is
+        // that raising it would buy nothing here. Review noted that the margin over the floor
+        // grew (37 % → 41 % at the peak) and that the assertion therefore discriminates less. It
+        // does — but it never discriminated *this* brick: reverting the schedule to a fixed 2
+        // still peaks at 37 %, comfortably over 20 %, so the test passed either way both before
+        // and after. What guards the schedule is
+        // `the_reduction_schedule_is_pinned_at_the_depths_the_engine_reaches`, which reddens on
+        // all three mutations review tried. This test keeps the job its name claims — that the
+        // pass prunes substantially *somewhere* — and a floor that survives an evaluation change
+        // serves that job better than one recalibrated to today's peak. A
         // sevenfold rise between two adjacent depths is the whole point, and it is why
         // asserting the amplitude across the sweep would only pin the weakest depth.
         //
@@ -2327,7 +2481,7 @@ mod tests {
         const DEEPEST: u32 = 7;
         let mut best_saving = 0.0_f64;
         let mut report = String::new();
-        for depth in (NULL_MOVE_REDUCTION + 3)..=DEEPEST {
+        for depth in (NULL_MOVE_MIN_DEPTH + 1)..=DEEPEST {
             let (with, without) = (nodes(true, depth), nodes(false, depth));
             assert!(
                 with < without,
