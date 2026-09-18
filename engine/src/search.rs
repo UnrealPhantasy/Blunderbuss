@@ -5217,8 +5217,14 @@ mod tests {
         //
         // What this bound genuinely gives up against the old equality is the *merely tightened*
         // predicate, `see > 0` for `see >= 0`, whose drift is the same order as the honest one.
-        // That is not left uncovered: mutating it turns **seven** other tests red, among them
-        // `a_capture_promotion_is_still_searched` and `iterative_deepening_matches_direct_search`.
+        // That is not left uncovered: mutating it turns **two** other tests red —
+        // `a_capture_promotion_is_still_searched` and `the_promotion_is_seen_past_the_depth_limit`
+        // — plus this test itself at its drift bound.
+        //
+        // **The count read "seven" until review re-ran the mutation** (2026-09-18), and the test
+        // named beside it, `iterative_deepening_matches_direct_search`, is not among them. Three
+        // red in total, measured on this head, whole engine crate. A mutation record is the
+        // contract of a test; when it is wrong the next reader trusts a guard that is not there.
         //
         // The mate half is inert against *this* brick, which is worth writing down rather than
         // leaving for the next reader to discover: all four mates come back identical under every
