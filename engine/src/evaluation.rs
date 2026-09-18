@@ -282,7 +282,7 @@ mod cost;
 /// Below this edge, a pawnless side cannot be assumed to be winning.
 ///
 /// A rook is the threshold because K+R against K **is** a win and K+B or K+N against K is not.
-/// Everything between — two minors at 640, for instance — needs its own condition rather than a
+/// Everything between — two minors at 597, for instance — needs its own condition rather than a
 /// wider net, which is why two knights are named explicitly below and bishop-plus-knight is not:
 /// B+N against a bare king is a genuine win, and flattening it would throw away real games.
 const PAWNLESS_WIN_THRESHOLD: i32 = 500;
@@ -364,9 +364,15 @@ fn cannot_mate(pos: &Position, pawns: [u64; 2]) -> bool {
     if material.abs() < PAWNLESS_WIN_THRESHOLD {
         return true;
     }
-    // Two knights and a bare king is the one drawn position above the threshold: 640 cp of
+    // Two knights and a bare king is the one drawn position above the threshold: **596 cp** of
     // material that cannot force mate. Named rather than covered by a wider net, because the
-    // configurations either side of it — B+N at 650, R at 500 — are wins.
+    // neighbouring configurations — B+N at 597, two bishops at 598, a rook at 513 — are wins.
+    //
+    // **The three figures moved with the fitted values and read as `main`'s until review**
+    // (2026-09-18): 640 / 650 / 500 were the hand-made levels. The logic is unchanged — this case
+    // is named explicitly, not caught by a threshold — but B+N now sits **1 cp above** two
+    // knights rather than comfortably either side of it, so the wider net the comment rules out
+    // would be even less separable than before.
     let knights = pos.count(strong, Piece::Knight);
     let others = pos.count(strong, Piece::Bishop)
         + pos.count(strong, Piece::Rook)
@@ -598,8 +604,12 @@ const BISHOP_EG: [i32; 64] = [
      15,  21,  31,  17,  35,  43,  34,   8,
      43,  23,  17,  40,  14,  22,   7,  21, // rank 8
 ];
-/// A rook wants open files in the middlegame and the seventh rank at any time; its
-/// endgame level is the one that moves most against the hand-made table.
+/// A rook wants open files in the middlegame and the seventh rank at any time, and its endgame
+/// level rises against the hand-made table.
+///
+/// **Not the one that moves most** — corrected in review (2026-09-18). Measured as the guard test
+/// measures it (`value()` plus the mean over occupiable squares), the rook moves **+14** and the
+/// queen **+61**: the queen moves most, by a factor of four.
 ///
 /// Mean over the squares a rook can occupy: **500 cp in the middlegame, 515 in the endgame**, of which 513 is carried by `value()`.
 #[rustfmt::skip]
@@ -897,8 +907,10 @@ mod tests {
     fn the_king_tables_carry_no_arbitrary_offset() {
         // **The gauge, asserted rather than described.** A constant added to all 64 squares of a
         // king table cancels between the two sides, so it is free — and an ungauged fit parks it
-        // anywhere. The hand-made tables carried −22.8 there, which reads as a fact about kings
-        // and is not one.
+        // anywhere. The hand-made **middlegame** table carried −22.8 there (it sums to −1460),
+        // which reads as a fact about kings and is not one. Its endgame counterpart summed to
+        // −640, a mean of −10.0 — also an offset, and smaller; the single figure in this comment
+        // covered both until review separated them (2026-09-18).
         //
         // Two different claims, because two different things are attainable. `KING_EG` is fitted
         // and new, so its rounding residual can be spread and it is emitted **exactly**
