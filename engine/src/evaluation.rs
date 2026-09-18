@@ -1006,6 +1006,29 @@ mod tests {
             "a passed pawn must be worth clearly more in an endgame, base and schedule \
              together: {pawn_eg} against {pawn_mg}",
         );
+        // **And the pawn table itself, which the assertion above does not reach.** Raised in
+        // review: the clause above is dominated by the schedule, whose two levels differ by 34 at
+        // rank 5 while the base tables differ by −3. Rewiring `PST_ENDGAME[0]` to `PAWN_MG`
+        // therefore *raises* its left-hand side, and both that rewiring and a swap of two ranks
+        // of `PAWN_EG` left all 207 tests in this crate green. The clause pinned the schedule —
+        // already pinned by `a_passed_pawn_is_worth_more_in_the_endgame` — and not the table.
+        //
+        // Rank 6 is where the two tables disagree most and where the disagreement means
+        // something: a pawn two squares from queening is a promotion in the making once the board
+        // empties, and a liability to be defended while the queens are on. Measured on the
+        // shipped tables, the rank-6 means are **+27.8 in the endgame against +12.5 in the
+        // middlegame**; the other ranks are −1.9/−9.1/−12.6/−4.5 against −3.8/−7.5/0.0/+6.2, so
+        // rank 6 is the one to assert and the others are not claims this project has measured.
+        let rank6 = |tables: &[[i32; 64]; 6]| {
+            let table = &tables[Piece::Pawn as usize];
+            table[40..48].iter().sum::<i32>() / 8
+        };
+        assert!(
+            rank6(&PST_ENDGAME) > rank6(&PST_MIDDLEGAME),
+            "a pawn on the sixth rank must be worth more once the board empties: {} against {}",
+            rank6(&PST_ENDGAME),
+            rank6(&PST_MIDDLEGAME),
+        );
     }
 
     #[test]
