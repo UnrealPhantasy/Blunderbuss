@@ -928,11 +928,27 @@ mod tests {
 
     #[test]
     fn the_endgame_tables_are_worth_something_different_from_the_middlegame_ones() {
-        // **The only guard on five of the six fitted tables, and it was missing.** Rewiring the
-        // five non-king entries of [`PST_ENDGAME`] to the middlegame arrays — undoing everything
-        // this file was retuned for except the king — left **all 249 tests in this crate
-        // green**. The two tests that catch the six-way rewiring are both king tests, so pawn,
+        // **The only test that looks at the five non-king fitted tables at all.** Rewiring those
+        // five entries of [`PST_ENDGAME`] to the middlegame arrays — undoing everything this file
+        // was retuned for except the king — left the whole workspace green before this test
+        // existed. The two tests that catch the six-way rewiring are both king tests, so pawn,
         // knight, bishop, rook and queen shipped with nothing watching them.
+        //
+        // **It guards three of them, and that is measured rather than claimed.** Rewiring each
+        // entry alone, one at a time, whole engine crate:
+        //
+        // | rewired alone | this test |
+        // |---------------|-----------|
+        // | pawn          | **red**   |
+        // | knight        | **red**   |
+        // | rook          | **red**   |
+        // | bishop        | green     |
+        // | queen         | green     |
+        //
+        // The two green rows are deliberate and are explained below — bishop and queen are named
+        // here without being asserted. What is *not* deliberate is a comment that claims more
+        // coverage than the mutations show: an earlier draft of this paragraph said "five", and
+        // review found the pawn unguarded before the assertion at the end of this test existed.
         //
         // What is asserted is the property the work was undertaken for and not the numbers it
         // produced: a knight is worth clearly less once the board empties, a rook clearly more.
