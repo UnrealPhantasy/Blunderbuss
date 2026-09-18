@@ -1900,10 +1900,17 @@ mod tests {
     use super::*;
     use crate::position::{Color, Piece, Status};
 
-    // A position where the engine changes its mind as it deepens: c1d1 at depths 1-2,
-    // h2h3 at 3-4, f3e1 at 5-6. That is what makes it usable for the tests below —
-    // "an iteration found something better than the previous one" needs an iteration
-    // that actually disagrees with its predecessor.
+    // A position where the engine changes its mind as it deepens. Measured on this head
+    // (2026-09-18, release binary and `search_cut_at` agreeing): **c1f1 at depth 1, f3d2 at
+    // 2-4, b2b3 at 5, g1h1 at 6.** That is what makes it usable for the tests below — "an
+    // iteration found something better than the previous one" needs an iteration that actually
+    // disagrees with its predecessor, and depths 1 and 2 do.
+    //
+    // **This ladder read "c1d1 at 1-2, h2h3 at 3-4, f3e1 at 5-6" until review** (2026-09-18).
+    // It was already stale on `main` — c1d1 at 1, g1f1 at 3-6 there — and this branch did not
+    // touch these lines but made a test lean on them, which is what surfaced it: the fixture
+    // said depths 1 and 2 agreed while the test said they disagreed. A ladder is a measurement
+    // and rots like one; it carries its date now.
     const CHANGES_ITS_MIND: &str = "2r3k1/pp3pp1/4p2p/3pP3/3P4/2P2N2/PP3PPP/2R3K1 w - - 0 1";
 
     // A search interrupted after exactly `node_ceiling` nodes, collecting the depths it
@@ -2954,7 +2961,7 @@ mod tests {
         // depth 2 reports the value of a three-ply line and depth 1 the value of a one-ply
         // one. Nothing about the promotion changed; only whether the extra ply is worth
         // anything. It was worth nothing while the king table was flat: on the hand-made one
-        // the five white king moves scored within 25 cp of each other and three of them —
+        // the five white king moves scored within 30 cp of each other and three of them —
         // Kd2, Ke2, Kf2 — scored *identically*, so both depths settled on the same move at
         // the same score. The fitted endgame table separates all five, 66 cp apart end to end
         // (measured 2026-09), and the extension has something to find.
@@ -3004,7 +3011,7 @@ mod tests {
 
         // And the search as it actually runs, extensions included: the deeper ply may disagree
         // about which king move to make, but not about who is a queen up. A quarter of the
-        // promotion is far above what the extension moves (12 cp in 2026-09) and far below
+        // promotion is far above what the extension moves (about ten centipawns) and far below
         // the whole queen a missed promotion costs.
         let shallow = best_move(&p, 1).expect("a move").1;
         let deeper = best_move(&p, 2).expect("a move").1;
@@ -3193,7 +3200,9 @@ mod tests {
         // by 9 cp in every position at once** -- the castling rules make f1 and g1 empty exactly
         // when the lift is legal -- so this test went red with no fixture able to save it. A rook
         // on g1 in a middlegame is a *symptom* of a healthy kingside, and the fit had priced the
-        // symptom. Only the endgame tables ship, so the arithmetic below is the hand-made one.
+        // symptom. Only the endgame tables ship, so the middlegame arithmetic is unchanged from
+        // `main`: on the shipped tables `KING_MG` e1->g1 reads **+30** and `ROOK_MG` h1->f1 reads
+        // **0**, so `O-O` beats the lift by 30 and the failure mode above does not arise here.
         //
         // **AC#2, and it is the criterion this brick most needed.** The failure mode of an
         // over-broad "castling is not a capture" is an engine that stops castling *altogether*, and
