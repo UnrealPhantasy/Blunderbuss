@@ -540,8 +540,24 @@ pub fn evaluate(pos: &Position) -> i32 {
 
 
 /// A pawn's square, and the two schedules are the whole reason this file was retuned:
-/// a passed-looking central pawn is a middlegame asset, and an advanced pawn in an endgame
-/// is a promotion in the making. One shared table could say only one of the two.
+/// a passed-looking central pawn is a middlegame asset, and a pawn on the **sixth or seventh**
+/// rank in an endgame is a promotion in the making. One shared table could say only one of the
+/// two.
+///
+/// **"Advanced" is too broad, and the fit says so** — corrected in review (2026-09-18). Rank by
+/// rank, the fitted endgame means are −1.9, −9.1, −12.6, −4.5, **+27.8**, **+33.9** against the
+/// middlegame's −3.8, −7.5, 0.0, +6.2, +12.5, +45.0: ranks 3 to 5 sit *below* rank 2, so a pawn
+/// one or two squares forward is worth **less** here, not more. Counted with `PASSED_ENDGAME`, a
+/// white passer's first step at phase 0 reads a2→a3 −45, b −16, c −9, d +6, e +22, f −27, g −20,
+/// h −33.
+///
+/// Measured in the release binary (`OwnBook` off, K+P against K), the dip bites only at the
+/// shallowest depths: from depth 4 the head plays `a2a4`, `h2h4`, `b2b4`, `a4a5` where `main`
+/// still shuffles the king through depth 6 — so overall it advances passers *sooner*. Not a
+/// defect and not fixed here: the anchoring priced the whole table, dip included. It is the
+/// endgame's own instance of the symptom-pricing this file's block comment attributes to the
+/// middlegame corpus, and the `PASSED_ENDGAME` comment explains its own 20 → 12 dip while saying
+/// nothing of the larger one in the base table beside it.
 ///
 /// Mean over the squares a pawn can occupy: **114 cp in the middlegame, 111 in the endgame**, of which 105 is carried by `value()`.
 #[rustfmt::skip]
