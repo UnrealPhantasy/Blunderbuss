@@ -40,12 +40,11 @@
 //! and [`KING_EG`] — and the score is **interpolated** between them according to how
 //! much material is left ([`phase`]).
 //!
-//! Until these tables were split, five of the six pieces read the *same* array in both
-//! phases and only the king had two, so this whole mechanism moved nothing but the
-//! king — a pawn on the sixth rank was worth the same with both queens on the board as
-//! in a pure pawn endgame. Fitting the endgame half is worth **0.97 %** of held-out
-//! cross-entropy (0.621312 → 0.615263, read off the built binary) for **1.7 %** more
-//! nodes.
+//! Fitting the endgame half is worth **0.97 %** of held-out cross-entropy
+//! (0.621312 → 0.615263, read off the built binary) for **1.7 %** more nodes. Why the split was
+//! needed at all is explained once, in the block comment above the tables — the copy that used to
+//! sit here said the same thing in the same words, and review asked for one (2026-09-18). A
+//! reader meets that one next to the numbers it describes.
 //!
 //! Interpolating rather than switching at a threshold matters: a switch would make
 //! the evaluation of one position jump by tens of centipawns the moment a single
