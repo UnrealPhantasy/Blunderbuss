@@ -5211,9 +5211,24 @@ mod tests {
         //
         // **Fifty and not a hundred, and the three numbers that place it** (2026-09-10). The
         // honest tables drift 18 cp; the exchange evaluation inverted — `see(pos, mv) <= 0`,
-        // keeping the losing captures and dropping the winning ones — drifts **117 cp** and turns
-        // this red. The bound therefore sits with better than a factor of two of clearance on
-        // each side, which is what stops it being either a change detector or a rubber stamp.
+        // keeping the losing captures and dropping the winning ones — drifts **117 cp**. The
+        // bound therefore sits with better than a factor of two of clearance on each side, which
+        // is what stops it being either a change detector or a rubber stamp.
+        //
+        // **What the inversion does NOT do is turn this test red** (measured in review,
+        // 2026-09-18; this paragraph claimed it did). The per-nature trees move in opposite
+        // directions under it — the opening grows to 29 732 against 20 919 and the quiet
+        // middlegame to 33 805 against 31 791, while the tactical position *halves*, 50 750
+        // against 94 380, because dropping the winning captures empties it — and the total lands
+        // at 0.78, well inside the 5 % bound this test measures. Six other tests catch the
+        // inversion: `a_losing_capture_is_not_forced`, `a_losing_promotion_is_not_forced`,
+        // `a_winning_capture_is_taken`, `pruning_never_filters_the_replies_of_a_side_in_check`,
+        // `the_recapture_is_seen_past_the_depth_limit` and
+        // `pruning_losing_captures_keeps_every_forced_mate`.
+        //
+        // Bounding the growth *per nature* would catch it here too, and is deliberately not done:
+        // it reintroduces the per-nature fragility this test was rewritten to remove. The 117 cp
+        // places the drift bound; it is not this test's mutation record.
         //
         // What this bound genuinely gives up against the old equality is the *merely tightened*
         // predicate, `see > 0` for `see >= 0`, whose drift is the same order as the honest one.
