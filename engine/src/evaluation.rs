@@ -1,6 +1,6 @@
 //! Static evaluation of a position.
 //!
-//! Two terms, both in **centipawns** (1 pawn = 100) and both from the
+//! Five terms, both of the first two in **centipawns** (1 pawn = 100) and all from the
 //! side-to-move perspective:
 //!
 //! - **material** — how much each side has;
@@ -11,7 +11,16 @@
 //! The two are **not separately identifiable**, and it is worth knowing before
 //! reading either: `evaluate` adds `value(piece)` to every one of a table's 64
 //! squares, so only their sum has meaning. Splitting it back out is a readability
-//! choice — `value` carries the mean and the tables carry the deviation.
+//! choice.
+//!
+//! **`value` does not carry the mean, and the shipped `*_MG` tables are not the CPW ones** —
+//! corrected in review (2026-09-18). The middlegame is bit-identical to `main` by construction:
+//! every `*_MG` table is the hand-made one plus a uniform shift, and `value()` moved by the exact
+//! opposite — pawn −5 / +5, knight +22 / −22, bishop +31 / −31, rook −13 / +13, queen −56 / +56,
+//! king +23. A uniform shift on a table cancels against the same shift on the value, so the sum
+//! is unchanged; `value()` therefore carries the **endgame** fit's level (knight 298 against a
+//! middlegame mean of 307, queen 956 against 897), not a mean of the two. A reader checking a
+//! shipped table against the Chess Programming Wiki finds every entry off by that constant.
 //!
 //! The **endgame** numbers were fitted, not chosen: the evaluation is linear in them,
 //! so "are they good" is a convex problem rather than an opinion. Sparse logistic
@@ -154,9 +163,14 @@ static PASSED_MASK: LazyLock<[[u64; 64]; 2]> = LazyLock::new(|| {
 /// **What the halving below does to it.** A blockaded passer has its adjustment divided by two.
 /// That reads as "keeps part of its bonus" and, on any rank where the adjustment were negative,
 /// would equally read as "is half as much of a liability" — the same rule either way, since
-/// halving moves the adjustment toward zero from whichever side it starts. The values are forced
-/// **even** so that `bonus /= 2` on an `i32` is exact; an odd value would truncate toward zero
-/// and cost half a centipawn the fit's model does not know about.
+/// halving moves the adjustment toward zero from whichever side it starts. The **fitted**
+/// schedule's values are forced **even** so that `bonus /= 2` on an `i32` is exact; an odd value
+/// would truncate toward zero and cost half a centipawn the fit's model does not know about.
+///
+/// **Scoped to the fitted schedule in review** (2026-09-18): the halving runs per schedule,
+/// before the interpolation, and `PASSED_MIDDLEGAME` is the hand-made one, byte-identical to
+/// `main`, holding 5, 55 and 85 — which truncate to 2, 27 and 42. That half-centipawn predates
+/// this branch and is named here rather than claimed away.
 const PASSED_MIDDLEGAME: [i32; 8] = [0, 5, 10, 18, 32, 55, 85, 0];
 const PASSED_ENDGAME: [i32; 8] = [0, 20, 12, 42, 66, 110, 138, 0];
 
