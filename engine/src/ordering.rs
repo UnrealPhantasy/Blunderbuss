@@ -20,8 +20,19 @@
 use crate::position::{Color, MAX_LEGAL_MOVES, Move, Piece, Position, Square, SquareSet};
 use crate::search::MAX_DEPTH;
 
-// Piece values used *for ordering only* (not for evaluation): only their relative
-// order matters here, so this table stays local to the module.
+// Piece values used *for ordering only* (not for evaluation), and local to the module.
+//
+// **Their relative order is no longer all that matters** — noted in review of #103
+// (2026-09-18). `see` reads the *sign* of a multi-piece exchange, and quiescence prunes on it
+// (`moves.retain(|&mv| see(pos, mv) >= 0)`). Until the evaluation's values were fitted the two
+// scales were the same table, so that gate pruned exactly the captures the evaluation scored as
+// losing. They now differ — 100/320/330/500/900 here against 105/298/299/513/956 there — and the
+// sign of a multi-piece exchange can differ with them: two minors for rook and pawn reads −50 in
+// SEE and +21 in the evaluation, a queen for three minors +70 against −60, a rook for knight and
+// two pawns +20 against −5. Single-piece trades keep their sign.
+//
+// Not a defect: the +18 ± 5 was anchored with this in place, and separate SEE values are common.
+// Aligning the two scales is its own brick with its own measurement.
 fn value(piece: Piece) -> i32 {
     match piece {
         Piece::Pawn => 100,
