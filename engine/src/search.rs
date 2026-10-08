@@ -2795,61 +2795,79 @@ mod tests {
     #[test]
     fn the_engine_does_not_shuffle_into_a_threefold_it_is_winning() {
         // The regression this fix exists for, replayed from the game that showed it. Game 546 of
-        // an anchoring run: with a persistent table the engine answered `c7b6` at **cp 792** and
-        // the opponent's reply completed the threefold — that is how the real game ended. The
-        // same position with a fresh table answers `h8h6`.
+        // an anchoring run: eight pawns up, the engine answered `c7b6` at cp 783, the opponent
+        // replied `e3e5`, and that was the third occurrence — a draw. With the guard it answers
+        // `h8h6` and keeps the win.
         //
-        // **The history is what makes this test bite**, not the move list: the moves are replayed
-        // to build it, and it is the repeated key in `searcher.history` that the fix reads. A
-        // version of this test that searched the final position alone would pass with the defect
-        // in place.
+        // **Three things make this test bite, and each of them was missing from a draft that
+        // stayed green under the mutation.**
+        //
+        // 1. *The table is filled the way a game fills it.* The defect is an entry written at an
+        //    earlier move being read back now; a fresh table has none. So the engine's own moves
+        //    from ply 71 on are searched in order on one table, exactly as the UCI layer does.
+        //    Ply 71 is the first move of the shuffle, and it is also the earliest start that still
+        //    separates the two versions — measured: 71 does, 73 does not, because by 73 the entry
+        //    that misleads the search has not been written yet.
+        // 2. *The history is rebuilt at every one of those searches*, because it is the repeated
+        //    key in `history` that the fix reads.
+        // 3. *The depth is 10.* At depth 8 both versions answer the same thing: the search does
+        //    not reach deep enough for the stale entry to decide the move. Measured — 8 gives
+        //    `c7a5` either way, 10 and 11 separate them cleanly. A regression test for a defect
+        //    that only appears past a depth has to pay for that depth, and this one costs about
+        //    one second in release and nineteen in debug.
         const GAME_546_FEN: &str =
             "rnbqkbnr/p1pppppp/1p6/8/8/5P2/PPPPP1PP/RNBQKBNR w KQkq - 0 2";
-        const GAME_546: &str = "d2d4 e7e6 e2e4 b8c6 c2c3 g8f6 f1d3 d7d5 e4e5 f6d7 g1e2 d8h4 g2g3 h4d8 b2b4 c8b7 h2h4 a7a6 e1g1 f7f6 d1c2 f6e5 d3h7 d7f6 h7d3 f8d6 d3g6 e8f8 g1g2 e5d4 a2a3 e6e5 c3d4 c6d4 e2d4 e5d4 c1g5 a6a5 b1d2 a5b4 a3b4 a8a1 f1a1 d6b4 g3g4 c7c5 c2f5 b4d2 f5e5 d2a5 g2h3 b7c8 g5f4 f8g8 h4h5 d4d3 a1d1 c5c4 h3g2 b6b5 e5b8 a5b6 f4g3 b5b4 g3f4 b4b3 f4e5 f6d7 b8d6 d7e5 d6e5 b6c7 e5e3 c7b6 e3e5";
+        // The 77 plies before the losing move. Our side moves on the odd plies.
+        const GAME_546: &str = "d2d4 e7e6 e2e4 b8c6 c2c3 g8f6 f1d3 d7d5 e4e5 f6d7 g1e2 d8h4 g2g3 h4d8 b2b4 c8b7 h2h4 a7a6 e1g1 f7f6 d1c2 f6e5 d3h7 d7f6 h7d3 f8d6 d3g6 e8f8 g1g2 e5d4 a2a3 e6e5 c3d4 c6d4 e2d4 e5d4 c1g5 a6a5 b1d2 a5b4 a3b4 a8a1 f1a1 d6b4 g3g4 c7c5 c2f5 b4d2 f5e5 d2a5 g2h3 b7c8 g5f4 f8g8 h4h5 d4d3 a1d1 c5c4 h3g2 b6b5 e5b8 a5b6 f4g3 b5b4 g3f4 b4b3 f4e5 f6d7 b8d6 d7e5 d6e5 b6c7 e5e3 c7b6 e3e5 b6c7 e5e3";
+        // What the engine actually played, and the reply that made it a draw.
+        const THE_LOSING_MOVE: &str = "c7b6";
+        const THE_REPLY: &str = "e3e5";
 
-        let mut pos = Position::from_fen(GAME_546_FEN).unwrap();
-        let mut history = vec![pos.hash()];
-        for uci in GAME_546.split_whitespace() {
-            pos = pos.play(pos.move_from_uci(uci).expect("a legal move from the game"));
-            history.push(pos.hash());
-        }
-        // Precondition: the position really is one move from a threefold, or this test asserts
-        // nothing. The side to move has been here twice before.
+        // Idiom: a closure, so the replay below and the precondition share one way of walking the
+        // move list. `|&str| -> (Position, Vec<u64>)` — it returns the position and the history
+        // of keys that led to it.
+        let replay = |n: usize| {
+            let mut pos = Position::from_fen(GAME_546_FEN).unwrap();
+            let mut history = vec![pos.hash()];
+            for uci in GAME_546.split_whitespace().take(n) {
+                pos = pos.play(pos.move_from_uci(uci).expect("a legal move from the game"));
+                history.push(pos.hash());
+            }
+            (pos, history)
+        };
+
+        // Precondition: `c7b6` really does hand the opponent a threefold, or this test asserts
+        // nothing. Play it, play the reply, and count.
+        let (pos_77, history_77) = replay(77);
+        let after_losing_move = pos_77.play(pos_77.move_from_uci(THE_LOSING_MOVE).unwrap());
+        let after_reply = after_losing_move.play(after_losing_move.move_from_uci(THE_REPLY).unwrap());
+        let occurrences = history_77
+            .iter()
+            .chain([after_losing_move.hash(), after_reply.hash()].iter())
+            .filter(|&&k| k == after_reply.hash())
+            .count();
         assert_eq!(
-            history.iter().filter(|&&k| k == pos.hash()).count(),
-            2,
-            "precondition: the final position must already have occurred twice",
+            occurrences, 3,
+            "precondition: {THE_LOSING_MOVE} then {THE_REPLY} must be the third occurrence",
         );
 
-        // **The table must be filled the way a game fills it, or this test is inert.** A first
-        // draft searched the final position with a fresh table and stayed green under the
-        // mutation — of course it did: the defect is an entry written at an *earlier move* being
-        // read back now, and an empty table has none. Found by mutation, which is what mutation
-        // is for.
-        //
-        // So the last ten plies are searched in order, keeping one table, exactly as the UCI
-        // layer does across a game.
+        // One table across the whole replay — this is the persistence the defect lives in.
         let table = Table::new();
         let mut searcher = Searcher::new(MoveOrder::Full, None, &table);
-        let coups: Vec<&str> = GAME_546.split_whitespace().collect();
-        let depart = coups.len() - 10;
-        let mut pos = Position::from_fen(GAME_546_FEN).unwrap();
-        searcher.history = vec![pos.hash()];
-        for (i, uci) in coups.iter().enumerate() {
-            if i >= depart {
-                searcher.root(&pos, 6, None);
-            }
-            pos = pos.play(pos.move_from_uci(uci).expect("a legal move from the game"));
-            searcher.history.push(pos.hash());
+        let mut best = None;
+        for ply in (71..=77).step_by(2) {
+            let (pos, history) = replay(ply);
+            searcher.history = history;
+            best = searcher.root(&pos, 10, None).best;
         }
-        let best = searcher.root(&pos, 8, None).best.expect("a move").0;
+
+        let (best_move, score) = best.expect("a move at ply 77");
         assert_ne!(
-            format!("{best}"),
-            "c7b6",
-            "the engine walked back into the threefold it was winning by eight pawns",
+            format!("{best_move}"),
+            THE_LOSING_MOVE,
+            "the engine walked back into the threefold it was winning by {score} centipawns",
         );
     }
-
     #[test]
     fn a_repetition_score_is_not_cached() {
         // The hazard #23 introduced: a draw by repetition belongs to the *path*, not
@@ -5668,3 +5686,6 @@ mod tests {
     }
 
 }
+
+
+
