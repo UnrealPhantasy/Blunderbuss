@@ -1599,7 +1599,25 @@ impl<'a> Searcher<'a> {
         self.table_hits += u64::from(hit.matched);
         self.table_cutoffs += u64::from(hit.cutoff.is_some());
         if let Some(score) = hit.cutoff {
-            return score;
+            // **Not when this position already occurred in the game.** The table stores a fact
+            // about a *position*; a repetition is a fact about the *path* that reached it. The
+            // guard above refuses to probe or store at a node that already repeats, which keeps
+            // the path fact out of the table. This is the other half of the same hazard, and it
+            // was missing: a node that does **not** yet repeat probes normally, and the entry it
+            // finds may have been written at an earlier move of the game, when the position had
+            // been seen fewer times. That score knows nothing about the repetition that now
+            // completes, so the reply making it threefold is never searched — the engine shuffles
+            // between two squares announcing +792 and draws.
+            //
+            // The probe itself stays: `hit.best` is still a move worth trying first, and ordering
+            // is not a claim about the score. Only the cutoff is unsafe.
+            //
+            // The asymmetry is what settles it. A missing cutoff costs one re-search; a wrong
+            // cutoff costs a decision — and here the decision was a game the engine scored as
+            // eight pawns up.
+            if !self.history.contains(&key) {
+                return score;
+            }
         }
 
         // Reverse futility pruning, also called static null move: near the leaves, ask whether
@@ -2740,6 +2758,78 @@ mod tests {
         assert!(!searcher.is_repetition(42), "one played occurrence is not a draw yet");
         searcher.history.push(42);
         assert!(searcher.is_repetition(42), "two played occurrences make this the third");
+    }
+
+    #[test]
+    fn a_table_cutoff_never_hides_a_repetition_from_the_search() {
+        // **The other half of the hazard `a_repetition_score_is_not_cached` guards**, and it
+        // shipped unguarded: that test checks nothing is *stored* at a repeating node; this one
+        // checks nothing is *read* at a node the game has already visited once.
+        //
+        // The distinction is the whole defect. A node that does not yet repeat probes the table
+        // normally, and the entry it finds may predate the occurrences that now make a repetition
+        // reachable. Taking that cutoff skips the reply that completes the threefold.
+        let p = Position::from_fen(LOST_KING).unwrap();
+        let after_ke2 = p.play(p.move_from_uci("e1e2").unwrap());
+        let key = after_ke2.hash();
+
+        let table = Table::new();
+        let mut searcher = Searcher::new(MoveOrder::Full, None, &table);
+        // **One** prior occurrence, not two: the position is not a repetition yet, so
+        // `is_repetition` lets the search through to the probe. That is the case this test is
+        // about, and the reason the existing tests miss it — they all set up two.
+        searcher.history = vec![key];
+        // An entry claiming a winning score for a position that is in fact one move from a draw.
+        // `Bound::Exact` because that is the only bound a probe returns against any window.
+        searcher.table.store_at(key, 8, 900, Bound::Exact, None, 0);
+
+        // Idiom: a null window `(alpha, beta) = (0, 1)` asks only "does it reach 1", which is
+        // what makes a stored `Exact` of 900 able to cut off here if the guard is missing.
+        let score = searcher.negamax_inner(&after_ke2, 4, 0, 1, 1, true);
+        assert_ne!(
+            score, 900,
+            "the stored score was taken as a cutoff at a position already seen once in the game",
+        );
+    }
+
+    #[test]
+    fn the_engine_does_not_shuffle_into_a_threefold_it_is_winning() {
+        // The regression this fix exists for, replayed from the game that showed it. Game 546 of
+        // an anchoring run: with a persistent table the engine answered `c7b6` at **cp 792** and
+        // the opponent's reply completed the threefold — that is how the real game ended. The
+        // same position with a fresh table answers `h8h6`.
+        //
+        // **The history is what makes this test bite**, not the move list: the moves are replayed
+        // to build it, and it is the repeated key in `searcher.history` that the fix reads. A
+        // version of this test that searched the final position alone would pass with the defect
+        // in place.
+        const GAME_546_FEN: &str =
+            "rnbqkbnr/p1pppppp/1p6/8/8/5P2/PPPPP1PP/RNBQKBNR w KQkq - 0 2";
+        const GAME_546: &str = "d2d4 e7e6 e2e4 b8c6 c2c3 g8f6 f1d3 d7d5 e4e5 f6d7 g1e2 d8h4 g2g3 h4d8 b2b4 c8b7 h2h4 a7a6 e1g1 f7f6 d1c2 f6e5 d3h7 d7f6 h7d3 f8d6 d3g6 e8f8 g1g2 e5d4 a2a3 e6e5 c3d4 c6d4 e2d4 e5d4 c1g5 a6a5 b1d2 a5b4 a3b4 a8a1 f1a1 d6b4 g3g4 c7c5 c2f5 b4d2 f5e5 d2a5 g2h3 b7c8 g5f4 f8g8 h4h5 d4d3 a1d1 c5c4 h3g2 b6b5 e5b8 a5b6 f4g3 b5b4 g3f4 b4b3 f4e5 f6d7 b8d6 d7e5 d6e5 b6c7 e5e3 c7b6 e3e5";
+
+        let mut pos = Position::from_fen(GAME_546_FEN).unwrap();
+        let mut history = vec![pos.hash()];
+        for uci in GAME_546.split_whitespace() {
+            pos = pos.play(pos.move_from_uci(uci).expect("a legal move from the game"));
+            history.push(pos.hash());
+        }
+        // Precondition: the position really is one move from a threefold, or this test asserts
+        // nothing. The side to move has been here twice before.
+        assert_eq!(
+            history.iter().filter(|&&k| k == pos.hash()).count(),
+            2,
+            "precondition: the final position must already have occurred twice",
+        );
+
+        let table = Table::new();
+        let mut searcher = Searcher::new(MoveOrder::Full, None, &table);
+        searcher.history = history;
+        let best = searcher.root(&pos, 8, None).best.expect("a move").0;
+        assert_ne!(
+            format!("{best}"),
+            "c7b6",
+            "the engine walked back into the threefold it was winning by eight pawns",
+        );
     }
 
     #[test]
