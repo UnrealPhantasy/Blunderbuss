@@ -2821,9 +2821,27 @@ mod tests {
             "precondition: the final position must already have occurred twice",
         );
 
+        // **The table must be filled the way a game fills it, or this test is inert.** A first
+        // draft searched the final position with a fresh table and stayed green under the
+        // mutation — of course it did: the defect is an entry written at an *earlier move* being
+        // read back now, and an empty table has none. Found by mutation, which is what mutation
+        // is for.
+        //
+        // So the last ten plies are searched in order, keeping one table, exactly as the UCI
+        // layer does across a game.
         let table = Table::new();
         let mut searcher = Searcher::new(MoveOrder::Full, None, &table);
-        searcher.history = history;
+        let coups: Vec<&str> = GAME_546.split_whitespace().collect();
+        let depart = coups.len() - 10;
+        let mut pos = Position::from_fen(GAME_546_FEN).unwrap();
+        searcher.history = vec![pos.hash()];
+        for (i, uci) in coups.iter().enumerate() {
+            if i >= depart {
+                searcher.root(&pos, 6, None);
+            }
+            pos = pos.play(pos.move_from_uci(uci).expect("a legal move from the game"));
+            searcher.history.push(pos.hash());
+        }
         let best = searcher.root(&pos, 8, None).best.expect("a move").0;
         assert_ne!(
             format!("{best}"),
